@@ -1,0 +1,18 @@
+# macOS
+.DS_Store
+
+# Jupyter Notebook
+.ipynb_checkpoints
+
+*csv
+*xlsx
+*json
+*pt
+*pth
+*pkl
+*sh
+*sif
+*jpg
+*png
+*.h5
+*.svg
