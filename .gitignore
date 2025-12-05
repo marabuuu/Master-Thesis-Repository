@@ -4,6 +4,9 @@
 # Jupyter Notebook
 .ipynb_checkpoints
 
+# Python
+__pycache__/
+
 *csv
 *xlsx
 *json
