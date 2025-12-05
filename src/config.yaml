@@ -1,0 +1,15 @@
+data:
+  csv_path: '../../data/brca_gene_expression_with_subtypes.csv'
+  columns_to_drop: ['Patient_ID', 'Majority_Subtype_mRNA']
+
+model:
+  latent_dim: 1024
+  hidden_dim: [2048, 1024]
+
+training:
+  num_epochs: 100
+  batch_size: 128
+  learning_rate: 0.001
+
+output:
+  encoded_data_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.npy'
