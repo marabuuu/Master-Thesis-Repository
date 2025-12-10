@@ -1,5 +1,6 @@
 data:
   csv_path: '../../data/brca_gene_expression_with_subtypes.csv'
+  id_column: 'Patient_ID'
   columns_to_drop: ['Patient_ID', 'Majority_Subtype_mRNA']
 
 model:
@@ -13,3 +14,6 @@ training:
 
 output:
   encoded_data_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.npy'
+  training_log_path: '../../vae_output/vae_training_history.csv'
+  encoded_csv_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.csv'
+  encoded_h5ad_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.h5ad'
