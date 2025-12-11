@@ -108,7 +108,7 @@ def main(config):
             index=sample_ids,
             columns=[f"z{i}" for i in range(encoded_data.shape[1])]
         )
-        df_encoded.to_csv(encoded_csv_path, index_label="sample_id")
+        df_encoded.to_csv(encoded_csv_path, index_label="Patient_ID")
         print(f"Saved encoded data CSV to {encoded_csv_path}")
 
     # Save h5ad representation if configured and anndata is available
