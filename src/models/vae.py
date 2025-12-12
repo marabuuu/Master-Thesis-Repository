@@ -51,13 +51,22 @@ class VAE(nn.Module):
         x_hat           = self.decoder(z)
         return x_hat, z
 
-    def loss(self, x, beta):
+    def loss_components(self, x, beta):
+        """
+        Compute total loss and components for monitoring.
+        Returns: (total, recon, mmd)
+        """
         x_hat, z = self.forward(x)
 
         reconstruction_loss = nn.MSELoss()
         recon = reconstruction_loss(x, x_hat)
 
-        true_samples=torch.randn(z.shape[0], z.shape[1]).to(self.device)
-        MMD=torch.sum(compute_mmd(true_samples, z))
+        true_samples = torch.randn(z.shape[0], z.shape[1]).to(self.device)
+        MMD = torch.sum(compute_mmd(true_samples, z))
 
-        return recon + beta * MMD
+        total = recon + beta * MMD
+        return total, recon, MMD
+
+    def loss(self, x, beta):
+        total, _, _ = self.loss_components(x, beta)
+        return total
