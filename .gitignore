@@ -7,6 +7,9 @@
 # Python
 __pycache__/
 
+# Build artifacts
+*.egg-info/
+
 *csv
 *xlsx
 *json
