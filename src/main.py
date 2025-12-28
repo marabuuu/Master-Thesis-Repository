@@ -86,10 +86,18 @@ def main(config):
     plot_loss(loss_values)
     
     # Use trained VAE to encode data
+
     vae.eval()
     with torch.no_grad():
         mean, log_var = vae.encoder(data_tensor)
-        encoded_data = mean.cpu().numpy()
+        # Project to 512 dims for downstream tasks
+        if mean.shape[1] == 1024:
+            projection = torch.nn.Linear(1024, 512).to(device)
+            # Optionally, you can load a trained projection or fit it, but for now use random weights
+            mean_proj = projection(mean)
+            encoded_data = mean_proj.cpu().numpy()
+        else:
+            encoded_data = mean.cpu().numpy()
 
     # create output directory if it doesn't exist
     output_dir = os.path.dirname(config['output']['encoded_data_path'])
