@@ -30,6 +30,8 @@ dependencies = [
     "lpips>=0.1.4",
     "transformers>=4.57.3",
     "timm>=1.0.22",
+    "plotly>=6.5.0",
+    "datasets>=4.4.2",
 ]
 
 
