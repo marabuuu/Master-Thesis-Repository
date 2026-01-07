@@ -86,9 +86,11 @@ def main(config):
     plot_loss(loss_values)
     
     # Use trained VAE to encode data
+
     vae.eval()
     with torch.no_grad():
         mean, log_var = vae.encoder(data_tensor)
+        # Project to 512 dims for downstream task
         encoded_data = mean.cpu().numpy()
 
     # create output directory if it doesn't exist

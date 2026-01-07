@@ -17,3 +17,20 @@ output:
   training_log_path: '../../vae_output/vae_training_history.csv'
   encoded_csv_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.csv'
   encoded_h5ad_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.h5ad'
+
+feature_selection:
+  feats_dir: "../../mopadi_features/train/"
+  mil_weights: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/fold_0/PMA_mil.pth"
+  clini_table: "../../mopadi_features/clinical_table.csv"
+  target_label: "Majority_Subtype_mRNA"
+  target_dict: {"LumA": 0, "Basal": 1}
+  n_top_features: 100
+  output_csv: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient.csv"
+  output_h5: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient_features.h5"
+  output_meta_csv: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient_features_meta.csv"
+  fname_index: 3
+  device: "cuda:0"
+  classifier_params:
+    dim: 512
+    num_heads: 8
+    num_seeds: 4
