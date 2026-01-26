@@ -63,6 +63,6 @@ class ProbabilisticDecoder(nn.Module):
         self.net = nn.Sequential(self.dt_layers)
         
     def forward(self, x):
-        
-        x_hat = torch.sigmoid(self.net(x))
+        # Return raw outputs (no sigmoid) so reconstruction can match real-valued inputs.
+        x_hat = self.net(x)
         return x_hat
