@@ -3,7 +3,7 @@
 Train a linear (or small-projection) classifier on per-sample genomic feature HDF5 files.
 
 Usage examples:
-  python scripts/train_genomic_linear_clf.py --train-dir data_gen/train --test-dir data_gen/test --out-dir models/gen_clf
+  python /data/horse/ws/mala059b-rna2wsi/Master-Thesis-Repository/src/scripts/train_genomic_linear_clf.py --train-dir /data/horse/ws/mala059b-rna2wsi/vae_output/full_train/mopadi_features/train --test-dir /data/horse/ws/mala059b-rna2wsi/vae_output/full_train/mopadi_features/test --out-dir /data/horse/ws/mala059b-rna2wsi/vae_output/full_train/gen_clf_luma_basal --labels-csv /data/horse/ws/mala059b-rna2wsi/vae_output/full_train/mopadi_features/clinical_table.csv --id-col PATIENT --label-col Majority_Subtype_mRNA --keep-classes LumA,Basal --feature-dim 1024 --epochs 30 --batch-size 64
 
 The script supports two labelling modes:
  - directory-per-class: train/<class>/*.h5 and test/<class>/*.h5
