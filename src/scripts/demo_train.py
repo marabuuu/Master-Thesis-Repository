@@ -1,6 +1,6 @@
 """Minimal demo trainer: preprocess CSV, train VAE for a few epochs, save encoder and print latent stats.
 
-Usage: python scripts/demo_train.py --csv path/to/data.csv --out_dir results/demo
+Usage: python -m src.scripts.demo_train --csv path/to/data.csv --out_dir results/demo
 """
 import sys
 import os
@@ -10,8 +10,8 @@ import numpy as np
 import torch
 import torch.optim as optim
 
-# Ensure project root on sys.path so `src` package imports work when running script
-sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')))
+# Ensure project root on sys.path so `src` package imports work when running as a module
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..', '..')))
 
 from src.preprocessing.utils import preprocess_log1p_zscore, inspect_variance
 from src.encoders.probabilistic_encoder import ProbabilisticEncoder
