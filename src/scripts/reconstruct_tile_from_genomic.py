@@ -27,6 +27,7 @@ import numpy as np
 import torch
 import torch.nn as nn
 from PIL import Image
+from torchvision import transforms
 
 
 class GenomicClassifier(nn.Module):
@@ -77,7 +78,13 @@ def morph_feature_with_classifier(orig_feat: torch.Tensor, model: nn.Module, tar
     """Perform gradient-ascent on the conditioning vector to increase the
     target class logit. Returns a new conditioning vector (1,D).
     """
-    model = model.to(device).eval()
+    # Try moving model to device; if CUDA init fails, fall back to CPU and continue.
+    try:
+        model = model.to(device).eval()
+    except Exception as e:
+        print(f"Warning: moving classifier to device {device} failed: {e}\nFalling back to CPU for classifier operations.")
+        device = 'cpu'
+        model = model.to(device).eval()
     feat = orig_feat.clone().to(device).unsqueeze(0).detach()
     feat.requires_grad_(True)
     orig = feat.detach().clone()
@@ -133,11 +140,23 @@ def main():
     parser.add_argument('--clip-scale', type=float, default=5.0, help='Clip morphed cond to orig +/- clip_scale*std (0=no clip)')
     parser.add_argument('--denorm-before-decode', action='store_true', help='Denormalize conditioning before decode (if norm_state used)')
     parser.add_argument('--decode-steps', type=int, default=20, help='Number of diffusion sampling steps (T) for decoder')
+    parser.add_argument('--init-image', type=str, default=None, help='Path to an image to encode to noise and then decode')
+    parser.add_argument('--encode-steps', type=int, default=250, help='Number of diffusion sampling steps (T) for encoding (encode_to_noise)')
+    parser.add_argument('--use-model-xT', action='store_true', help='Use model.x_T stored in checkpoint as initial noise if available')
     parser.add_argument('--n-seeds', type=int, default=1, help='Number of random seeds to sample and save')
     parser.add_argument('--avg-out', action='store_true', help='Average multiple sampled images and save an additional averaged image')
     args = parser.parse_args()
 
-    device = args.device if torch.cuda.is_available() or 'cpu' not in args.device else 'cpu'
+    # Robust device selection: prefer requested CUDA if available, otherwise use CPU.
+    requested = args.device
+    if isinstance(requested, str) and requested.lower().startswith('cuda'):
+        if torch.cuda.is_available():
+            device = requested
+        else:
+            print(f"Warning: requested device {requested} but CUDA not available. Falling back to CPU.")
+            device = 'cpu'
+    else:
+        device = 'cpu' if 'cpu' in str(requested).lower() else requested
 
     # load feature vector
     feat = load_feature_vector(args.feature_h5, key=args.feature_key)
@@ -261,11 +280,51 @@ def main():
 
     cond = cond_for_decode.to(device).unsqueeze(0)  # [1, D]
 
+    # Optionally encode a real image to noise and use that as initial x_T for decoding.
+    initial_noise = None
+    if args.init_image:
+        if not os.path.exists(args.init_image):
+            raise RuntimeError(f"init-image not found: {args.init_image}")
+        # determine image size expected by model
+        try:
+            img_size = int(getattr(enc.model.conf, 'img_size', args.patch_size))
+        except Exception:
+            img_size = args.patch_size
+        transform = transforms.Compose([
+            transforms.Resize(size=img_size, interpolation=transforms.InterpolationMode.BILINEAR),
+            transforms.ToTensor(),
+            transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+        ])
+        img = Image.open(args.init_image).convert('RGB')
+        tensor_img = transform(img).unsqueeze(0).to(device)
+        # encode with neutral conditioning so encoder focuses on image
+        neutral_feat = torch.zeros_like(cond).to(device)
+        print(f"Encoding image {args.init_image} to noise with T={args.encode_steps}...")
+        xT = enc.encode_to_noise(tensor_img, neutral_feat, T=args.encode_steps)
+        initial_noise = xT
+        print(f"Encoded image -> noise shape {xT.shape}")
+    elif args.use_model_xT:
+        # use model's stored x_T if available
+        model_obj = getattr(enc, 'model', None)
+        if model_obj is not None and hasattr(model_obj, 'x_T'):
+            try:
+                initial_noise = model_obj.x_T[:1].to(device)
+                print('Using model.x_T as initial noise')
+            except Exception:
+                initial_noise = None
+
     samples = []
     for s in range(args.n_seeds):
         seed = s
         torch.manual_seed(seed)
-        noise = torch.randn(1, 3, args.patch_size, args.patch_size).to(device)
+        if initial_noise is not None:
+            noise = initial_noise.clone().to(device)
+        else:
+            try:
+                img_size = int(getattr(enc.model.conf, 'img_size', args.patch_size))
+            except Exception:
+                img_size = args.patch_size
+            noise = torch.randn(1, 3, img_size, img_size, device=device)
         # call decode with configurable number of steps (T)
         # Some diffusion configs require particular spacings (ddim striding);
         # if the requested T is incompatible the sampler will raise a ValueError.
