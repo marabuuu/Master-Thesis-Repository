@@ -282,6 +282,33 @@ def train_demo(csv_path, out_dir, hidden_dim, latent_dim, lr, epochs, batch_size
         arr = df_z.loc[pid].values
         save_h5(pid, arr, test_dir)
 
+    # --- Save normalization state used for conditioning (conds_mean, conds_std) ---
+    try:
+        # compute mean/std over training samples (rows of df_z indexed by train_idx)
+        train_mat = df_z.loc[train_idx].values.astype(np.float32)
+        conds_mean = train_mat.mean(axis=0).astype(np.float32)
+        conds_std = train_mat.std(axis=0).astype(np.float32)
+        # guard against zero std
+        conds_std = np.maximum(conds_std, 1e-6)
+        norm_state = {
+            'conds_mean': torch.from_numpy(conds_mean).cpu(),
+            'conds_std': torch.from_numpy(conds_std).cpu(),
+            'feature_dim': int(z.shape[1]),
+        }
+        # include class2idx mapping if labels are available
+        try:
+            if labels is not None:
+                unique_labels = pd.Series(labels.dropna().unique()).astype(str)
+                class2idx = {str(l): int(i) for i, l in enumerate(sorted(unique_labels))}
+                norm_state['class2idx'] = class2idx
+        except Exception:
+            pass
+
+        torch.save(norm_state, os.path.join(mopadi_out_dir, 'norm_state.pth'))
+        print(f'Saved normalization state to {os.path.join(mopadi_out_dir, "norm_state.pth")}')
+    except Exception as e:
+        print('Could not save norm_state.pth:', e)
+
     # Clinical table
     clin_df = pd.DataFrame({'PATIENT': list(df_z.index)})
     if labels is not None:
