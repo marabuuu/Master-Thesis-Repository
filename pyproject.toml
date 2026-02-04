@@ -33,6 +33,9 @@ dependencies = [
     "plotly>=6.5.0",
     "datasets>=4.4.2",
     "mopadi",
+    "shapely>=2.1.2",
+    "openslide-python>=1.4.3",
+    "rtree>=1.4.1",
 ]
 
 
