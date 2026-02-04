@@ -596,15 +596,19 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
         except Exception as e:
             print(f"Failed to print diagnostics: {e}")
 
-    # create tar.gz archive
-    archive_path = os.path.join(save_dir, f"{tiles_folder}.tar.gz")
+    # create zip archive
+    archive_path = os.path.join(save_dir, f"{tiles_folder}.zip")
     try:
-        with tarfile.open(archive_path, "w:gz") as tar:
-            tar.add(filtered_tiles_dir, arcname=tiles_folder)
+        with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
+            for root, dirs, files in os.walk(filtered_tiles_dir):
+                for file in files:
+                    file_path = os.path.join(root, file)
+                    arcname = os.path.join(tiles_folder, os.path.relpath(file_path, filtered_tiles_dir))
+                    zf.write(file_path, arcname)
     except Exception as e:
         print(f'Error creating archive for {tiles_folder}: {e}')
 
-    # Clean up: remove the temporary folder with extracted tiles (keep only tar.gz and plot)
+    # Clean up: remove the temporary folder with extracted tiles (keep only zip and plot)
     try:
         shutil.rmtree(filtered_tiles_dir)
     except Exception as e:
