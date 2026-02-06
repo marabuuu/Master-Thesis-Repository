@@ -1,3 +1,5 @@
+# taken and adapted from mopadi repository to work with pre-extracted tiles in zip files
+# https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/get_tiles_within_rois.py
 import os
 import re
 from shapely.geometry import Polygon, MultiPolygon

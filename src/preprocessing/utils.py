@@ -51,6 +51,9 @@ def inspect_variance(df: pd.DataFrame) -> dict:
         'sample_var_summary': sample_var.describe().to_dict()
     }
 
+# taken and adapted from mopadi repository to work with pre-extracted tiles in zip files
+# https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/utils.py
+
 def create_polygons(df):
     polygons = []
     for _, row in df.iterrows():
