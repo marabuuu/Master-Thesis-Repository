@@ -50,3 +50,7 @@ venv.bak/
 *png
 *.h5
 *.svg
+
+# SLURM logs
+*.out
+*.err
