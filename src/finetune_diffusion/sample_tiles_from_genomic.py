@@ -694,10 +694,12 @@ def main():
                 continue
             
             real_tiles = tiles_by_patient[pid]
+            # Stack list of tensors into batch tensor
+            real_tiles_batch = torch.stack(real_tiles, dim=0)
             samples = genomic_sampler.encode_decode(
+                x=real_tiles_batch,
                 genomic=genomic_tensor,
-                real_tiles=real_tiles,
-                encode_steps=args.encode_steps,
+                encode_steps=args.encode_steps or 250,
             )
         
         # Save as zip file with individual PNGs
