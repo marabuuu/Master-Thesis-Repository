@@ -1,5 +1,5 @@
 """
-Evaluation metrics for generative models.
+Statistics and metrics for generative models.
 
 Modules:
     training_curves: Plot training loss curves from checkpoints
