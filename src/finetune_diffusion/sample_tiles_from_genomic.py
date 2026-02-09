@@ -4,19 +4,35 @@
 Sample Tiles from Genomic Features using Fine-tuned Diffusion Model
 
 This script generates synthetic tile images conditioned on genomic feature vectors.
-It loads:
-1. The fine-tuned diffusion model (with projection head integrated)
-2. Genomic features from H5 files
-And generates tile images for each patient.
+It supports two sampling modes:
+
+1. RANDOM NOISE (default): Generate tiles from pure random noise
+   - Fully synthetic generation
+   - High diversity, different noise = different tile
+   
+2. ENCODE-DECODE: Use real tiles as starting points
+   - Encodes real tile → stochastic noise x_T
+   - Decodes with genomic conditioning
+   - Preserves structure while applying genomic-specific features
 
 Usage:
+    # Mode 1: Random noise generation (default)
     python sample_tiles_from_genomic.py \\
         --checkpoint ./diffusion_genomic_best.pt \\
         --genomic-h5-dir /path/to/genomic_features \\
         --output-dir ./generated_tiles \\
         --num-samples-per-patient 4
 
-Or with the original diffusion + projection head (without fine-tuning):
+    # Mode 2: Encode-decode with real tiles
+    python sample_tiles_from_genomic.py \\
+        --checkpoint ./diffusion_genomic_best.pt \\
+        --genomic-h5-dir /path/to/genomic_features \\
+        --tiles-zip-dir /path/to/tile_zips \\
+        --output-dir ./generated_tiles \\
+        --mode encode-decode \\
+        --num-samples-per-patient 4
+
+    # With separate checkpoints (no fine-tuning)
     python sample_tiles_from_genomic.py \\
         --diffusion-ckpt ./diffusion_without_encoder.ckpt \\
         --projection-head-ckpt ./projection_head_best.pt \\
@@ -26,8 +42,11 @@ Or with the original diffusion + projection head (without fine-tuning):
 
 import argparse
 import os
+import random
+import zipfile
+from io import BytesIO
 from pathlib import Path
-from typing import Optional
+from typing import List, Optional, Tuple
 
 import h5py
 import numpy as np
@@ -35,7 +54,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
-from torchvision.utils import save_image, make_grid
+from torchvision import transforms
 from tqdm import tqdm
 
 
@@ -124,6 +143,53 @@ def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     return Image.fromarray(tensor)
 
 
+def load_tiles_from_zip(
+    zip_path: Path,
+    num_tiles: int,
+    img_size: int = 512,
+    random_sample: bool = True,
+) -> List[torch.Tensor]:
+    """
+    Load tile images from a zip file.
+    
+    Args:
+        zip_path: Path to zip file
+        num_tiles: Number of tiles to load
+        img_size: Size to resize tiles to
+        random_sample: If True, randomly sample tiles; else take first N
+    
+    Returns:
+        List of tensors, each (3, H, W) in range [-1, 1]
+    """
+    transform = transforms.Compose([
+        transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BILINEAR),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
+    ])
+    
+    tiles = []
+    with zipfile.ZipFile(zip_path, "r") as zf:
+        candidates = [n for n in zf.namelist() 
+                      if n.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        
+        if not candidates:
+            return tiles
+        
+        # Select tiles
+        if random_sample and len(candidates) > num_tiles:
+            selected = random.sample(candidates, num_tiles)
+        else:
+            selected = candidates[:num_tiles]
+        
+        for tile_name in selected:
+            with zf.open(tile_name) as f:
+                img = Image.open(BytesIO(f.read())).convert("RGB")
+                tiles.append(transform(img))
+    
+    return tiles
+
+
 # ----------------------------------------------------------------------
 #   Genomic Conditioned Sampler
 # ----------------------------------------------------------------------
@@ -154,24 +220,8 @@ class GenomicConditionedSampler:
         self.diffusion_model.eval()
         self.projection_head.eval()
     
-    @torch.no_grad()
-    def sample(
-        self,
-        genomic: torch.Tensor,
-        num_samples: int = 1,
-        noise: Optional[torch.Tensor] = None,
-    ) -> torch.Tensor:
-        """
-        Generate tile images from genomic features.
-        
-        Args:
-            genomic: (D,) or (B, D) genomic feature vector
-            num_samples: number of tiles to generate per genomic vector
-            noise: optional starting noise, shape (B*num_samples, 3, H, W)
-        
-        Returns:
-            Generated images, shape (B*num_samples, 3, H, W)
-        """
+    def _get_conditioning(self, genomic: torch.Tensor, num_samples: int = 1) -> torch.Tensor:
+        """Project genomic features and normalize for conditioning."""
         if genomic.dim() == 1:
             genomic = genomic.unsqueeze(0)
         
@@ -188,7 +238,28 @@ class GenomicConditionedSampler:
         if num_samples > 1:
             cond = cond.repeat_interleave(num_samples, dim=0)  # (B*num_samples, 512)
         
-        total_samples = B * num_samples
+        return cond
+    
+    @torch.no_grad()
+    def sample(
+        self,
+        genomic: torch.Tensor,
+        num_samples: int = 1,
+        noise: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Generate tile images from random noise + genomic conditioning.
+        
+        Args:
+            genomic: (D,) or (B, D) genomic feature vector
+            num_samples: number of tiles to generate per genomic vector
+            noise: optional starting noise, shape (B*num_samples, 3, H, W)
+        
+        Returns:
+            Generated images, shape (B*num_samples, 3, H, W)
+        """
+        cond = self._get_conditioning(genomic, num_samples)
+        total_samples = cond.shape[0]
         
         # Generate noise if not provided
         if noise is None:
@@ -202,6 +273,88 @@ class GenomicConditionedSampler:
         samples = self.sampler.sample(
             model=self.diffusion_model,
             noise=noise,
+            cond=cond,
+            model_kwargs=model_kwargs,
+            progress=True,
+        )
+        
+        return samples
+    
+    @torch.no_grad()
+    def encode(self, x: torch.Tensor, encode_steps: int = 250) -> torch.Tensor:
+        """
+        Encode images to stochastic noise representation.
+        
+        Uses the forward diffusion process to map x_0 → x_T.
+        
+        Args:
+            x: Images (B, 3, H, W) in range [-1, 1]
+            encode_steps: Number of encoding steps (T)
+        
+        Returns:
+            Encoded noise x_T, shape (B, 3, H, W)
+        """
+        x = x.to(self.device)
+        B = x.shape[0]
+        
+        # Use neutral conditioning for encoding (zeros)
+        neutral_cond = torch.zeros(B, self.conds_mean.shape[0], device=self.device)
+        
+        # Get noise schedule parameters
+        # We'll do stochastic encoding by adding noise at level T
+        t = torch.full((B,), encode_steps - 1, device=self.device, dtype=torch.long)
+        
+        # Simple approach: add noise according to diffusion schedule
+        # This is a simplified encoding - for more precise encoding, use DDIM inversion
+        noise = torch.randn_like(x)
+        
+        # Get alpha_bar at timestep t (from the sampler)
+        # Using simplified formula: x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
+        alpha_bar = self.sampler._extract(
+            self.sampler.alphas_cumprod.to(self.device), t, x.shape
+        )
+        x_t = torch.sqrt(alpha_bar) * x + torch.sqrt(1 - alpha_bar) * noise
+        
+        return x_t
+    
+    @torch.no_grad()
+    def encode_decode(
+        self,
+        x: torch.Tensor,
+        genomic: torch.Tensor,
+        encode_steps: int = 250,
+    ) -> torch.Tensor:
+        """
+        Encode real tiles then decode with genomic conditioning.
+        
+        This preserves structure from real tiles while applying
+        genomic-specific features.
+        
+        Args:
+            x: Real tile images (B, 3, H, W) in range [-1, 1]
+            genomic: (D,) or (B, D) genomic feature vector
+            encode_steps: Number of encoding steps
+        
+        Returns:
+            Reconstructed images with genomic conditioning, shape (B, 3, H, W)
+        """
+        B = x.shape[0]
+        
+        # Get conditioning from genomic features
+        cond = self._get_conditioning(genomic, num_samples=1)
+        
+        # If single genomic for multiple tiles, expand
+        if cond.shape[0] == 1 and B > 1:
+            cond = cond.expand(B, -1)
+        
+        # Encode images to noise
+        x_T = self.encode(x, encode_steps)
+        
+        # Decode with genomic conditioning
+        model_kwargs = {"cond": cond}
+        samples = self.sampler.sample(
+            model=self.diffusion_model,
+            noise=x_T,
             cond=cond,
             model_kwargs=model_kwargs,
             progress=True,
@@ -354,13 +507,22 @@ def main():
                         help="Maximum number of patients to sample")
     
     # Sampling settings
+    parser.add_argument("--mode", type=str, default="random",
+                        choices=["random", "encode-decode"],
+                        help="Sampling mode: 'random' generates from random noise, "
+                             "'encode-decode' encodes real tiles and reconstructs")
     parser.add_argument("--num-samples-per-patient", type=int, default=4,
                         help="Number of tiles to generate per patient")
     parser.add_argument("--img-size", type=int, default=512)
-    parser.add_argument("--save-grid", action="store_true",
-                        help="Save samples as grid images")
     parser.add_argument("--seed", type=int, default=42,
                         help="Random seed for reproducibility")
+    
+    # Encode-decode mode settings
+    parser.add_argument("--tiles-zip-dir", type=str, default=None,
+                        help="Directory with tile zip files (required for encode-decode mode)")
+    parser.add_argument("--encode-steps", type=int, default=None,
+                        help="Number of diffusion steps for encoding (default: full T steps). "
+                             "Use smaller values (e.g., 250) for less noise/more preservation")
     
     # Output
     parser.add_argument("--output-dir", type=str, required=True,
@@ -376,6 +538,11 @@ def main():
             "both --diffusion-ckpt and --projection-head-ckpt"
         )
     
+    if args.mode == "encode-decode" and args.tiles_zip_dir is None:
+        raise ValueError(
+            "--tiles-zip-dir is required for encode-decode mode"
+        )
+    
     # Set seed
     torch.manual_seed(args.seed)
     if torch.cuda.is_available():
@@ -387,6 +554,7 @@ def main():
     print("=" * 60)
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
+    print(f"Mode: {args.mode}")
     print("=" * 60 + "\n")
     
     # Device
@@ -461,13 +629,44 @@ def main():
     
     print(f"[OK] Found {len(h5_files)} genomic H5 files")
     
+    # Load tile zips if encode-decode mode
+    tiles_by_patient = {}
+    if args.mode == "encode-decode":
+        print("\n" + "=" * 60)
+        print("LOADING TILE ZIPS FOR ENCODE-DECODE")
+        print("=" * 60)
+        
+        tiles_dir = Path(args.tiles_zip_dir).expanduser()
+        for h5_path in h5_files:
+            pid = canonical_patient_id(h5_path.name)
+            # Find matching zip file
+            matching_zips = list(tiles_dir.glob(f"*{pid}*.zip")) + \
+                           list(tiles_dir.glob(f"*{pid.replace('-', '')}*.zip"))
+            
+            if matching_zips:
+                zip_path = matching_zips[0]
+                tiles = load_tiles_from_zip(
+                    zip_path, 
+                    num_tiles=args.num_samples_per_patient,
+                    img_size=args.img_size
+                )
+                if tiles:
+                    tiles_by_patient[pid] = tiles
+                    print(f"  [OK] Loaded {len(tiles)} tiles for {pid}")
+                else:
+                    print(f"  [WARN] No valid tiles in zip for {pid}")
+            else:
+                print(f"  [WARN] No zip file found for {pid}")
+        
+        print(f"[OK] Loaded tiles for {len(tiles_by_patient)} patients")
+    
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
     # Generate samples
     print("\n" + "=" * 60)
-    print("GENERATING SAMPLES")
+    print(f"GENERATING SAMPLES (mode={args.mode})")
     print("=" * 60 + "\n")
     
     for h5_path in tqdm(h5_files, desc="Sampling"):
@@ -481,33 +680,46 @@ def main():
         
         genomic_tensor = torch.from_numpy(genomic.astype(np.float32))
         
-        # Generate samples
-        samples = genomic_sampler.sample(
-            genomic=genomic_tensor,
-            num_samples=args.num_samples_per_patient,
-        )
-        
-        # Save
-        patient_dir = output_dir / pid
-        patient_dir.mkdir(exist_ok=True)
-        
-        if args.save_grid:
-            # Save as a single grid image
-            grid = make_grid(samples, nrow=int(np.sqrt(args.num_samples_per_patient)))
-            grid = (grid + 1) / 2  # [-1, 1] -> [0, 1]
-            save_image(grid, patient_dir / "grid.png")
+        # Generate samples based on mode
+        if args.mode == "random":
+            # Random noise sampling
+            samples = genomic_sampler.sample(
+                genomic=genomic_tensor,
+                num_samples=args.num_samples_per_patient,
+            )
         else:
-            # Save individual images
+            # Encode-decode mode
+            if pid not in tiles_by_patient:
+                print(f"  [SKIP] No tiles for {pid}")
+                continue
+            
+            real_tiles = tiles_by_patient[pid]
+            samples = genomic_sampler.encode_decode(
+                genomic=genomic_tensor,
+                real_tiles=real_tiles,
+                encode_steps=args.encode_steps,
+            )
+        
+        # Save as zip file with individual PNGs
+        zip_path = output_dir / f"{pid}.zip"
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, sample in enumerate(samples):
                 img = tensor_to_pil(sample)
-                img.save(patient_dir / f"sample_{i:02d}.png")
+                # Save to bytes buffer
+                img_buffer = BytesIO()
+                img.save(img_buffer, format="PNG")
+                img_buffer.seek(0)
+                # Write to zip
+                zf.writestr(f"sample_{i:02d}.png", img_buffer.getvalue())
     
     print("\n" + "=" * 60)
     print("SAMPLING COMPLETE")
     print(f"  Output: {output_dir}")
+    print(f"  Mode: {args.mode}")
     print(f"  Patients: {len(h5_files)}")
     print(f"  Samples per patient: {args.num_samples_per_patient}")
-    print(f"  Total samples: {len(h5_files) * args.num_samples_per_patient}")
+    if args.mode == "encode-decode":
+        print(f"  Encode steps: {args.encode_steps or 'full T'}")
     print("=" * 60 + "\n")
 
 
