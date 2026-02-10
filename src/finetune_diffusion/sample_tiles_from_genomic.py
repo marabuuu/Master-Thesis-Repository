@@ -148,7 +148,7 @@ def load_tiles_from_zip(
     num_tiles: int,
     img_size: int = 512,
     random_sample: bool = True,
-) -> List[torch.Tensor]:
+) -> Tuple[List[torch.Tensor], List[str]]:
     """
     Load tile images from a zip file.
     
@@ -159,7 +159,9 @@ def load_tiles_from_zip(
         random_sample: If True, randomly sample tiles; else take first N
     
     Returns:
-        List of tensors, each (3, H, W) in range [-1, 1]
+        Tuple of:
+            - List of tensors, each (3, H, W) in range [-1, 1]
+            - List of original tile names (basenames without path)
     """
     transform = transforms.Compose([
         transforms.Resize(img_size, interpolation=transforms.InterpolationMode.BILINEAR),
@@ -169,12 +171,13 @@ def load_tiles_from_zip(
     ])
     
     tiles = []
+    tile_names = []
     with zipfile.ZipFile(zip_path, "r") as zf:
         candidates = [n for n in zf.namelist() 
                       if n.lower().endswith(('.png', '.jpg', '.jpeg'))]
         
         if not candidates:
-            return tiles
+            return tiles, tile_names
         
         # Select tiles
         if random_sample and len(candidates) > num_tiles:
@@ -186,8 +189,10 @@ def load_tiles_from_zip(
             with zf.open(tile_name) as f:
                 img = Image.open(BytesIO(f.read())).convert("RGB")
                 tiles.append(transform(img))
+                # Store just the filename (basename) for matching
+                tile_names.append(Path(tile_name).name)
     
-    return tiles
+    return tiles, tile_names
 
 
 # ----------------------------------------------------------------------
@@ -281,7 +286,7 @@ class GenomicConditionedSampler:
         return samples
     
     @torch.no_grad()
-    def encode(self, x: torch.Tensor, encode_steps: int = 250) -> torch.Tensor:
+    def encode(self, x: torch.Tensor, encode_steps: Optional[int] = None) -> torch.Tensor:
         """
         Encode images to stochastic noise representation.
         
@@ -296,25 +301,40 @@ class GenomicConditionedSampler:
         """
         x = x.to(self.device)
         B = x.shape[0]
-        
-        # Use neutral conditioning for encoding (zeros)
-        neutral_cond = torch.zeros(B, self.conds_mean.shape[0], device=self.device)
-        
-        # Get noise schedule parameters
-        # We'll do stochastic encoding by adding noise at level T
-        t = torch.full((B,), encode_steps - 1, device=self.device, dtype=torch.long)
-        
-        # Simple approach: add noise according to diffusion schedule
-        # This is a simplified encoding - for more precise encoding, use DDIM inversion
+
+        # Default to full schedule if not specified
+        alphas_cumprod = getattr(self.sampler, "alphas_cumprod", None)
+        if alphas_cumprod is None:
+            # Fallback: try to read from sampler.conf or sampler.betas
+            raise RuntimeError("Sampler does not expose 'alphas_cumprod'; cannot encode")
+
+        # Ensure alphas_cumprod is a torch tensor on the correct device
+        if not isinstance(alphas_cumprod, torch.Tensor):
+            alphas_cumprod = torch.tensor(np.array(alphas_cumprod), dtype=torch.float32, device=self.device)
+        else:
+            alphas_cumprod = alphas_cumprod.to(self.device)
+
+        # Determine timestep to encode to (use last index of requested steps)
+        max_T = int(alphas_cumprod.shape[0])
+        if encode_steps is None:
+            T = max_T
+        else:
+            T = min(int(encode_steps), max_T)
+            if int(encode_steps) > max_T:
+                print(f"[WARN] encode_steps={encode_steps} exceeds schedule length {max_T}; clamping to {max_T}")
+
+        t = torch.full((B,), T - 1, device=self.device, dtype=torch.long)
+
+        # Simple stochastic encoding (x_t = sqrt(alpha_bar) * x0 + sqrt(1-alpha_bar) * noise)
         noise = torch.randn_like(x)
-        
-        # Get alpha_bar at timestep t (from the sampler)
-        # Using simplified formula: x_t = sqrt(alpha_bar) * x_0 + sqrt(1 - alpha_bar) * noise
-        alpha_bar = self.sampler._extract(
-            self.sampler.alphas_cumprod.to(self.device), t, x.shape
-        )
-        x_t = torch.sqrt(alpha_bar) * x + torch.sqrt(1 - alpha_bar) * noise
-        
+
+        # Index alphas_cumprod at t and reshape for broadcasting
+        alpha_bar = alphas_cumprod[t]  # shape (B,)
+        # reshape to (B,1,1,1) for broadcasting over image dims
+        alpha_bar = alpha_bar.view(B, 1, 1, 1)
+
+        x_t = torch.sqrt(alpha_bar) * x + torch.sqrt(1.0 - alpha_bar) * noise
+
         return x_t
     
     @torch.no_grad()
@@ -645,13 +665,13 @@ def main():
             
             if matching_zips:
                 zip_path = matching_zips[0]
-                tiles = load_tiles_from_zip(
+                tiles, tile_names = load_tiles_from_zip(
                     zip_path, 
                     num_tiles=args.num_samples_per_patient,
                     img_size=args.img_size
                 )
                 if tiles:
-                    tiles_by_patient[pid] = tiles
+                    tiles_by_patient[pid] = (tiles, tile_names)
                     print(f"  [OK] Loaded {len(tiles)} tiles for {pid}")
                 else:
                     print(f"  [WARN] No valid tiles in zip for {pid}")
@@ -693,7 +713,7 @@ def main():
                 print(f"  [SKIP] No tiles for {pid}")
                 continue
             
-            real_tiles = tiles_by_patient[pid]
+            real_tiles, tile_names = tiles_by_patient[pid]
             # Stack list of tensors into batch tensor
             real_tiles_batch = torch.stack(real_tiles, dim=0)
             samples = genomic_sampler.encode_decode(
@@ -703,6 +723,7 @@ def main():
             )
         
         # Save as zip file with individual PNGs
+        # Use original tile names for encode-decode mode, indexed names for random mode
         zip_path = output_dir / f"{pid}.zip"
         with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
             for i, sample in enumerate(samples):
@@ -711,8 +732,13 @@ def main():
                 img_buffer = BytesIO()
                 img.save(img_buffer, format="PNG")
                 img_buffer.seek(0)
+                # Use original tile name if available (encode-decode mode), else indexed
+                if args.mode == "encode-decode" and i < len(tile_names):
+                    out_name = tile_names[i]
+                else:
+                    out_name = f"sample_{i:02d}.png"
                 # Write to zip
-                zf.writestr(f"sample_{i:02d}.png", img_buffer.getvalue())
+                zf.writestr(out_name, img_buffer.getvalue())
     
     print("\n" + "=" * 60)
     print("SAMPLING COMPLETE")
