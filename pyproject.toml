@@ -36,6 +36,7 @@ dependencies = [
     "shapely>=2.1.2",
     "openslide-python>=1.4.3",
     "rtree>=1.4.1",
+    "pytest>=7.4.4",
 ]
 
 
