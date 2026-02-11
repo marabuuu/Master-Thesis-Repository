@@ -25,6 +25,7 @@ Usage:
 
 import argparse
 import copy
+import math
 import os
 import random
 import re
@@ -279,6 +280,118 @@ class GenomicTileDataset(Dataset):
 
 
 # ----------------------------------------------------------------------
+#   Early Stopping
+# ----------------------------------------------------------------------
+
+class EarlyStopping:
+    """Stop training when the monitored loss stops improving.
+
+    Args:
+        patience: Number of epochs with no improvement before stopping.
+                  Set to 0 to disable.
+        min_delta: Minimum absolute decrease in loss to count as an
+                   improvement.  Helps ignore noise.
+        restore_best: If True the caller should reload the best checkpoint
+                      after training ends (signalled by `self.should_stop`).
+    """
+
+    def __init__(self, patience: int = 0, min_delta: float = 0.0,
+                 restore_best: bool = True):
+        self.patience = patience
+        self.min_delta = min_delta
+        self.restore_best = restore_best
+
+        self.best_loss: Optional[float] = None
+        self.epochs_without_improvement: int = 0
+        self.should_stop: bool = False
+        self.best_epoch: int = 0
+
+    @property
+    def enabled(self) -> bool:
+        return self.patience > 0
+
+    def step(self, loss: float, epoch: int) -> bool:
+        """Call once per epoch.  Returns True when training should stop."""
+        if not self.enabled:
+            return False
+
+        if self.best_loss is None or loss < self.best_loss - self.min_delta:
+            self.best_loss = loss
+            self.epochs_without_improvement = 0
+            self.best_epoch = epoch
+        else:
+            self.epochs_without_improvement += 1
+
+        if self.epochs_without_improvement >= self.patience:
+            self.should_stop = True
+            return True
+        return False
+
+    def status_message(self) -> str:
+        if not self.enabled:
+            return "early stopping disabled"
+        return (f"patience {self.epochs_without_improvement}/{self.patience} "
+                f"(best={self.best_loss:.6f} @ epoch {self.best_epoch})")
+
+
+# ----------------------------------------------------------------------
+#   LR Scheduler helpers
+# ----------------------------------------------------------------------
+
+class _LinearWarmupCosineDecay(torch.optim.lr_scheduler.LambdaLR):
+    """Linear warmup for `warmup_epochs`, then cosine decay to `eta_min`."""
+
+    def __init__(self, optimizer, warmup_epochs: int, total_epochs: int,
+                 eta_min_factor: float = 0.01, last_epoch: int = -1):
+        self.warmup_epochs = warmup_epochs
+        self.total_epochs = total_epochs
+        self.eta_min_factor = eta_min_factor
+        super().__init__(optimizer, self._lr_lambda, last_epoch=last_epoch)
+
+    def _lr_lambda(self, epoch: int) -> float:
+        if epoch < self.warmup_epochs:
+            # linear warmup from 0 → 1
+            return max(epoch / max(self.warmup_epochs, 1), 1e-6)
+        # cosine decay from 1 → eta_min_factor
+        progress = (epoch - self.warmup_epochs) / max(
+            self.total_epochs - self.warmup_epochs, 1)
+        import math
+        return self.eta_min_factor + 0.5 * (1.0 - self.eta_min_factor) * (
+            1.0 + math.cos(math.pi * progress))
+
+
+def build_scheduler(optimizer, args):
+    """Build a learning-rate scheduler from CLI arguments.
+
+    Supported values for ``args.scheduler``:
+    * ``cosine``        – CosineAnnealingLR (default, current behaviour)
+    * ``cosine_warmup`` – Linear warmup + cosine decay
+    * ``plateau``       – ReduceLROnPlateau (reacts to loss stagnation)
+    """
+    name = getattr(args, "scheduler", "cosine")
+    warmup = getattr(args, "warmup_epochs", 0)
+
+    if name == "cosine_warmup" or (name == "cosine" and warmup > 0):
+        print(f"[INFO] LR scheduler: cosine with {warmup}-epoch linear warmup")
+        return _LinearWarmupCosineDecay(
+            optimizer,
+            warmup_epochs=warmup,
+            total_epochs=args.epochs,
+            eta_min_factor=0.01,
+        )
+    elif name == "plateau":
+        print("[INFO] LR scheduler: ReduceLROnPlateau (factor=0.5, patience=3)")
+        return torch.optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer, mode="min", factor=0.5, patience=3,
+        )
+    else:  # default: plain cosine
+        print("[INFO] LR scheduler: CosineAnnealingLR")
+        return torch.optim.lr_scheduler.CosineAnnealingLR(
+            optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
+        )
+
+
+# ----------------------------------------------------------------------
 #   Diffusion Fine-tuning
 # ----------------------------------------------------------------------
 
@@ -402,8 +515,14 @@ def finetune_diffusion(
         weight_decay=args.weight_decay,
     )
     
-    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
-        optimizer, T_max=args.epochs, eta_min=args.lr * 0.01
+    scheduler = build_scheduler(optimizer, args)
+    is_plateau_scheduler = isinstance(
+        scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
+    
+    # Early stopping
+    early_stopping = EarlyStopping(
+        patience=getattr(args, "early_stopping_patience", 0),
+        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
     )
     
     print(f"\n[INFO] Training config:")
@@ -412,8 +531,15 @@ def finetune_diffusion(
     print(f"       Grad accum steps: {args.grad_accum_steps}")
     print(f"       Effective batch size: {args.batch_size * args.grad_accum_steps}")
     print(f"       Learning rate: {args.lr}")
+    print(f"       Scheduler: {getattr(args, 'scheduler', 'cosine')}")
+    print(f"       Warmup epochs: {getattr(args, 'warmup_epochs', 0)}")
     print(f"       Freeze projection: {args.freeze_projection_head}")
     print(f"       Mixed precision (fp16): {args.fp16}")
+    if early_stopping.enabled:
+        print(f"       Early stopping: patience={early_stopping.patience}, "
+              f"min_delta={early_stopping.min_delta}")
+    else:
+        print(f"       Early stopping: disabled")
     
     # Setup mixed precision
     use_amp = args.fp16 and device.startswith("cuda")
@@ -492,14 +618,22 @@ def finetune_diffusion(
                 pbar.set_postfix({"loss": accum_loss})
                 accum_loss = 0.0
         
-        scheduler.step()
+        # Step the LR scheduler
         # Average loss: we accumulate per optimizer step, divide by number of steps
         num_optim_steps = (len(train_loader) + args.grad_accum_steps - 1) // args.grad_accum_steps
         epoch_loss /= max(num_optim_steps, 1)
+
+        if is_plateau_scheduler:
+            scheduler.step(epoch_loss)
+        else:
+            scheduler.step()
+
+        # Current LR (works for all scheduler types)
+        current_lr = optimizer.param_groups[0]["lr"]
         epoch_time = time.time() - epoch_start
         
         print(f"\nEpoch {epoch}/{args.epochs} | Time: {epoch_time:.1f}s | "
-              f"Loss: {epoch_loss:.6f} | LR: {scheduler.get_last_lr()[0]:.2e}")
+              f"Loss: {epoch_loss:.6f} | LR: {current_lr:.2e}")
         
         if device.startswith("cuda"):
             mem = torch.cuda.memory_allocated(device) / 1024**3
@@ -523,12 +657,25 @@ def finetune_diffusion(
                 conds_mean, conds_std, epoch, epoch_loss, args
             )
             print(f"  Checkpoint saved: epoch {epoch}")
+        
+        # Early stopping check
+        if early_stopping.step(epoch_loss, epoch):
+            print(f"\n[EARLY STOPPING] No improvement for {early_stopping.patience} "
+                  f"epochs. Best loss {early_stopping.best_loss:.6f} at epoch "
+                  f"{early_stopping.best_epoch}. Stopping.")
+            break
+        elif early_stopping.enabled:
+            print(f"  Early stopping: {early_stopping.status_message()}")
     
     total_time = time.time() - training_start
+    stopped_early = early_stopping.should_stop
     print("\n" + "=" * 60)
-    print("FINE-TUNING COMPLETE")
+    print("FINE-TUNING COMPLETE" + (" (early stopped)" if stopped_early else ""))
+    print(f"  Epochs run: {epoch}/{args.epochs}")
     print(f"  Total time: {total_time/60:.1f} minutes")
     print(f"  Best loss: {best_loss:.6f}")
+    if early_stopping.enabled:
+        print(f"  Best epoch: {early_stopping.best_epoch}")
     print(f"  Output: {args.out_dir}")
     print("=" * 60 + "\n")
 
@@ -597,6 +744,19 @@ def main():
     parser.add_argument("--lr", type=float, default=1e-5,
                         help="Learning rate (lower than pretraining)")
     parser.add_argument("--weight-decay", type=float, default=0.01)
+    
+    # Scheduler & early stopping
+    parser.add_argument("--scheduler", type=str, default="cosine",
+                        choices=["cosine", "cosine_warmup", "plateau"],
+                        help="LR scheduler type (default: cosine)")
+    parser.add_argument("--warmup-epochs", type=int, default=0,
+                        help="Number of linear-warmup epochs before cosine decay "
+                             "(only used with cosine/cosine_warmup scheduler)")
+    parser.add_argument("--early-stopping-patience", type=int, default=0,
+                        help="Stop after N epochs without improvement (0 = disabled)")
+    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0,
+                        help="Minimum loss decrease to count as improvement")
+    
     parser.add_argument("--tiles-per-patient", type=int, default=10,
                         help="Tiles to sample per patient per epoch")
     parser.add_argument("--split", type=str, default="train",

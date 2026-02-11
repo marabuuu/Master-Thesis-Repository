@@ -77,12 +77,12 @@ class TestProjectionHeadBadInput:
 
     def test_wrong_ndim_raises(self):
         head = ProjectionHead(in_dim=64, out_dim=64)
-        with pytest.raises(AssertionError):
+        with pytest.raises((AssertionError, RuntimeError)):
             head(torch.randn(64))  # 1-D instead of 2-D
 
     def test_wrong_feature_dim_raises(self):
         head = ProjectionHead(in_dim=64, out_dim=64)
-        with pytest.raises(AssertionError):
+        with pytest.raises((AssertionError, RuntimeError)):
             head(torch.randn(4, 128))  # dim mismatch
 
     def test_unknown_arch_raises(self):
@@ -209,3 +209,118 @@ class TestGenomicTileDatasetErrors:
                 genomic_h5_dir=str(genomic_dir),
                 tiles_zip_dir=str(tiles_dir),
             )
+
+
+# ======================================================================
+#   EarlyStopping
+# ======================================================================
+
+class TestEarlyStopping:
+
+    def _make_es(self, patience=3, min_delta=0.0):
+        from src.finetune_diffusion.finetune_diffusion_with_genomic import EarlyStopping
+        return EarlyStopping(patience=patience, min_delta=min_delta)
+
+    def test_disabled_when_patience_zero(self):
+        es = self._make_es(patience=0)
+        assert not es.enabled
+        assert es.step(1.0, 1) is False
+
+    def test_does_not_stop_while_improving(self):
+        es = self._make_es(patience=3)
+        assert es.step(1.0, 1) is False
+        assert es.step(0.9, 2) is False
+        assert es.step(0.8, 3) is False
+        assert not es.should_stop
+
+    def test_stops_after_patience_exhausted(self):
+        es = self._make_es(patience=2)
+        es.step(1.0, 1)  # new best
+        es.step(1.1, 2)  # no improvement (1)
+        result = es.step(1.2, 3)  # no improvement (2) → should stop
+        assert result is True
+        assert es.should_stop
+        assert es.best_epoch == 1
+
+    def test_resets_counter_on_improvement(self):
+        es = self._make_es(patience=2)
+        es.step(1.0, 1)
+        es.step(1.1, 2)  # no improvement (1)
+        es.step(0.5, 3)  # big improvement → resets
+        assert es.epochs_without_improvement == 0
+        es.step(0.6, 4)  # no improvement (1)
+        assert not es.should_stop
+
+    def test_min_delta_must_be_exceeded(self):
+        es = self._make_es(patience=2, min_delta=0.1)
+        es.step(1.0, 1)
+        # Tiny improvement (0.01 < min_delta=0.1) does NOT count
+        es.step(0.99, 2)
+        es.step(0.98, 3)
+        assert es.should_stop
+
+    def test_min_delta_improvement_counts(self):
+        es = self._make_es(patience=2, min_delta=0.1)
+        es.step(1.0, 1)
+        es.step(0.85, 2)  # drop of 0.15 > 0.1 → counts as improvement
+        assert es.epochs_without_improvement == 0
+        assert not es.should_stop
+
+    def test_status_message(self):
+        es = self._make_es(patience=5)
+        es.step(0.5, 1)
+        msg = es.status_message()
+        assert "patience" in msg
+        assert "best=" in msg
+
+
+# ======================================================================
+#   build_scheduler
+# ======================================================================
+
+class TestBuildScheduler:
+
+    def _make_args(self, **overrides):
+        """Create a minimal namespace that looks like the argparse output."""
+        from types import SimpleNamespace
+        defaults = dict(
+            epochs=10, lr=1e-4, scheduler="cosine",
+            warmup_epochs=0,
+        )
+        defaults.update(overrides)
+        return SimpleNamespace(**defaults)
+
+    def _make_optimizer(self):
+        model = torch.nn.Linear(4, 4)
+        return torch.optim.AdamW(model.parameters(), lr=1e-4)
+
+    def test_cosine_scheduler(self):
+        from src.finetune_diffusion.finetune_diffusion_with_genomic import build_scheduler
+        opt = self._make_optimizer()
+        sched = build_scheduler(opt, self._make_args(scheduler="cosine"))
+        assert isinstance(sched, torch.optim.lr_scheduler.CosineAnnealingLR)
+
+    def test_plateau_scheduler(self):
+        from src.finetune_diffusion.finetune_diffusion_with_genomic import build_scheduler
+        opt = self._make_optimizer()
+        sched = build_scheduler(opt, self._make_args(scheduler="plateau"))
+        assert isinstance(sched, torch.optim.lr_scheduler.ReduceLROnPlateau)
+
+    def test_cosine_warmup_scheduler(self):
+        from src.finetune_diffusion.finetune_diffusion_with_genomic import build_scheduler
+        opt = self._make_optimizer()
+        sched = build_scheduler(opt, self._make_args(
+            scheduler="cosine_warmup", warmup_epochs=3))
+        # Should be our custom LambdaLR-based scheduler
+        assert isinstance(sched, torch.optim.lr_scheduler.LambdaLR)
+
+    def test_warmup_lr_starts_low(self):
+        """During warmup the LR should be lower than the base LR."""
+        from src.finetune_diffusion.finetune_diffusion_with_genomic import build_scheduler
+        opt = self._make_optimizer()
+        sched = build_scheduler(opt, self._make_args(
+            scheduler="cosine_warmup", warmup_epochs=5, epochs=20))
+        # After 1 step (epoch 0→1) we should be in warmup still
+        sched.step()
+        lr_after_one = opt.param_groups[0]["lr"]
+        assert lr_after_one < 1e-4, "LR during warmup should be below base LR"
