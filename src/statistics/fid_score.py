@@ -28,7 +28,7 @@ import os
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, cast
 
 import numpy as np
 from PIL import Image
@@ -39,6 +39,7 @@ import torch.nn as nn
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
 from torchvision.models import inception_v3, Inception_V3_Weights
+from scipy import linalg
 
 # Try to import scipy for matrix square root
 try:
@@ -64,7 +65,7 @@ class InceptionFeatureExtractor(nn.Module):
         
         # Load pretrained InceptionV3
         self.model = inception_v3(weights=Inception_V3_Weights.IMAGENET1K_V1)
-        self.model.fc = nn.Identity()  # Remove classification head
+        self.model.fc = cast(nn.Linear, nn.Identity())  # Remove classification head
         self.model.eval()
         self.model.to(device)
         
@@ -209,7 +210,7 @@ def compute_fid(mu1: np.ndarray, sigma1: np.ndarray,
     
     # Handle numerical errors
     if np.iscomplexobj(covmean):
-        if not np.allclose(np.diagonal(covmean).imag, 0, atol=1e-3):
+        if not np.allclose(np.imag(np.diagonal(covmean)), 0, atol=1e-3):
             print("Warning: Complex values in matrix square root, taking real part")
         covmean = covmean.real
     

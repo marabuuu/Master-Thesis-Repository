@@ -22,16 +22,17 @@ Usage:
 import argparse
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
-
+from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
 import matplotlib.pyplot as plt
+from matplotlib.figure import Figure
 import numpy as np
 
-try:
+if TYPE_CHECKING:
     import torch
-    HAS_TORCH = True
-except ImportError:
-    HAS_TORCH = False
+
+# Import torch at runtime inside functions that need it. This keeps the script
+# usable for log-only plotting when PyTorch isn't installed while still
+# informing static type checkers about `torch`.
 
 
 def parse_checkpoints(checkpoint_dir: Path) -> Dict[str, List[Tuple[int, float]]]:
@@ -42,8 +43,13 @@ def parse_checkpoints(checkpoint_dir: Path) -> Dict[str, List[Tuple[int, float]]
     mapping to list of (epoch, value) tuples.
     """
     checkpoint_dir = Path(checkpoint_dir)
-    
-    if not HAS_TORCH:
+
+    # Import torch at runtime to allow the module to be imported without
+    # PyTorch when only plotting logs. Static type checkers still see `torch`
+    # from the `TYPE_CHECKING` import above.
+    try:
+        import torch  # type: ignore
+    except Exception:
         raise ImportError("PyTorch is required to parse checkpoint files")
     
     # Find all checkpoint files
@@ -148,7 +154,7 @@ def plot_training_curves(
     output_path: Optional[str] = None,
     show: bool = True,
     figsize: Tuple[int, int] = (12, 6),
-) -> plt.Figure:
+) -> Figure:
     """
     Plot training curves from one or more training runs.
     
@@ -183,7 +189,7 @@ def plot_training_curves(
         axes = axes.flatten() if n_metrics > 1 else [axes]
     
     # Color palette
-    colors = plt.cm.tab10(np.linspace(0, 1, len(histories)))
+    colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(histories)))
     
     # Plot each metric
     for idx, metric in enumerate(sorted(all_metrics)):

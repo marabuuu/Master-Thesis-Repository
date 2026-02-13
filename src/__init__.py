@@ -9,6 +9,12 @@ Modules:
     scripts: Utility scripts (classifiers, evaluation)
 """
 
+from . import encoding
+from . import finetune_diffusion
+from . import preprocessing
+from . import statistics
+from . import scripts
+
 __all__ = [
     "encoding",
     "finetune_diffusion",
@@ -16,3 +22,4 @@ __all__ = [
     "statistics",
     "scripts",
 ]
+
