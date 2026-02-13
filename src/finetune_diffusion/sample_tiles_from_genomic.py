@@ -46,7 +46,7 @@ import random
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import List, Optional, Tuple, TYPE_CHECKING
 
 import h5py
 import numpy as np
@@ -56,6 +56,21 @@ import torch.nn.functional as F
 from PIL import Image
 from torchvision import transforms
 from tqdm import tqdm
+
+
+# Import mopadi conditionally so static analyzers don't require it at analysis time.
+if TYPE_CHECKING:  # pragma: no cover - for type checkers only
+    from mopadi.configs.templates import tcga_brca_autoenc  # type: ignore
+else:
+    try:
+        from mopadi.configs.templates import tcga_brca_autoenc
+    except Exception as e:
+        raise RuntimeError(
+            "mopadi is required for sampling but could not be imported. "
+            "Install mopadi in your environment (e.g. `pip install -e /path/to/mopadi`) "
+            "or activate the interpreter that has mopadi installed. "
+            f"Original error: {e}"
+        ) from e
 
 
 # ----------------------------------------------------------------------
@@ -135,12 +150,21 @@ def canonical_patient_id(name: str) -> str:
 
 def tensor_to_pil(tensor: torch.Tensor) -> Image.Image:
     """Convert a tensor [-1, 1] to PIL Image."""
-    tensor = tensor.detach().cpu()
-    tensor = (tensor + 1) / 2  # [-1, 1] -> [0, 1]
-    tensor = tensor.clamp(0, 1)
-    tensor = tensor.mul(255).byte()
-    tensor = tensor.permute(1, 2, 0).numpy()
-    return Image.fromarray(tensor)
+    t = tensor.detach().cpu()
+    t = (t + 1) / 2  # [-1, 1] -> [0, 1]
+    t = t.clamp(0, 1)
+    # Convert to [0,255] uint8 numpy image with shape (H, W, C)
+    np_img = (t.mul(255)).to(torch.uint8).permute(1, 2, 0).numpy()
+
+    # Ensure C-contiguous for PIL and type-checkers
+    if not np_img.flags.c_contiguous:
+        np_img = np.ascontiguousarray(np_img)
+
+    # PIL expects HxW or HxWxC uint8/float; ensure uint8
+    if np_img.dtype != np.uint8:
+        np_img = np_img.astype(np.uint8)
+
+    return Image.fromarray(np_img)
 
 
 def load_tiles_from_zip(
@@ -406,8 +430,7 @@ def load_model_from_combined_checkpoint(
     projection_head.load_state_dict(ckpt["projection_head_state_dict"])
     print(f"[OK] Loaded projection head")
     
-    # Load diffusion model
-    from mopadi.configs.templates import tcga_brca_autoenc
+    # Load diffusion model (tcga_brca_autoenc imported conditionally at module level)
     conf = tcga_brca_autoenc()
     model = conf.make_model_conf().make_model()
     
@@ -454,8 +477,7 @@ def load_model_from_separate_checkpoints(
     conds_mean = proj_ckpt.get("target_mean", torch.zeros(512))
     conds_std = proj_ckpt.get("target_std", torch.ones(512))
     
-    # Load diffusion model
-    from mopadi.configs.templates import tcga_brca_autoenc
+    # Load diffusion model (tcga_brca_autoenc imported conditionally at module level)
     conf = tcga_brca_autoenc()
     model = conf.make_model_conf().make_model()
     
@@ -691,6 +713,8 @@ def main():
     
     for h5_path in tqdm(h5_files, desc="Sampling"):
         pid = canonical_patient_id(h5_path.name)
+        # Ensure `tile_names` is always defined (encode-decode branch will overwrite)
+        tile_names: List[str] = []
         
         # Load genomic features
         with h5py.File(h5_path, "r") as f:

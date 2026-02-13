@@ -43,6 +43,7 @@ import sys
 from collections import defaultdict
 from pathlib import Path
 from typing import Optional
+from collections.abc import Sequence
 
 import h5py
 import numpy as np
@@ -51,12 +52,13 @@ import torch
 import torch.optim as optim
 from sklearn.model_selection import train_test_split
 from torch.utils.data import DataLoader, TensorDataset
+from pandas.api.types import is_scalar
 
 # Add parent to path for imports when running as script
 sys.path.insert(0, str(Path(__file__).parent.parent.parent))
 
-from src.encoding.architecture import ProbabilisticEncoder, ProbabilisticDecoder, VAE
-from src.preprocessing.utils import preprocess_log1p_zscore, inspect_variance
+from encoding.architecture import ProbabilisticEncoder, ProbabilisticDecoder, VAE
+from preprocessing.utils import preprocess_log1p_zscore, inspect_variance
 
 
 def make_unique_ids(index_iter):
@@ -309,6 +311,33 @@ def train_vae(
 
     # Build labels
     labels = None
+    def _safe_label_val(val):
+        """Return a single scalar-like label from various input types.
+
+        Handles pandas Series/DataFrame, numpy arrays, lists/tuples and
+        plain scalars. Always returns a scalar or pd.NA.
+        """
+        # Unwrap DataFrame / Series first
+        if isinstance(val, pd.DataFrame):
+            try:
+                v = val.iloc[0, 0] if val.size else pd.NA
+            except Exception:
+                return pd.NA
+        elif isinstance(val, pd.Series):
+            try:
+                v = val.iloc[0] if len(val) else pd.NA
+            except Exception:
+                return pd.NA
+        # handle sequence-like (but not str/bytes)
+        elif isinstance(val, Sequence) and not isinstance(val, (str, bytes, bytearray)):
+            try:
+                v = val[0] if len(val) else pd.NA
+            except Exception:
+                return pd.NA
+        else:
+            v = val
+
+        return v if pd.notna(v) else pd.NA
     if metadata_csv is not None and os.path.exists(metadata_csv):
         try:
             meta = pd.read_csv(metadata_csv, index_col=0)
@@ -322,9 +351,7 @@ def train_vae(
                     orig = orig_map.get(uid, uid)
                     if orig in meta.index:
                         val = meta.loc[orig, label_col]
-                        if isinstance(val, (pd.Series, pd.DataFrame)):
-                            val = val.iloc[0]
-                        lab_vals.append(val if pd.notna(val) else pd.NA)
+                        lab_vals.append(_safe_label_val(val))
                     else:
                         lab_vals.append(pd.NA)
                 labels = pd.Series(lab_vals, index=df_z.index)
@@ -337,18 +364,30 @@ def train_vae(
             orig = orig_map.get(uid, uid)
             if orig in csv_labels.index:
                 val = csv_labels.loc[orig]
-                if isinstance(val, (pd.Series, pd.DataFrame)):
-                    val = val.iloc[0]
-                lab_vals.append(val if pd.notna(val) else pd.NA)
+                lab_vals.append(_safe_label_val(val))
             else:
                 lab_vals.append(pd.NA)
         labels = pd.Series(lab_vals, index=df_z.index)
 
     # Train/test split
+    # Prepare a plain NumPy array for stratification (sklearn doesn't accept
+    # pandas ExtensionArray and cannot handle missing values). Disable
+    # stratification if any labels are missing.
+    stratify_arr = None
+    if labels is not None:
+        try:
+            arr = np.asarray(labels.astype(object))
+            if not pd.isna(arr).any():
+                stratify_arr = arr
+            else:
+                stratify_arr = None
+        except Exception:
+            stratify_arr = None
+
     try:
         train_idx, test_idx = train_test_split(
             df_z.index, test_size=test_size, random_state=random_state,
-            stratify=(labels.values if labels is not None else None)
+            stratify=stratify_arr
         )
     except Exception:
         train_idx, test_idx = train_test_split(

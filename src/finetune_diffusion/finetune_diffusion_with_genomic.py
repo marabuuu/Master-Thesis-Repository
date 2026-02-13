@@ -39,6 +39,7 @@ from typing import Optional, Tuple
 import h5py
 import numpy as np
 import torch
+from torch.cuda.amp import GradScaler, autocast
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
@@ -410,13 +411,26 @@ def finetune_diffusion(
     - Trainable: Both adapt together (joint fine-tuning)
     """
     
-    # Import MoPaDi
-    try:
-        from mopadi.configs.templates import tcga_brca_autoenc
-        from mopadi.model.unet import BeatGANsUNetModel
-        from mopadi.model.nn import timestep_embedding
-    except ImportError as e:
-        raise RuntimeError(f"Failed to import MoPaDi: {e}")
+    # Import MoPaDi. Use TYPE_CHECKING to keep static checkers satisfied
+    # while providing a clear runtime error when mopadi isn't installed.
+    from typing import TYPE_CHECKING
+
+    if TYPE_CHECKING:  # pragma: no cover - for type checkers only
+        from mopadi.configs.templates import tcga_brca_autoenc  # type: ignore
+        from mopadi.model.unet import BeatGANsUNetModel  # type: ignore
+        from mopadi.model.nn import timestep_embedding  # type: ignore
+    else:
+        try:
+            from mopadi.configs.templates import tcga_brca_autoenc
+            from mopadi.model.unet import BeatGANsUNetModel
+            from mopadi.model.nn import timestep_embedding
+        except Exception as e:  # broad except to capture ImportError and attribute errors
+            raise RuntimeError(
+                "mopadi is required for diffusion fine-tuning but could not be imported. "
+                "Install mopadi in your environment (e.g. `pip install -e /path/to/mopadi`) "
+                "or activate the interpreter that has mopadi installed. "
+                f"Original error: {e}"
+            ) from e
     
     print("\n" + "=" * 60)
     print("LOADING DIFFUSION MODEL")
@@ -542,8 +556,8 @@ def finetune_diffusion(
         print(f"       Early stopping: disabled")
     
     # Setup mixed precision
-    use_amp = args.fp16 and device.startswith("cuda")
-    scaler = torch.amp.GradScaler(enabled=use_amp)
+    use_amp = args.fp16 and device.startswith("cuda") and torch.cuda.is_available()
+    scaler = GradScaler(enabled=use_amp)
     if use_amp:
         print("[INFO] Using mixed precision training (fp16)")
     
@@ -554,6 +568,7 @@ def finetune_diffusion(
     
     best_loss = float("inf")
     training_start = time.time()
+    epoch = 0
     
     for epoch in range(1, args.epochs + 1):
         epoch_start = time.time()
@@ -573,7 +588,7 @@ def finetune_diffusion(
             B = imgs.shape[0]
             
             # Mixed precision forward pass
-            with torch.amp.autocast(device_type="cuda", enabled=use_amp):
+            with autocast(enabled=use_amp):
                 # Project genomic features
                 with torch.set_grad_enabled(not args.freeze_projection_head):
                     projected = projection_head(genomic)  # (B, 512)

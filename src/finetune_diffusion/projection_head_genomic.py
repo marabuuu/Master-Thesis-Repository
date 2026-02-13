@@ -62,7 +62,7 @@ import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple, Sized, cast
 
 import h5py
 import numpy as np
@@ -805,10 +805,14 @@ def train_reconstruction(
     
     # Load MoPaDi diffusion model
     try:
-        from mopadi.configs.templates import tcga_brca_autoenc
-        from mopadi.utils.encode import ImageEncoder
+        from mopadi.configs.templates import tcga_brca_autoenc  # type: ignore
+        from mopadi.utils.encode import ImageEncoder  # type: ignore
     except ImportError as e:
-        raise RuntimeError("Failed to import MoPaDi. Ensure it's installed.") from e
+        raise RuntimeError(
+            "Failed to import MoPaDi. Ensure it's installed:\n"
+            "  pip install -e /path/to/mopadi\n"
+            f"Original error: {e}"
+        ) from e
     
     diffusion = ImageEncoder(
         tcga_brca_autoenc(),
@@ -906,13 +910,13 @@ def train_distribution_matching(
     print(f"  Learning rate: {args.lr}")
     print(f"  Weight decay: {args.weight_decay}")
     print(f"  Num batches: {len(train_loader)}")
-    print(f"  Num samples: {len(train_loader.dataset)}")
+    print(f"  Num samples: {len(cast(Sized, train_loader.dataset))}")
     print("-" * 50 + "\n")
     
     # Load MoPaDi diffusion model to get conditioning statistics
     try:
-        from mopadi.configs.templates import tcga_brca_autoenc
-        from mopadi.utils.encode import ImageEncoder
+        from mopadi.configs.templates import tcga_brca_autoenc  # type: ignore
+        from mopadi.utils.encode import ImageEncoder  # type: ignore
     except ImportError as e:
         raise RuntimeError(
             "Failed to import MoPaDi. Ensure mopadi is installed:\n"
@@ -1290,8 +1294,6 @@ def main():
     print(f"Mode: {args.mode}")
     print(f"PyTorch version: {torch.__version__}")
     print(f"CUDA available: {torch.cuda.is_available()}")
-    if torch.cuda.is_available():
-        print(f"CUDA version: {torch.version.cuda}")
     print("=" * 60 + "\n")
     
     if args.convert:
