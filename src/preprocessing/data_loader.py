@@ -1,6 +1,6 @@
 import pandas as pd
 import numpy as np
-from src.preprocessing.utils import preprocess_log1p_zscore, preprocess_log1p_minmax, inspect_variance
+from preprocessing.utils import preprocess_log1p_zscore, preprocess_log1p_minmax, inspect_variance
 
 
 class GeneExpressionDataLoader:

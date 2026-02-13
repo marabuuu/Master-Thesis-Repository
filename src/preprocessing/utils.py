@@ -13,7 +13,7 @@ from shapely.validation import make_valid
 import traceback
 import logging
 import h5py
-from typing import List, Optional
+from typing import List, Optional, Tuple, cast
 
 
 def preprocess_log1p_minmax(df: pd.DataFrame) -> pd.DataFrame:
@@ -84,24 +84,28 @@ def create_dataframe(arrays):
     return df
 
 
-def read_h5_file(h5_file_path):
+def read_h5_file(h5_file_path: str) -> Tuple[Optional[np.ndarray], np.ndarray, np.ndarray, Optional[np.ndarray]]:
+    """Read expected datasets from an HDF5 file.
+
+    Returns a tuple: (augmented_or_None, coords, feats, zoom_or_None).
+    Raises KeyError if required datasets are missing.
+    """
     with h5py.File(h5_file_path, 'r') as f:
-        # print(f.keys())  # print all keys
+        # Use .get to allow missing optional datasets and to help static type checkers
+        coords_ds = f.get('coords')
+        feats_ds = f.get('feats')
+        if coords_ds is None or feats_ds is None:
+            raise KeyError(f"Required datasets 'coords' or 'feats' not found in {h5_file_path}")
 
-        coords = f['coords'][:]
-        feats = f['feats'][:]
+        # Cast to h5py.Dataset so type checkers know __getitem__ is available
+        coords = cast(h5py.Dataset, coords_ds)[()]  # read entire dataset
+        feats = cast(h5py.Dataset, feats_ds)[()]
 
-        # check if "augmented" data exists, and if so, read it
-        if 'augmented' in f.keys():
-            augmented = f['augmented'][:]
-        else:
-            augmented = None
+        augmented_ds = f.get('augmented')
+        augmented = cast(h5py.Dataset, augmented_ds)[()] if augmented_ds is not None else None
 
-        # check if "zoom" data exists, and if so, read it
-        if 'zoom' in f.keys():
-            zoom = f['zoom'][:]
-        else:
-            zoom = None
+        zoom_ds = f.get('zoom')
+        zoom = cast(h5py.Dataset, zoom_ds)[()] if zoom_ds is not None else None
 
         return augmented, coords, feats, zoom
 
@@ -173,7 +177,7 @@ def read_annotations(annon_path):
     # Combine the individual polygons into a single MultiPolygon object
     annPolys = sg.MultiPolygon(polygons)
 
-    return annPolys, np.int32(rectcoords_list)
+    return annPolys, np.asarray(rectcoords_list, dtype=np.int32)
 
 def find_substring_in_list(strings, substring):
     return [s for s in strings if substring in s]
@@ -187,8 +191,12 @@ def extract_coordinates(filename):
     else:
         return None
 
-def create_polygons_from_filenames(filenames):
-    """Extract coordinates from filename. Assumes that coordinates were written as X,Y """
+def create_polygons_from_filenames_simple(filenames):
+    """Simple helper: extract coordinates from filenames and build 512px polygons.
+
+    Renamed to avoid clobbering the more advanced `create_polygons_from_filenames`.
+    Keeps original behaviour for callers that may expect the simple version.
+    """
     polygons = []
     for filename in filenames:
         coords = extract_coordinates(filename)
@@ -250,12 +258,18 @@ def get_mpp_from_tiler_params(params: dict) -> Optional[float]:
         # sometimes keys may be nested or named differently; try some fallbacks
         for k in ['tile_size', 'tile_px']:
             if k in params:
-                # best-effort parse
+                # best-effort parse — guard against None or non-indexable values
                 vals = params.get(k)
-                try:
-                    return float(vals[0]) / float(vals[1])
-                except Exception:
+                if not vals or not isinstance(vals, (list, tuple)) or len(vals) < 2:
                     continue
+                try:
+                    num = float(vals[0])
+                    den = float(vals[1])
+                except (TypeError, ValueError):
+                    continue
+                if den == 0:
+                    continue
+                return num / den
     except Exception:
         logging.exception('Error computing MPP from tiler params')
     return None

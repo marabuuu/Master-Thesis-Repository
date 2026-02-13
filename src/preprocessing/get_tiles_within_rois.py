@@ -15,7 +15,7 @@ import logging
 import concurrent.futures
 import shutil
 from tqdm import tqdm
-from preprocessing.utils import *
+from preprocessing.utils import parse_tile_coords, read_zip_tile_list, read_tiler_params, get_mpp_from_tiler_params, match_zip_to_csv, read_annotations, extract_selected_from_zip
 from shapely import speedups
 from matplotlib.patches import Polygon as MatplotlibPolygon
 import rtree
@@ -27,100 +27,6 @@ import json
 
 load_dotenv()
 ws_path = os.getenv("WORKSPACE_PATH")
-
-
-def process_slide(fname, slide_dir, img_dir, save_dir, roi_dir, target_mpp, generate_plots):
-
-    tiles_folder = fname.split('.')[0]
-    #print(f'Tiles folder: {tiles_folder}')
-    filtered_tiles_dir = os.path.join(save_dir, tiles_folder)
-
-    if os.path.exists(filtered_tiles_dir) and len(os.listdir(filtered_tiles_dir)) > 0:
-        #print(f'Tiles have been already processed for {tiles_folder} slide, skipping...')
-        return
-
-    tiles_dir = os.path.join(img_dir, tiles_folder)
-    if not os.path.exists(os.path.join(img_dir, tiles_folder)):
-        #print("Tiles folder could not be found, likely due to missing MPP, skipping...")
-        return
-
-    tile_fnames = os.listdir(tiles_dir)
-
-    os.makedirs(filtered_tiles_dir, exist_ok=True)
-    slide = open_slide(os.path.join(slide_dir, fname))
-
-    try:
-        slide_mpp = get_slide_mpp(slide)
-    except Exception as err:
-        print(f'Could not find MPP, the slide {tiles_folder} will be skipped: {err}')
-        return False
-
-    if slide_mpp is None:
-        print(f'Could not find MPP, the slide {tiles_folder} will be skipped')
-        return False
-
-    polygons = create_polygons_from_filenames(tile_fnames)
-    tiles_with_polygons = list(zip(tile_fnames, polygons))
-
-    # find corresponding annotations file
-    try:
-        roi_fname = find_substring_in_list(os.listdir(roi_dir), fname.split('.svs')[0])
-        if len(roi_fname) > 1:
-            print('Found multiple csv files. Taking just the 1st one.')
-        elif len(roi_fname) == 0:
-            print('Could not find corresponding CSV file; the slide will be skipped...')
-            return False
-    except Exception as err:
-        print(f"Exception during CSV file reading: {err}; the slide will be skipped")
-        return False
-
-    # read and scale annotations thath were made in the original WSI resolution
-    try:
-        ann, _ = read_annotations(os.path.join(roi_dir, roi_fname[0]))
-        scale_factor = slide_mpp / target_mpp
-        scaled_annPolys = scale(ann, xfact=scale_factor, yfact=scale_factor, origin=(0, 0))
-    except Exception as err:
-        print(f"Error reading or scaling annotations for slide {tiles_folder}: {err}")
-        return False
-
-    if generate_plots:
-        os.makedirs(os.path.join(save_dir, "plots"), exist_ok=True) 
-
-        fig, ax = plt.subplots()
-        if isinstance(scaled_annPolys, sg.MultiPolygon):
-            for i, polygon in enumerate(scaled_annPolys.geoms):
-                x, y = polygon.exterior.xy
-                ax.fill(x, y, alpha=0.5, fc='r', label=f'Annotated Tissue')
-        else:
-            x, y = scaled_annPolys.exterior.xy
-            ax.fill(x, y, alpha=0.5, fc='r', ec='Annotated Tissue')
-
-        for tile in polygons:
-            x, y = tile.exterior.xy
-            ax.fill(x, y, alpha=0.5, fc='b', ec='none', label='Extracted Tiles')
-
-            minx, miny, maxx, maxy = tile.bounds
-            ax.add_patch(MatplotlibPolygon([[minx, miny], [minx, maxy], [maxx, maxy], [maxx, miny]], fill=None, edgecolor='b', linestyle='--'))
-
-
-        legend_elements = [Patch(facecolor='red', edgecolor='r', alpha=0.5, label='Annotated Tissue'),
-                        Patch(facecolor='blue', edgecolor='b', alpha=0.5, label='All Tiles')]
-        ax.legend(handles=legend_elements, loc='upper right')
-        # Remove y-axis inversion to match slide coordinate convention
-        # ax.invert_yaxis()
-
-        plt.savefig(os.path.join(save_dir, "plots", f'{fname.split(".")[0]}.png'))
-        plt.close()
-
-    # insert polygons from fnames of tiles into the R-tree spatial index for faster intersection lookup
-    index = rtree.index.Index()
-    for idx, polygon in enumerate(polygons):
-        index.insert(idx, polygon.bounds)
-
-    for tile_fname, tile_polygon in tqdm(tiles_with_polygons, total=len(tiles_with_polygons)):
-        process_tile((tile_fname, tile_polygon, scaled_annPolys, index, img_dir, tiles_folder, filtered_tiles_dir, polygons))
-
-    return True
 
 
 def process_tile(tile_data):
@@ -201,12 +107,32 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
         return False
     # Print raw tile coordinate bounds
     try:
-        coords_raw = [parse_tile_coords(fn) for fn in tile_fnames if parse_tile_coords(fn) is not None]
+        # Build a cleaned list of parsed coordinates (avoid calling parse_tile_coords twice)
+        coords_raw = []
+        for fn in tile_fnames:
+            c = parse_tile_coords(fn)
+            if c is None:
+                continue
+            # ensure coordinate is indexable with two elements
+            if not (isinstance(c, (list, tuple)) and len(c) >= 2):
+                continue
+            try:
+                x_val = float(c[0])
+                y_val = float(c[1])
+            except Exception:
+                continue
+            coords_raw.append((x_val, y_val))
+
         if coords_raw:
             xs = [c[0] for c in coords_raw]
             ys = [c[1] for c in coords_raw]
-            print(f"Raw tile coordinate bounds: x=({min(xs)}, {max(xs)}), y=({min(ys)}, {max(ys)})")
-            print(f"Raw tile coordinate centroid: ({np.mean(xs)}, {np.mean(ys)})")
+            try:
+                print(f"Raw tile coordinate bounds: x=({min(xs)}, {max(xs)}), y=({min(ys)}, {max(ys)})")
+                print(f"Raw tile coordinate centroid: ({np.mean(xs)}, {np.mean(ys)})")
+            except Exception as e:
+                print(f"Failed to compute simple statistics for raw coords: {e}")
+        else:
+            print("No valid tile coordinates parsed from filenames")
     except Exception as e:
         print(f"Failed to print raw tile coordinate bounds: {e}")
 
@@ -410,6 +336,10 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
     except Exception as e:
         print(f"Failed to scale annotations: {e}")
         scaled_annPolys = ann_raw
+
+    # Ensure scaled_annPolys is a valid geometry object (avoid None)
+    if scaled_annPolys is None:
+        scaled_annPolys = Polygon()
     
     tiles_with_polygons = list(zip(tile_fnames, polygons))
 
@@ -458,23 +388,48 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
         os.makedirs(os.path.join(save_dir, "plots"), exist_ok=True)
 
         fig, ax = plt.subplots()
-        if isinstance(scaled_annPolys, sg.MultiPolygon):
-            for i, polygon in enumerate(scaled_annPolys.geoms):
-                x, y = polygon.exterior.xy
-                ax.fill(x, y, alpha=0.5, fc='r', label=f'Annotated Tissue')
-        else:
-            x, y = scaled_annPolys.exterior.xy
-            ax.fill(x, y, alpha=0.5, fc='r', ec='Annotated Tissue')
 
+        # Plot annotations safely: handle empty, Polygon, MultiPolygon, or other geometry types
+        try:
+            if scaled_annPolys is None or getattr(scaled_annPolys, 'is_empty', False):
+                print(f"No annotation geometry to plot for {tiles_folder}")
+            else:
+                # If MultiPolygon-like, iterate geometries
+                if isinstance(scaled_annPolys, (MultiPolygon,)) or (hasattr(scaled_annPolys, 'geoms') and not isinstance(scaled_annPolys, Polygon)):
+                    for polygon in getattr(scaled_annPolys, 'geoms', []):
+                        if polygon is None or getattr(polygon, 'is_empty', False):
+                            continue
+                        try:
+                            x, y = polygon.exterior.xy
+                            ax.fill(x, y, alpha=0.5, fc='r', label='Annotated Tissue')
+                        except Exception:
+                            continue
+                else:
+                    ext = getattr(scaled_annPolys, 'exterior', None)
+                    if ext is not None:
+                        try:
+                            x, y = ext.xy
+                            ax.fill(x, y, alpha=0.5, fc='r', ec='Annotated Tissue')
+                        except Exception:
+                            pass
+        except Exception as e:
+            print(f"Failed plotting annotation geometry: {e}")
+
+        # Plot tiles (skip any invalid polygons)
         for tile in polygons:
-            x, y = tile.exterior.xy
-            ax.fill(x, y, alpha=0.5, fc='b', ec='none', label='Extracted Tiles')
+            try:
+                if tile is None or getattr(tile, 'is_empty', False):
+                    continue
+                x, y = tile.exterior.xy
+                ax.fill(x, y, alpha=0.5, fc='b', ec='none', label='Extracted Tiles')
 
-            minx, miny, maxx, maxy = tile.bounds
-            ax.add_patch(MatplotlibPolygon([[minx, miny], [minx, maxy], [maxx, maxy], [maxx, miny]], fill=None, edgecolor='b', linestyle='--'))
+                minx, miny, maxx, maxy = tile.bounds
+                ax.add_patch(MatplotlibPolygon([[minx, miny], [minx, maxy], [maxx, maxy], [maxx, miny]], fill=None, edgecolor='b', linestyle='--'))
+            except Exception:
+                continue
 
         legend_elements = [Patch(facecolor='red', edgecolor='r', alpha=0.5, label='Annotated Tissue'),
-                        Patch(facecolor='blue', edgecolor='b', alpha=0.5, label='All Tiles')]
+                           Patch(facecolor='blue', edgecolor='b', alpha=0.5, label='All Tiles')]
         ax.legend(handles=legend_elements, loc='upper right')
         ax.invert_yaxis()
 
@@ -691,7 +646,6 @@ def main():
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = {
                 executor.submit(
-                    process_slide,
                     fname,
                     slide_dir,
                     img_dir,
