@@ -8,6 +8,7 @@ Metrics:
     - MSE (Mean Squared Error): Pixel-level reconstruction error
     - PSNR (Peak Signal-to-Noise Ratio): Signal quality measure in dB
     - SSIM (Structural Similarity Index): Perceptual similarity measure
+    - TopoFD (Topological Fréchet Distance): Topology-aware cell layout similarity
 
 Usage:
     from quality_assurance import evaluate_reconstruction, metrics, visualization
@@ -31,6 +32,11 @@ from .visualization import (
     plot_single_comparison,
     save_figure,
 )
+from .topological_frechet_distance import (
+    compute_topofd,
+    compute_topofd_from_folders,
+    TopoFDResult,
+)
 
 __all__ = [
     # Metrics
@@ -48,4 +54,8 @@ __all__ = [
     "plot_metric_correlation",
     "plot_single_comparison",
     "save_figure",
+    # Topological Fréchet Distance
+    "compute_topofd",
+    "compute_topofd_from_folders",
+    "TopoFDResult",
 ]
