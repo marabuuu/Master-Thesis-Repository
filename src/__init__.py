@@ -16,6 +16,7 @@ from . import preprocessing
 from . import statistics
 from . import classifier
 from . import quality_assurance
+from . import visualization
 
 __all__ = [
     "encoding",
@@ -24,5 +25,6 @@ __all__ = [
     "statistics",
     "classifier",
     "quality_assurance",
+    "visualization",
 ]
 
