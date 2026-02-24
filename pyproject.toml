@@ -45,6 +45,7 @@ package = true
 
 [tool.uv.sources]
 mopadi = { path = "../mopadi" }
+TopoCellGen = { path = "../TopoCellGen"}
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]
