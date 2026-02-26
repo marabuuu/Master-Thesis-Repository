@@ -24,7 +24,7 @@ from .evaluate_reconstruction import (
     ReconstructionEvaluator,
     evaluate_patient_tiles,
 )
-from .visualization import (
+from visualization.reconstruction_eval import (
     plot_metrics_summary,
     plot_comparison_grid,
     plot_per_patient_metrics,

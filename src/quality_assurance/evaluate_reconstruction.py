@@ -35,18 +35,31 @@ import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Iterator, List, Optional, Tuple
+from typing import Dict, Iterator, List, Optional, Tuple, Any
 
 import numpy as np
 from PIL import Image
 from tqdm import tqdm
 
-from .metrics import (
-    compute_all_metrics,
-    compute_batch_metrics,
-    summarize_metrics,
-)
-
+try:
+    from .metrics import (
+        compute_all_metrics,
+        compute_batch_metrics,
+        summarize_metrics,
+    )
+except Exception:
+    # Allow running the script directly (not as a package) by falling
+    # back to absolute import when the relative import fails.
+    from quality_assurance.metrics import (
+        compute_all_metrics,
+        compute_batch_metrics,
+        summarize_metrics,
+    )
+try:
+    from visualization.reconstruction_eval import plot_metrics_summary, plot_per_patient_metrics, plot_comparison_grid, plot_metric_correlation, plot_single_comparison
+except ImportError:
+    # visualization is optional
+    pass
 
 @dataclass
 class TilePair:
@@ -77,12 +90,12 @@ class PatientResult:
         ssim_values = [t["ssim"] for t in self.tile_results]
         
         return {
-            "mse_mean": np.mean(mse_values),
-            "mse_std": np.std(mse_values),
-            "psnr_mean": np.mean(psnr_values) if psnr_values else float("nan"),
-            "psnr_std": np.std(psnr_values) if psnr_values else float("nan"),
-            "ssim_mean": np.mean(ssim_values),
-            "ssim_std": np.std(ssim_values),
+            "mse_mean": float(np.mean(mse_values)),
+            "mse_std": float(np.std(mse_values)),
+            "psnr_mean": float(np.mean(psnr_values)) if psnr_values else float("nan"),
+            "psnr_std": float(np.std(psnr_values)) if psnr_values else float("nan"),
+            "ssim_mean": float(np.mean(ssim_values)),
+            "ssim_std": float(np.std(ssim_values)),
         }
 
 
@@ -253,7 +266,7 @@ class ReconstructionEvaluator:
     def evaluate_all(
         self,
         show_progress: bool = True,
-    ) -> Dict[str, Dict]:
+    ) -> Dict[str, Any]:
         """
         Evaluate all matched tile pairs and compute metrics.
         
@@ -436,7 +449,7 @@ class ReconstructionEvaluator:
 def evaluate_patient_tiles(
     original_zip: str,
     reconstructed_zip: str,
-) -> Dict[str, Dict]:
+) -> Dict[str, Any]:
     """
     Convenience function to evaluate tiles for a single patient.
     
@@ -466,9 +479,9 @@ def evaluate_patient_tiles(
         ssim_values = [r["ssim"] for r in results]
         
         summary = {
-            "mse_mean": np.mean(mse_values),
-            "psnr_mean": np.mean(psnr_values) if psnr_values else float("nan"),
-            "ssim_mean": np.mean(ssim_values),
+            "mse_mean": float(np.mean(mse_values)),
+            "psnr_mean": float(np.mean(psnr_values)) if psnr_values else float("nan"),
+            "ssim_mean": float(np.mean(ssim_values)),
             "num_tiles": len(results),
         }
     else:
@@ -572,9 +585,12 @@ def main():
     
     summary = results["summary"]
     print("Overall Metrics:")
-    print(f"  MSE:  {summary['mse']['mean']:.2f} +/- {summary['mse']['std']:.2f}")
-    print(f"  PSNR: {summary['psnr']['mean']:.2f} +/- {summary['psnr']['std']:.2f} dB")
-    print(f"  SSIM: {summary['ssim']['mean']:.4f} +/- {summary['ssim']['std']:.4f}")
+    if summary and isinstance(summary, dict) and "mse" in summary:
+        print(f"  MSE:  {summary['mse']['mean']:.2f} +/- {summary['mse']['std']:.2f}")
+        print(f"  PSNR: {summary['psnr']['mean']:.2f} +/- {summary['psnr']['std']:.2f} dB")
+        print(f"  SSIM: {summary['ssim']['mean']:.4f} +/- {summary['ssim']['std']:.4f}")
+    else:
+        print("  [WARN] No metric data available (no matched tiles were evaluated).")
     print("=" * 60 + "\n")
     
     # Save results
@@ -587,27 +603,35 @@ def main():
     # Generate plots if plot directory specified
     if args.plot_dir:
         try:
-            from .visualization import (
-                plot_metrics_summary,
-                plot_comparison_grid,
-                plot_per_patient_metrics,
-            )
-            
+            # Try relative import first (package execution), then absolute fallback
+            try:
+                from visualization.reconstruction_eval import (
+                    plot_metrics_summary,
+                    plot_comparison_grid,
+                    plot_per_patient_metrics,
+                )
+            except Exception:
+                from visualization.reconstruction_eval import (
+                    plot_metrics_summary,
+                    plot_comparison_grid,
+                    plot_per_patient_metrics,
+                )
+
             plot_path = Path(args.plot_dir)
             plot_path.mkdir(parents=True, exist_ok=True)
-            
+
             # Summary distribution plots
             plot_metrics_summary(
                 evaluator.all_tile_results,
                 save_path=plot_path / "metrics_distribution.png",
             )
-            
+
             # Per-patient comparison
             plot_per_patient_metrics(
                 evaluator.patient_results,
                 save_path=plot_path / "per_patient_metrics.png",
             )
-            
+
             # Comparison grid with sample tiles
             tile_pairs = list(evaluator.iter_tile_pairs())
             if tile_pairs:
@@ -620,10 +644,10 @@ def main():
                     sample_pairs,
                     save_path=plot_path / "tile_comparison.png",
                 )
-            
+
             print(f"\n[OK] Saved plots to {args.plot_dir}")
-            
-        except ImportError as e:
+
+        except Exception as e:
             print(f"[WARN] Could not generate plots: {e}")
     
     print("\n[DONE] Evaluation complete!\n")

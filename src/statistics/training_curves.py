@@ -140,6 +140,45 @@ def parse_log_file(log_path: Path) -> Dict[str, List[Tuple[int, float]]]:
         history["mean"].append((epoch, float(match.group(3))))
         history["var"].append((epoch, float(match.group(4))))
         history["diversity"].append((epoch, float(match.group(5))))
+    # Fallback parser (line-oriented) to support tqdm/progressbar logging
+    # Example lines:
+    # Epoch 1: 100%|...| 2581/2581 [24:51<00:00, ..., loss_step=0.045, loss_epoch=0.0384]
+    curr_epoch: Optional[int] = None
+    for line in content.splitlines():
+        # Update current epoch when present on the line
+        m_epoch = re.search(r"Epoch\s+(\d+)", line, re.IGNORECASE)
+        if m_epoch:
+            try:
+                curr_epoch = int(m_epoch.group(1))
+            except Exception:
+                curr_epoch = None
+
+        # Prefer explicit loss_epoch (final epoch-level loss)
+        if curr_epoch is not None:
+            m_le = re.search(r"loss_epoch\s*=\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
+            if m_le:
+                try:
+                    history["loss"].append((curr_epoch, float(m_le.group(1))))
+                    continue
+                except Exception:
+                    pass
+
+            # Fallback to loss_step if loss_epoch not present
+            m_ls = re.search(r"loss_step\s*=\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
+            if m_ls:
+                try:
+                    history["loss"].append((curr_epoch, float(m_ls.group(1))))
+                    continue
+                except Exception:
+                    pass
+
+            # Generic patterns like "Loss: 0.028057" or "loss=0.03"
+            m_generic = re.search(r"(?:Loss|loss)[:=]\s*([0-9]*\.?[0-9]+)", line)
+            if m_generic:
+                try:
+                    history["loss"].append((curr_epoch, float(m_generic.group(1))))
+                except Exception:
+                    pass
     
     # Remove empty keys and sort
     history = {k: sorted(v, key=lambda x: x[0]) for k, v in history.items() if v}
@@ -176,6 +215,20 @@ def plot_training_curves(
     all_metrics = set()
     for h in histories:
         all_metrics.update(h.keys())
+
+    # Collapse multiple entries for the same epoch: keep the last reported value
+    def _collapse_entries(metric_list: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
+        d: dict[int, float] = {}
+        for epoch, val in metric_list:
+            try:
+                d[int(epoch)] = float(val)
+            except Exception:
+                continue
+        return sorted(d.items())
+
+    for h in histories:
+        for metric in list(h.keys()):
+            h[metric] = _collapse_entries(h[metric])
     
     # Create subplot layout
     n_metrics = len(all_metrics)
@@ -237,6 +290,11 @@ def plot_training_curves(
     if output_path:
         fig.savefig(output_path, dpi=150, bbox_inches='tight')
         print(f"Saved figure to {output_path}")
+    else:
+        # Also auto-save a default file so users know where plots are stored
+        default_out = "training_curves.png"
+        fig.savefig(default_out, dpi=150, bbox_inches='tight')
+        print(f"Saved figure to {default_out} (default)")
     
     if show:
         plt.show()
@@ -278,9 +336,12 @@ def main():
         for ckpt_dir in args.checkpoint_dir:
             try:
                 history = parse_checkpoints(Path(ckpt_dir))
-                histories.append(history)
-                source_names.append(Path(ckpt_dir).name)
-                print(f"Parsed {len(history.get('loss', []))} epochs from {ckpt_dir}")
+                if not history:
+                    print(f"Warning: no metrics parsed from checkpoints in {ckpt_dir}")
+                else:
+                    histories.append(history)
+                    source_names.append(Path(ckpt_dir).name)
+                    print(f"Parsed {len(history.get('loss', []))} epochs from {ckpt_dir}")
             except Exception as e:
                 print(f"Error parsing {ckpt_dir}: {e}")
     
@@ -289,9 +350,12 @@ def main():
         for log_path in args.log_file:
             try:
                 history = parse_log_file(Path(log_path))
-                histories.append(history)
-                source_names.append(Path(log_path).stem)
-                print(f"Parsed {len(history.get('loss', []))} epochs from {log_path}")
+                if not history:
+                    print(f"Warning: no metrics parsed from log file {log_path}. Check log format or patterns in parse_log_file().")
+                else:
+                    histories.append(history)
+                    source_names.append(Path(log_path).stem)
+                    print(f"Parsed {len(history.get('loss', []))} epochs from {log_path}")
             except Exception as e:
                 print(f"Error parsing {log_path}: {e}")
     
