@@ -1,139 +1,116 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Fine-tune Diffusion Model with Genomic Conditioning
+Fine-tune Diffusion Model with Genomic Conditioning 
+=========================================================
 
-This script fine-tunes a pretrained MoPaDi diffusion model to generate tiles
-conditioned on genomic feature vectors (projected through a trained projection head).
+Joint single-stage training
+----------------------------
 
-Architecture:
-    Genomic (512-dim) → Projection Head → Pseudo Image Features (512-dim) → cDDIM → Tile
+    Genomic (512-d) → ProjectionHead (trainable) → cond (512-d)
+    Tile (x_start) + Gaussian noise + cond → UNet → ε̂
 
-The projection head was trained separately to match the distribution of image features.
-Now we fine-tune the diffusion model so it learns the semantic relationship between
-projected genomic features and tile content.
+The projection head and the UNet are trained jointly via the
+standard diffusion loss.  By pairing each tile with its patient's
+genomic vector, the gradient flows back through the UNet and the
+projection head — teaching the head which genomic dimensions matter
+for reconstructing histology tiles. The tiles are shown alongside 
+the genomic vectors during every training step.
 
-Usage:
-    python finetune_diffusion_with_genomic.py \\
-        --projection-head-ckpt ./projection_head_best.pt \\
-        --diffusion-ckpt ./diffusion_without_encoder.ckpt \\
-        --genomic-h5-dir /path/to/genomic_features \\
-        --tiles-zip-dir /path/to/tile_zips \\
-        --out-dir ./finetuned_diffusion \\
-        --epochs 10
+Usage
+-----
+    python finetune_diffusion_with_genomic.py \
+        --diffusion-ckpt ./last.ckpt \
+        --genomic-h5-dir /path/to/genomic_features \
+        --tiles-zip-dir /path/to/tile_zips \
+        --out-dir ./finetuned_genomic_v4 \
+        --epochs 20 --batch-size 4 --lr 1e-5 \
+        --proj-lr 3e-4 --proj-warmup 500 --proj-layers 4
 """
+
+from __future__ import annotations
 
 import argparse
 import copy
-import math
 import os
 import random
-import re
 import sys
-import time
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Optional, Tuple
+from typing import Optional
 
 import h5py
 import numpy as np
 import torch
-from torch.cuda.amp import GradScaler, autocast
 import torch.nn as nn
 import torch.nn.functional as F
 from PIL import Image
 from torch.utils.data import Dataset, DataLoader
 from torchvision import transforms
+from torchvision.utils import make_grid, save_image
 from tqdm import tqdm
 
+import pytorch_lightning as pl
+from pytorch_lightning import loggers as pl_loggers
+from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
 
-# ----------------------------------------------------------------------
-#   Projection Head (copied from projection_head_genomic.py)
-# ----------------------------------------------------------------------
+# MoPaDi imports
+from mopadi.train_diff_autoenc import LitModel, ema, is_time
+from mopadi.configs.config import TrainConfig
+from mopadi.configs.templates import tcga_brca_autoenc
+from mopadi.configs.choices import TrainMode
+
+
+# ======================================================================
+#  Projection Head
+# ======================================================================
 
 class ProjectionHead(nn.Module):
-    """Projection head for genomic → image feature space mapping."""
-    
+    """MLP projection: genomic space (in_dim) → UNet cond space (out_dim).
+
+    Trained jointly with the diffusion UNet — the diffusion loss gradient
+    flows through this head, teaching it which genomic dimensions are
+    relevant for reconstructing histo-pathology tiles.
+    """
+
     def __init__(
         self,
         in_dim: int = 512,
         out_dim: int = 512,
         hidden_dim: int = 512,
-        num_layers: int = 2,
-        arch: str = "mlp",
+        num_layers: int = 4,
         dropout: float = 0.1,
-        normalize_output: bool = False,
     ):
         super().__init__()
         self.in_dim = in_dim
         self.out_dim = out_dim
-        self.arch = arch
-        self.normalize_output = normalize_output
-        
-        if arch == "linear":
-            self.net = nn.Linear(in_dim, out_dim)
-        elif arch == "mlp":
-            layers = []
-            dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
-            for i in range(len(dims) - 1):
-                layers.append(nn.Linear(dims[i], dims[i + 1]))
-                if i < len(dims) - 2:
-                    layers.append(nn.LayerNorm(dims[i + 1]))
-                    layers.append(nn.GELU())
-                    layers.append(nn.Dropout(dropout))
-            self.net = nn.Sequential(*layers)
-        elif arch == "residual":
-            layers = []
-            for i in range(num_layers):
-                layers.append(nn.Linear(hidden_dim if i > 0 else in_dim, hidden_dim))
-                layers.append(nn.LayerNorm(hidden_dim))
+        self.num_layers = num_layers
+
+        layers: list[nn.Module] = []
+        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
+        for i in range(len(dims) - 1):
+            layers.append(nn.Linear(dims[i], dims[i + 1]))
+            if i < len(dims) - 2:                # skip after last linear
+                layers.append(nn.LayerNorm(dims[i + 1]))
                 layers.append(nn.GELU())
                 layers.append(nn.Dropout(dropout))
-            layers.append(nn.Linear(hidden_dim, out_dim))
-            self.net = nn.Sequential(*layers)
-            self.skip = nn.Identity() if in_dim == hidden_dim else nn.Linear(in_dim, out_dim)
-        else:
-            raise ValueError(f"Unknown architecture: {arch}")
-    
+        self.net = nn.Sequential(*layers)
+
+        n_params = sum(p.numel() for p in self.parameters())
+        print(f"[ProjectionHead] layers={num_layers}, "
+              f"dims={in_dim}→{hidden_dim}→{out_dim}, params={n_params:,}")
+
     def forward(self, x: torch.Tensor) -> torch.Tensor:
-        if self.arch == "residual":
-            out = self.net(x) + self.skip(x)
-        else:
-            out = self.net(x)
-        if self.normalize_output:
-            out = F.normalize(out, p=2, dim=-1)
-        return out
+        return self.net(x)
 
 
-def load_projection_head(ckpt_path: str, device: str = "cpu") -> ProjectionHead:
-    """Load a trained projection head from checkpoint."""
-    ckpt = torch.load(ckpt_path, map_location=device)
-    config = ckpt.get("config", {})
-    
-    projection_head = ProjectionHead(
-        in_dim=config.get("in_dim", 512),
-        out_dim=config.get("out_dim", 512),
-        hidden_dim=config.get("hidden_dim", 512),
-        num_layers=config.get("num_layers", 2),
-        arch=config.get("arch", "mlp"),
-    )
-    projection_head.load_state_dict(ckpt["state_dict"])
-    projection_head.to(device)
-    projection_head.eval()
-    
-    print(f"[OK] Loaded projection head from {ckpt_path}")
-    print(f"     Config: {config}")
-    
-    return projection_head
-
-
-# ----------------------------------------------------------------------
-#   Helper Functions
-# ----------------------------------------------------------------------
+# ======================================================================
+#  Patient-ID helper
+# ======================================================================
 
 def canonical_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX patient ID from various filename formats."""
+    """Extract TCGA-XX-XXXX from various filename formats."""
     name = Path(name).stem.upper()
     for sep in ("_", "."):
         name = name.replace(sep, "-")
@@ -145,26 +122,26 @@ def canonical_patient_id(name: str) -> str:
     return name
 
 
-# ----------------------------------------------------------------------
-#   Dataset
-# ----------------------------------------------------------------------
+# ======================================================================
+#  Dataset
+# ======================================================================
 
 class GenomicTileDataset(Dataset):
     """
-    Dataset that pairs genomic H5 features with tile images from zip files.
-    
-    For each patient:
-    - genomic: single 512-dim vector from H5 file
-    - tile: random tile image from corresponding zip file
+    Pairs genomic H5 feature vectors with tile images from zip archives.
+
+    Each item is {"img": (3,H,W), "feat": (D,), "patient_id": str}.
+    The tile and genomic vector come from the same patient so the
+    diffusion model sees them together during training.
     """
-    
+
     def __init__(
         self,
         genomic_h5_dir: str,
         tiles_zip_dir: str,
         genomic_key: str = "feats",
         transform=None,
-        tiles_per_patient: int = 1,  # How many tiles to sample per patient per epoch
+        tiles_per_patient: int = 1,
         split: str = "train",
     ):
         super().__init__()
@@ -173,703 +150,657 @@ class GenomicTileDataset(Dataset):
         self.genomic_key = genomic_key
         self.transform = transform
         self.tiles_per_patient = tiles_per_patient
-        
-        # Find matching files
-        # Check for train/test subdirs
-        train_dir = self.genomic_h5_dir / "train"
-        test_dir = self.genomic_h5_dir / "test"
-        
-        if train_dir.is_dir() or test_dir.is_dir():
-            if split == "train" and train_dir.is_dir():
-                genomic_files = {canonical_patient_id(f.name): f 
-                                 for f in train_dir.glob("*.h5")}
-            elif split == "test" and test_dir.is_dir():
-                genomic_files = {canonical_patient_id(f.name): f 
-                                 for f in test_dir.glob("*.h5")}
-            else:
-                genomic_files = {}
-                if train_dir.is_dir():
-                    genomic_files.update({canonical_patient_id(f.name): f 
-                                          for f in train_dir.glob("*.h5")})
-                if test_dir.is_dir():
-                    genomic_files.update({canonical_patient_id(f.name): f 
-                                          for f in test_dir.glob("*.h5")})
-        else:
-            genomic_files = {canonical_patient_id(f.name): f 
-                             for f in self.genomic_h5_dir.glob("*.h5")}
-        
-        zip_files = {canonical_patient_id(f.name): f 
-                     for f in self.tiles_zip_dir.glob("*.zip")}
-        
+
+        genomic_files = self._find_genomic_files(split)
+        zip_files = {
+            canonical_patient_id(f.name): f
+            for f in self.tiles_zip_dir.glob("*.zip")
+        }
         common_ids = sorted(set(genomic_files) & set(zip_files))
         if not common_ids:
             raise RuntimeError(
-                f"No matching patient IDs between\n"
+                f"No matching patients between\n"
                 f"  Genomic: {self.genomic_h5_dir}\n"
-                f"  Tiles: {self.tiles_zip_dir}"
+                f"  Tiles:   {self.tiles_zip_dir}"
             )
-        
-        print(f"[GenomicTileDataset] Found {len(common_ids)} matched patients (split={split})")
-        self.pairs = [(genomic_files[pid], zip_files[pid], pid) for pid in common_ids]
-        
-        # Cache genomic features (they're small, one per patient)
-        self.genomic_cache = {}
-        print("[INFO] Caching genomic features...")
-        for genomic_path, _, pid in tqdm(self.pairs, desc="Loading genomic"):
-            with h5py.File(genomic_path, "r") as f:
-                genomic = np.array(f[self.genomic_key])
-                if genomic.ndim == 2:
-                    genomic = genomic.mean(axis=0)
-                self.genomic_cache[pid] = torch.from_numpy(genomic.astype(np.float32))
-        
-        # Pre-list tiles in each zip (for faster random sampling)
-        print("[INFO] Indexing tile files...")
-        self.tile_lists = {}
-        bad_zips = []
-        for _, zip_path, pid in tqdm(self.pairs, desc="Indexing zips"):
+        print(f"[GenomicTileDataset] {len(common_ids)} matched patients "
+              f"(split={split})")
+
+        self.pairs = [
+            (genomic_files[pid], zip_files[pid], pid) for pid in common_ids
+        ]
+
+        # Cache genomic features
+        self.genomic_cache: dict[str, torch.Tensor] = {}
+        for gpath, _, pid in tqdm(self.pairs, desc="Caching genomic"):
+            with h5py.File(gpath, "r") as f:
+                arr = np.array(f[self.genomic_key])
+                if arr.ndim == 2:
+                    arr = arr.mean(axis=0)
+                if arr.ndim != 1:
+                    raise ValueError(
+                        f"Genomic vector for {pid} has shape {arr.shape}")
+                if np.isnan(arr).any():
+                    raise ValueError(
+                        f"Genomic vector for {pid} contains NaNs")
+                self.genomic_cache[pid] = torch.from_numpy(
+                    arr.astype(np.float32))
+
+        # Index tile names inside each zip
+        self.tile_lists: dict[str, list[str]] = {}
+        bad_pids: set[str] = set()
+        for _, zpath, pid in tqdm(self.pairs, desc="Indexing zips"):
             try:
-                with zipfile.ZipFile(zip_path, "r") as zf:
-                    tiles = [n for n in zf.namelist() 
-                             if n.lower().endswith(('.png', '.jpg', '.jpeg'))]
-                    self.tile_lists[pid] = tiles
+                with zipfile.ZipFile(zpath, "r") as zf:
+                    names = [
+                        n for n in zf.namelist()
+                        if n.lower().endswith((".png", ".jpg", ".jpeg"))
+                    ]
+                    if not names:
+                        print(f"[WARN] No tiles in zip for {pid}: {zpath}")
+                        bad_pids.add(pid)
+                    else:
+                        self.tile_lists[pid] = names
             except zipfile.BadZipFile:
-                print(f"[WARNING] Skipping bad/corrupt zip: {zip_path}")
-                bad_zips.append((pid, zip_path))
-        
-        # Remove bad zips from pairs
-        if bad_zips:
-            bad_pids = {pid for pid, _ in bad_zips}
-            self.pairs = [(g, z, p) for g, z, p in self.pairs if p not in bad_pids]
-            print(f"[WARNING] Skipped {len(bad_zips)} corrupt zip files")
-        
-        # Create expanded index for tiles_per_patient > 1
-        self.samples = []
-        for genomic_path, zip_path, pid in self.pairs:
-            n_tiles = min(self.tiles_per_patient, len(self.tile_lists[pid]))
-            for _ in range(n_tiles):
-                self.samples.append((pid, zip_path))
-        
-        print(f"[GenomicTileDataset] Total samples: {len(self.samples)}")
-    
-    def __len__(self):
+                print(f"[WARN] Bad zip skipped: {zpath}")
+                bad_pids.add(pid)
+
+        if bad_pids:
+            self.pairs = [
+                (g, z, p) for g, z, p in self.pairs if p not in bad_pids
+            ]
+
+        self.samples: list[tuple[str, Path]] = []
+        for _, zpath, pid in self.pairs:
+            n = min(self.tiles_per_patient,
+                    len(self.tile_lists.get(pid, [])))
+            self.samples.extend([(pid, zpath)] * n)
+
+        print(f"[GenomicTileDataset] {len(self.samples)} total samples")
+
+    def _find_genomic_files(self, split: str) -> dict[str, Path]:
+        train_dir = self.genomic_h5_dir / "train"
+        test_dir = self.genomic_h5_dir / "test"
+        if train_dir.is_dir() or test_dir.is_dir():
+            files: dict[str, Path] = {}
+            if split in ("train", "all") and train_dir.is_dir():
+                files.update({
+                    canonical_patient_id(f.name): f
+                    for f in train_dir.glob("*.h5")
+                })
+            if split in ("test", "all") and test_dir.is_dir():
+                files.update({
+                    canonical_patient_id(f.name): f
+                    for f in test_dir.glob("*.h5")
+                })
+            return files
+        return {
+            canonical_patient_id(f.name): f
+            for f in self.genomic_h5_dir.glob("*.h5")
+        }
+
+    def __len__(self) -> int:
         return len(self.samples)
-    
-    def _load_random_tile(self, zip_path: Path, pid: str) -> Image.Image:
-        tile_name = random.choice(self.tile_lists[pid])
-        with zipfile.ZipFile(zip_path, "r") as zf:
-            with zf.open(tile_name) as f:
-                return Image.open(BytesIO(f.read())).convert("RGB")
-    
-    def __getitem__(self, idx):
-        pid, zip_path = self.samples[idx]
-        
-        # Get cached genomic features
+
+    def __getitem__(self, idx: int):
+        pid, zpath = self.samples[idx]
         genomic = self.genomic_cache[pid]
-        
-        # Load random tile
-        img = self._load_random_tile(zip_path, pid)
-        if self.transform:
+
+        tile_name = random.choice(self.tile_lists[pid])
+        with zipfile.ZipFile(zpath, "r") as zf:
+            with zf.open(tile_name) as fh:
+                img = Image.open(BytesIO(fh.read())).convert("RGB")
+
+        if self.transform is not None:
             img = self.transform(img)
         else:
             img = transforms.ToTensor()(img)
-        
-        return {
-            "img": img,
-            "genomic": genomic,
-            "patient_id": pid,
-        }
+
+        return {"img": img, "feat": genomic, "patient_id": pid}
 
 
-# ----------------------------------------------------------------------
-#   Early Stopping
-# ----------------------------------------------------------------------
+# ======================================================================
+#  Image transforms
+# ======================================================================
 
-class EarlyStopping:
-    """Stop training when the monitored loss stops improving.
-
-    Args:
-        patience: Number of epochs with no improvement before stopping.
-                  Set to 0 to disable.
-        min_delta: Minimum absolute decrease in loss to count as an
-                   improvement.  Helps ignore noise.
-        restore_best: If True the caller should reload the best checkpoint
-                      after training ends (signalled by `self.should_stop`).
-    """
-
-    def __init__(self, patience: int = 0, min_delta: float = 0.0,
-                 restore_best: bool = True):
-        self.patience = patience
-        self.min_delta = min_delta
-        self.restore_best = restore_best
-
-        self.best_loss: Optional[float] = None
-        self.epochs_without_improvement: int = 0
-        self.should_stop: bool = False
-        self.best_epoch: int = 0
-
-    @property
-    def enabled(self) -> bool:
-        return self.patience > 0
-
-    def step(self, loss: float, epoch: int) -> bool:
-        """Call once per epoch.  Returns True when training should stop."""
-        if not self.enabled:
-            return False
-
-        if self.best_loss is None or loss < self.best_loss - self.min_delta:
-            self.best_loss = loss
-            self.epochs_without_improvement = 0
-            self.best_epoch = epoch
-        else:
-            self.epochs_without_improvement += 1
-
-        if self.epochs_without_improvement >= self.patience:
-            self.should_stop = True
-            return True
-        return False
-
-    def status_message(self) -> str:
-        if not self.enabled:
-            return "early stopping disabled"
-        return (f"patience {self.epochs_without_improvement}/{self.patience} "
-                f"(best={self.best_loss:.6f} @ epoch {self.best_epoch})")
+def make_tile_transform(img_size: int = 512) -> transforms.Compose:
+    """Standard tile transform: resize, crop, normalise to [-1, 1]."""
+    return transforms.Compose([
+        transforms.Resize(
+            img_size,
+            interpolation=transforms.InterpolationMode.BILINEAR,
+        ),
+        transforms.CenterCrop(img_size),
+        transforms.ToTensor(),
+        transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
+    ])
 
 
-# ----------------------------------------------------------------------
-#   LR Scheduler helpers
-# ----------------------------------------------------------------------
+# ======================================================================
+#  Joint diffusion fine-tuning with genomic conditioning
+# ======================================================================
 
-class _LinearWarmupCosineDecay(torch.optim.lr_scheduler.LambdaLR):
-    """Linear warmup for `warmup_epochs`, then cosine decay to `eta_min`."""
-
-    def __init__(self, optimizer, warmup_epochs: int, total_epochs: int,
-                 eta_min_factor: float = 0.01, last_epoch: int = -1):
-        self.warmup_epochs = warmup_epochs
-        self.total_epochs = total_epochs
-        self.eta_min_factor = eta_min_factor
-        super().__init__(optimizer, self._lr_lambda, last_epoch=last_epoch)
-
-    def _lr_lambda(self, epoch: int) -> float:
-        if epoch < self.warmup_epochs:
-            # linear warmup from 0 → 1
-            return max(epoch / max(self.warmup_epochs, 1), 1e-6)
-        # cosine decay from 1 → eta_min_factor
-        progress = (epoch - self.warmup_epochs) / max(
-            self.total_epochs - self.warmup_epochs, 1)
-        import math
-        return self.eta_min_factor + 0.5 * (1.0 - self.eta_min_factor) * (
-            1.0 + math.cos(math.pi * progress))
-
-
-def build_scheduler(optimizer, args):
-    """Build a learning-rate scheduler from CLI arguments.
-
-    Supported values for ``args.scheduler``:
-    * ``cosine``        – CosineAnnealingLR (default, current behaviour)
-    * ``cosine_warmup`` – Linear warmup + cosine decay
-    * ``plateau``       – ReduceLROnPlateau (reacts to loss stagnation)
-    """
-    name = getattr(args, "scheduler", "cosine")
-    warmup = getattr(args, "warmup_epochs", 0)
-
-    if name == "cosine_warmup" or (name == "cosine" and warmup > 0):
-        print(f"[INFO] LR scheduler: cosine with {warmup}-epoch linear warmup")
-        return _LinearWarmupCosineDecay(
-            optimizer,
-            warmup_epochs=warmup,
-            total_epochs=args.epochs,
-            eta_min_factor=0.01,
-        )
-    elif name == "plateau":
-        print("[INFO] LR scheduler: ReduceLROnPlateau (factor=0.5, patience=3)")
-        return torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, mode="min", factor=0.5, patience=3,
-        )
-    else:  # default: plain cosine
-        print("[INFO] LR scheduler: CosineAnnealingLR")
-        return torch.optim.lr_scheduler.CosineAnnealingLR(
-            optimizer, T_max=args.epochs, eta_min=args.lr * 0.01,
-        )
-
-
-# ----------------------------------------------------------------------
-#   Diffusion Fine-tuning
-# ----------------------------------------------------------------------
-
-def finetune_diffusion(
-    projection_head: ProjectionHead,
-    diffusion_ckpt_path: str,
-    train_loader: DataLoader,
-    args,
-    device: str,
-):
+class LitDiffusionGenomicV4(LitModel):
     """
     Fine-tune the diffusion model with genomic conditioning.
-    
-    The projection head can be:
-    - Frozen: Only the diffusion model learns
-    - Trainable: Both adapt together (joint fine-tuning)
+
+    The projection head and UNet train **jointly**: paired (tile, genomic)
+    samples are fed every step so the diffusion loss gradient flows
+    through ``cond = proj_head(genomic)`` into the projection head,
+    teaching it which genomic dimensions are useful for each tile.
+
+    Standard Gaussian noise — no DDIM inversion.
     """
-    
-    # Import MoPaDi. Use TYPE_CHECKING to keep static checkers satisfied
-    # while providing a clear runtime error when mopadi isn't installed.
-    from typing import TYPE_CHECKING
 
-    if TYPE_CHECKING:  # pragma: no cover - for type checkers only
-        from mopadi.configs.templates import tcga_brca_autoenc  # type: ignore
-        from mopadi.model.unet import BeatGANsUNetModel  # type: ignore
-        from mopadi.model.nn import timestep_embedding  # type: ignore
-    else:
-        try:
-            from mopadi.configs.templates import tcga_brca_autoenc
-            from mopadi.model.unet import BeatGANsUNetModel
-            from mopadi.model.nn import timestep_embedding
-        except Exception as e:  # broad except to capture ImportError and attribute errors
+    def __init__(
+        self,
+        conf: TrainConfig,
+        projection_head: ProjectionHead,
+        genomic_h5_dir: str = "",
+        tiles_zip_dir: str = "",
+        tiles_per_patient: int = 10,
+        split: str = "train",
+        img_size: int = 512,
+        proj_lr: float = 3e-4,
+        proj_warmup: int = 500,
+        n_log_samples: int = 16,
+    ):
+        super().__init__(conf)
+        self.projection_head = projection_head
+        self.genomic_h5_dir = genomic_h5_dir
+        self.tiles_zip_dir = tiles_zip_dir
+        self.tiles_per_patient = tiles_per_patient
+        self.split = split
+        self._img_size = img_size
+        self.proj_lr = proj_lr
+        self.proj_warmup = proj_warmup
+        self.n_log_samples = n_log_samples
+
+        print(f"Projection head JOINTLY trained (lr={proj_lr}, "
+              f"warmup={proj_warmup} steps)")
+
+        self._fixed_val_batch: Optional[dict] = None
+
+    # ------------------------------------------------------------------
+    #  Lifecycle
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self):
+        self.projection_head = self.projection_head.to(self.device)
+
+    def setup(self, stage=None):
+        if self.conf.seed is not None:
+            seed = self.conf.seed + self.global_rank
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+
+        xform = make_tile_transform(self._img_size)
+        self.train_data = GenomicTileDataset(
+            genomic_h5_dir=self.genomic_h5_dir,
+            tiles_zip_dir=self.tiles_zip_dir,
+            transform=xform,
+            tiles_per_patient=self.tiles_per_patient,
+            split=self.split,
+        )
+        self.val_data = self.train_data
+
+        if len(self.train_data) == 0:
             raise RuntimeError(
-                "mopadi is required for diffusion fine-tuning but could not be imported. "
-                "Install mopadi in your environment (e.g. `pip install -e /path/to/mopadi`) "
-                "or activate the interpreter that has mopadi installed. "
-                f"Original error: {e}"
-            ) from e
-    
-    print("\n" + "=" * 60)
-    print("LOADING DIFFUSION MODEL")
-    print("=" * 60)
-    
-    # Load config and create model
-    conf = tcga_brca_autoenc()
-    
-    # Load the checkpoint
-    ckpt = torch.load(diffusion_ckpt_path, map_location=device)
-    
-    # The checkpoint might be from LitModel or just the model state
-    if "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-        # Filter to only model weights (not ema_model or other things)
-        model_state = {}
-        ema_state = {}
-        for k, v in state_dict.items():
-            if k.startswith("model."):
-                model_state[k[6:]] = v  # Remove "model." prefix
-            elif k.startswith("ema_model."):
-                ema_state[k[10:]] = v  # Remove "ema_model." prefix
-        
-        # Prefer EMA weights if available
-        if ema_state:
-            print("[INFO] Using EMA model weights")
-            state_dict = ema_state
-        elif model_state:
-            state_dict = model_state
-    else:
-        state_dict = ckpt
-    
-    # Create model
-    model = conf.make_model_conf().make_model()
-    model.load_state_dict(state_dict, strict=False)
-    model.to(device)
-    
-    # Create EMA model
-    ema_model = copy.deepcopy(model)
-    ema_model.requires_grad_(False)
-    ema_model.eval()
-    
-    print(f"[OK] Loaded diffusion model")
-    print(f"     Parameters: {sum(p.numel() for p in model.parameters()):,}")
-    
-    # Get conditioning statistics from checkpoint or use defaults
-    conds_mean = ckpt.get("conds_mean", None)
-    conds_std = ckpt.get("conds_std", None)
-    
-    if conds_mean is None and "state_dict" in ckpt:
-        # Try to find in state_dict
-        if "conds_mean" in ckpt["state_dict"]:
-            conds_mean = ckpt["state_dict"]["conds_mean"]
-        if "conds_std" in ckpt["state_dict"]:
-            conds_std = ckpt["state_dict"]["conds_std"]
-    
-    if conds_mean is not None:
-        if not isinstance(conds_mean, torch.Tensor):
-            conds_mean = torch.tensor(conds_mean, dtype=torch.float32)
-        conds_mean = conds_mean.to(device)
-        if conds_mean.dim() == 2:
-            conds_mean = conds_mean.squeeze(0)
-        print(f"[OK] conds_mean loaded, shape: {conds_mean.shape}")
-    else:
-        conds_mean = torch.zeros(512, device=device)
-        print("[WARN] No conds_mean found, using zeros")
-    
-    if conds_std is not None:
-        if not isinstance(conds_std, torch.Tensor):
-            conds_std = torch.tensor(conds_std, dtype=torch.float32)
-        conds_std = conds_std.to(device)
-        if conds_std.dim() == 2:
-            conds_std = conds_std.squeeze(0)
-        print(f"[OK] conds_std loaded, shape: {conds_std.shape}")
-    else:
-        conds_std = torch.ones(512, device=device)
-        print("[WARN] No conds_std found, using ones")
-    
-    # Create diffusion sampler
-    sampler = conf.make_diffusion_conf().make_sampler()
-    
-    # Setup optimizer
-    if args.freeze_projection_head:
-        projection_head.eval()
-        for p in projection_head.parameters():
-            p.requires_grad = False
-        trainable_params = list(model.parameters())
-        print("[INFO] Projection head FROZEN")
-    else:
-        trainable_params = list(model.parameters()) + list(projection_head.parameters())
-        print("[INFO] Projection head TRAINABLE (joint fine-tuning)")
-    
-    optimizer = torch.optim.AdamW(
-        trainable_params,
-        lr=args.lr,
-        weight_decay=args.weight_decay,
-    )
-    
-    scheduler = build_scheduler(optimizer, args)
-    is_plateau_scheduler = isinstance(
-        scheduler, torch.optim.lr_scheduler.ReduceLROnPlateau)
-    
-    # Early stopping
-    early_stopping = EarlyStopping(
-        patience=getattr(args, "early_stopping_patience", 0),
-        min_delta=getattr(args, "early_stopping_min_delta", 0.0),
-    )
-    
-    print(f"\n[INFO] Training config:")
-    print(f"       Epochs: {args.epochs}")
-    print(f"       Batch size: {args.batch_size}")
-    print(f"       Grad accum steps: {args.grad_accum_steps}")
-    print(f"       Effective batch size: {args.batch_size * args.grad_accum_steps}")
-    print(f"       Learning rate: {args.lr}")
-    print(f"       Scheduler: {getattr(args, 'scheduler', 'cosine')}")
-    print(f"       Warmup epochs: {getattr(args, 'warmup_epochs', 0)}")
-    print(f"       Freeze projection: {args.freeze_projection_head}")
-    print(f"       Mixed precision (fp16): {args.fp16}")
-    if early_stopping.enabled:
-        print(f"       Early stopping: patience={early_stopping.patience}, "
-              f"min_delta={early_stopping.min_delta}")
-    else:
-        print(f"       Early stopping: disabled")
-    
-    # Setup mixed precision
-    use_amp = args.fp16 and device.startswith("cuda") and torch.cuda.is_available()
-    scaler = GradScaler(enabled=use_amp)
-    if use_amp:
-        print("[INFO] Using mixed precision training (fp16)")
-    
-    # Training loop
-    print("\n" + "=" * 60)
-    print("STARTING FINE-TUNING")
-    print("=" * 60 + "\n")
-    
-    best_loss = float("inf")
-    training_start = time.time()
-    epoch = 0
-    
-    for epoch in range(1, args.epochs + 1):
-        epoch_start = time.time()
+                "Dataset is empty — check genomic and tile paths")
+
+        # Disable parent's feat_extractor (we use projection head instead)
+        self.feat_extractor = None
+        self.model.feat_extractor = None
+        self.ema_model.feat_extractor = None
+
+        # Capture fixed validation batch for grid logging
+        val_loader = DataLoader(
+            self.val_data,
+            batch_size=min(self.n_log_samples, len(self.val_data)),
+            shuffle=False,
+            num_workers=0,
+        )
+        try:
+            batch = next(iter(val_loader))
+            # Validate batch structure
+            if batch is None or not hasattr(batch, "__getitem__") or "img" not in batch:
+                self._fixed_val_batch = None
+                print("[setup] Warning: validation loader returned empty or unexpected batch")
+            else:
+                # store batch as-is (tensors will be moved to device later)
+                self._fixed_val_batch = batch
+                # Compute number of samples robustly (guard against None, lists, tensors)
+                fixed = self._fixed_val_batch
+                if fixed is None or not hasattr(fixed, "__getitem__") or "img" not in fixed:
+                    n_val = None
+                else:
+                    try:
+                        img = fixed["img"]
+                        if hasattr(img, "shape"):
+                            n_val = int(img.shape[0])
+                        else:
+                            n_val = int(len(img))
+                    except Exception:
+                        n_val = None
+                print(f"[setup] Captured {n_val if n_val is not None else 'unknown'} fixed validation samples "
+                      f"for grid logging")
+        except Exception as e:
+            self._fixed_val_batch = None
+            print(f"[setup] Warning: could not capture validation batch: {e}")
+
+    def train_dataloader(self):
+        return DataLoader(
+            self.train_data,
+            batch_size=self.batch_size,
+            shuffle=True,
+            num_workers=self.conf.num_workers,
+            pin_memory=True,
+            drop_last=True,
+        )
+
+    # ------------------------------------------------------------------
+    #  Training step — joint UNet + projection head
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        imgs = batch["img"].to(self.device)
+        genomic_raw = batch["feat"].to(self.device, dtype=torch.float32)
+
+        # Project genomic → cond (gradient flows into proj head)
+        cond = self.projection_head(genomic_raw)
+
+        # Standard diffusion training loss
+        t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+        losses = self.sampler.training_losses(
+            model=self.model,
+            x_start=imgs,
+            cond=cond,
+            t=t,
+            model_kwargs={"cond": cond},
+        )
+        loss = losses["loss"].mean()
+
+        # Lightning logging (accessible by ModelCheckpoint / callbacks)
+        self.log("loss", loss, prog_bar=True,
+                 on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/loss", loss, prog_bar=False,
+                 on_step=False, on_epoch=True, sync_dist=True)
+
+        # Also attempt to log to TensorBoard at self.num_samples (matches MoPaDi style).
+        # Guard against `self.logger.experiment` being None (some loggers defer creation).
+        if self.global_rank == 0:
+            try:
+                tb = getattr(self.logger, "experiment", None)
+                step = int(self.num_samples) if hasattr(self, "num_samples") else None
+                if tb is not None:
+                    tb.add_scalar("loss", loss.item(), step)
+                else:
+                    # Fallback to Lightning logger so metrics are still captured
+                    self.log("loss_tensorboard_fallback", loss, on_step=False, on_epoch=True)
+            except Exception:
+                # Ensure logging never crashes training
+                self.log("loss_logging_error", loss, on_step=False, on_epoch=True)
+
+        return {"loss": loss}
+
+    # ------------------------------------------------------------------
+    #  EMA + grid logging  (override parent's on_train_batch_end)
+    # ------------------------------------------------------------------
+
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """EMA update + periodic 4×4 grid of real vs generated tiles."""
+        if not self.is_last_accum(batch_idx):
+            return
+
+        # EMA update
+        ema(self.model, self.ema_model, self.conf.ema_decay)
+
+        # Grid logging
+        if (self.conf.reconstruct_every_samples > 0
+                and is_time(self.num_samples,
+                            self.conf.reconstruct_every_samples,
+                            self.conf.batch_size_effective)):
+            self._log_grid(self.model, postfix="")
+            self._log_grid(self.ema_model, postfix="_ema")
+
+    def _log_grid(self, model, postfix: str = ""):
+        """Generate a 4×4 grid from the fixed validation batch."""
+        vb = self._fixed_val_batch
+        if vb is None:
+            return
+
+        model.eval()
+        imgs = vb["img"].to(self.device)
+        genomic = vb["feat"].to(self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            cond = self.projection_head(genomic)
+
+            # Sample from Gaussian noise conditioned on genomic
+            noise = torch.randn_like(imgs)
+            gen = self.eval_sampler.sample(
+                model=model,
+                noise=noise,
+                cond=cond,
+                x_start=imgs,
+            )
+
+        if self.global_rank == 0:
+            step = int(self.num_samples)
+            nrow = 4
+
+            # Real tiles
+            grid_real = (make_grid(imgs, nrow=nrow) + 1) / 2
+            real_dir = os.path.join(
+                self.conf.logdir, f"sample_real{postfix}")
+            os.makedirs(real_dir, exist_ok=True)
+            save_image(grid_real, os.path.join(real_dir, f"{step}.png"))
+
+            # Generated tiles
+            grid_gen = (make_grid(gen, nrow=nrow) + 1) / 2
+            gen_dir = os.path.join(
+                self.conf.logdir, f"sample{postfix}")
+            os.makedirs(gen_dir, exist_ok=True)
+            save_image(grid_gen, os.path.join(gen_dir, f"{step}.png"))
+
+            # TensorBoard images (guarded)
+            try:
+                tb = getattr(self.logger, "experiment", None)
+                if tb is not None:
+                    tb.add_image(f"sample{postfix}/real", grid_real, step)
+                    tb.add_image(f"sample{postfix}", grid_gen, step)
+                else:
+                    # Log a simple scalar as a marker that images were saved to disk
+                    self.log(f"sample{postfix}/grid_saved", 1, on_step=False, on_epoch=True)
+            except Exception as e:
+                print(f"[log_grid] Warning: TensorBoard logging failed: {e}")
+                self.log(f"sample{postfix}/grid_logging_error", 1, on_step=False, on_epoch=True)
+
         model.train()
-        if not args.freeze_projection_head:
-            projection_head.train()
-        
-        epoch_loss = 0.0
-        pbar = tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs}")
-        
-        optimizer.zero_grad()
-        accum_loss = 0.0
-        
-        for batch_idx, batch in enumerate(pbar):
-            imgs = batch["img"].to(device)
-            genomic = batch["genomic"].to(device)
-            B = imgs.shape[0]
-            
-            # Mixed precision forward pass
-            with autocast(enabled=use_amp):
-                # Project genomic features
-                with torch.set_grad_enabled(not args.freeze_projection_head):
-                    projected = projection_head(genomic)  # (B, 512)
-                
-                # Normalize using diffusion model's statistics
-                cond = (projected - conds_mean) / (conds_std + 1e-6)
-                
-                # Sample timesteps
-                t = torch.randint(0, conf.T, (B,), device=device).long()
-                
-                # Compute diffusion loss
-                model_kwargs = {"cond": cond}
-                losses = sampler.training_losses(
-                    model=model,
-                    x_start=imgs,
-                    cond=cond,
-                    t=t,
-                    model_kwargs=model_kwargs,
-                )
-                
-                # Scale loss for gradient accumulation
-                loss = losses["loss"].mean() / args.grad_accum_steps
-            
-            # Scaled backward pass
-            scaler.scale(loss).backward()
-            accum_loss += loss.item() * args.grad_accum_steps
-            
-            # Step optimizer every grad_accum_steps
-            if (batch_idx + 1) % args.grad_accum_steps == 0 or (batch_idx + 1) == len(train_loader):
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(trainable_params, max_norm=1.0)
-                scaler.step(optimizer)
-                scaler.update()
-                optimizer.zero_grad()
-                
-                # Update EMA after each optimizer step
-                with torch.no_grad():
-                    for p_ema, p in zip(ema_model.parameters(), model.parameters()):
-                        p_ema.data.mul_(0.9999).add_(p.data, alpha=0.0001)
-                
-                epoch_loss += accum_loss
-                pbar.set_postfix({"loss": accum_loss})
-                accum_loss = 0.0
-        
-        # Step the LR scheduler
-        # Average loss: we accumulate per optimizer step, divide by number of steps
-        num_optim_steps = (len(train_loader) + args.grad_accum_steps - 1) // args.grad_accum_steps
-        epoch_loss /= max(num_optim_steps, 1)
 
-        if is_plateau_scheduler:
-            scheduler.step(epoch_loss)
+    # ------------------------------------------------------------------
+    #  Optimizer  (separate param groups for UNet + projection head)
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        param_groups = [
+            {"params": list(self.model.parameters()),
+             "lr": self.conf.lr, "name": "unet"},
+            {"params": list(self.projection_head.parameters()),
+             "lr": self.proj_lr, "name": "proj_head"},
+        ]
+
+        optim = torch.optim.AdamW(
+            param_groups,
+            betas=(0.9, 0.99),
+            eps=1e-6,
+            weight_decay=self.conf.weight_decay,
+        )
+
+        # Optional linear warm-up for the projection head
+        if self.proj_warmup > 0:
+            from torch.optim.lr_scheduler import LambdaLR
+
+            def warmup_fn(step):
+                """Ramp from 0 → 1 over proj_warmup steps."""
+                if step < self.proj_warmup:
+                    return float(step) / float(max(1, self.proj_warmup))
+                return 1.0
+
+            # Apply warm-up to ALL param groups (UNet also benefits from
+            # a short ramp since we're loading pre-trained weights)
+            scheduler = LambdaLR(optim, lr_lambda=warmup_fn)
+            return {
+                "optimizer": optim,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "interval": "step",
+                    "frequency": 1,
+                },
+            }
+
+        return {"optimizer": optim}
+
+    # ------------------------------------------------------------------
+    #  Evaluation placeholder
+    # ------------------------------------------------------------------
+
+    def evaluate_scores(self):
+        pass
+
+    # ------------------------------------------------------------------
+    #  Checkpoint helpers
+    # ------------------------------------------------------------------
+
+    def on_save_checkpoint(self, checkpoint):
+        checkpoint["projection_head_state_dict"] = (
+            self.projection_head.state_dict()
+        )
+
+    def on_load_checkpoint(self, checkpoint):
+        if "projection_head_state_dict" in checkpoint:
+            self.projection_head.load_state_dict(
+                checkpoint["projection_head_state_dict"]
+            )
+            print("[OK] Projection head restored from checkpoint")
+
+
+# ======================================================================
+#  Entry point
+# ======================================================================
+
+def run(args):
+    """Build model, load checkpoint, train."""
+
+    # ---- Projection head (trains from scratch jointly with UNet) ----
+    proj_head = ProjectionHead(
+        in_dim=512,
+        out_dim=512,
+        hidden_dim=args.proj_hidden_dim,
+        num_layers=args.proj_layers,
+        dropout=args.proj_dropout,
+    )
+
+    # Optionally warm-start from a previous checkpoint
+    if args.proj_ckpt:
+        ckpt_path = Path(args.proj_ckpt)
+        if ckpt_path.exists():
+            ckpt = torch.load(ckpt_path, map_location="cpu")
+            proj_head.load_state_dict(
+                ckpt.get("state_dict", ckpt), strict=False)
+            print(f"[OK] Warm-started projection head from {args.proj_ckpt}")
         else:
-            scheduler.step()
+            print(f"[WARN] --proj-ckpt not found: {args.proj_ckpt}")
 
-        # Current LR (works for all scheduler types)
-        current_lr = optimizer.param_groups[0]["lr"]
-        epoch_time = time.time() - epoch_start
-        
-        print(f"\nEpoch {epoch}/{args.epochs} | Time: {epoch_time:.1f}s | "
-              f"Loss: {epoch_loss:.6f} | LR: {current_lr:.2e}")
-        
-        if device.startswith("cuda"):
-            mem = torch.cuda.memory_allocated(device) / 1024**3
-            print(f"  GPU Memory: {mem:.2f} GB")
-        
-        # Save best
-        if epoch_loss < best_loss:
-            best_loss = epoch_loss
-            save_checkpoint(
-                args.out_dir, "diffusion_genomic_best.pt",
-                model, ema_model, projection_head, 
-                conds_mean, conds_std, epoch, epoch_loss, args
-            )
-            print(f"  ★ NEW BEST! Saved checkpoint")
-        
-        # Periodic save
-        if epoch % 5 == 0 or epoch == args.epochs:
-            save_checkpoint(
-                args.out_dir, f"diffusion_genomic_epoch{epoch:03d}.pt",
-                model, ema_model, projection_head,
-                conds_mean, conds_std, epoch, epoch_loss, args
-            )
-            print(f"  Checkpoint saved: epoch {epoch}")
-        
-        # Early stopping check
-        if early_stopping.step(epoch_loss, epoch):
-            print(f"\n[EARLY STOPPING] No improvement for {early_stopping.patience} "
-                  f"epochs. Best loss {early_stopping.best_loss:.6f} at epoch "
-                  f"{early_stopping.best_epoch}. Stopping.")
-            break
-        elif early_stopping.enabled:
-            print(f"  Early stopping: {early_stopping.status_message()}")
-    
-    total_time = time.time() - training_start
-    stopped_early = early_stopping.should_stop
-    print("\n" + "=" * 60)
-    print("FINE-TUNING COMPLETE" + (" (early stopped)" if stopped_early else ""))
-    print(f"  Epochs run: {epoch}/{args.epochs}")
-    print(f"  Total time: {total_time/60:.1f} minutes")
-    print(f"  Best loss: {best_loss:.6f}")
-    if early_stopping.enabled:
-        print(f"  Best epoch: {early_stopping.best_epoch}")
-    print(f"  Output: {args.out_dir}")
-    print("=" * 60 + "\n")
+    # ---- MoPaDi config ----
+    conf = tcga_brca_autoenc()
+    conf.batch_size = args.batch_size
+    conf.lr = args.lr
+    conf.weight_decay = args.weight_decay
+    conf.fp16 = args.fp16
+    conf.grad_clip = args.grad_clip
+    conf.accum_batches = args.accum_batches
+    conf.warmup = args.warmup
+    conf.ema_decay = args.ema_decay
+    conf.num_workers = args.num_workers
+    conf.img_size = args.img_size
+    conf.sample_size = args.n_log_samples
+    conf.reconstruct_every_samples = args.reconstruct_every_samples
+    conf.eval_every_samples = 999_999_999
+    conf.eval_ema_every_samples = 999_999_999
+    conf.save_every_samples = args.save_every_samples
+    conf.base_dir = args.out_dir
+    conf.name = "genomic_finetune_v4"
+
+    setattr(conf, "data_dirs", [])
+    setattr(conf, "feature_dirs", [])
+    setattr(conf, "feat_extractor", None)
+
+    # ---- Build model ----
+    model = LitDiffusionGenomicV4(
+        conf=conf,
+        projection_head=proj_head,
+        genomic_h5_dir=args.genomic_h5_dir,
+        tiles_zip_dir=args.tiles_zip_dir,
+        tiles_per_patient=args.tiles_per_patient,
+        split=args.split,
+        img_size=args.img_size,
+        proj_lr=args.proj_lr,
+        proj_warmup=args.proj_warmup,
+        n_log_samples=args.n_log_samples,
+    )
+
+    # ---- Load pretrained diffusion weights ----
+    if not Path(args.diffusion_ckpt).exists():
+        raise FileNotFoundError(
+            f"Diffusion checkpoint not found: {args.diffusion_ckpt}")
+    print(f"[INFO] Loading diffusion checkpoint: {args.diffusion_ckpt}")
+    ckpt = torch.load(args.diffusion_ckpt, map_location="cpu")
+
+    if "state_dict" in ckpt:
+        state = dict(ckpt["state_dict"])
+        # Drop x_T if shape doesn't match
+        if "x_T" in state:
+            model_xT = getattr(model, "x_T", None)
+            if model_xT is not None:
+                if tuple(state["x_T"].shape) != tuple(model_xT.shape):
+                    print(f"[WARN] Dropping x_T from checkpoint "
+                          f"(shape {tuple(state['x_T'].shape)} "
+                          f"!= {tuple(model_xT.shape)})")
+                    del state["x_T"]
+        model.load_state_dict(state, strict=False)
+        print(f"[OK] Loaded state_dict from {args.diffusion_ckpt}")
+    else:
+        model.model.load_state_dict(ckpt, strict=False)
+        model.ema_model = copy.deepcopy(model.model)
+        model.ema_model.requires_grad_(False)
+        model.ema_model.eval()
+        print(f"[OK] Loaded bare model weights from {args.diffusion_ckpt}")
+
+    # ---- Trainer ----
+    os.makedirs(conf.logdir, exist_ok=True)
+
+    ckpt_callback = ModelCheckpoint(
+        dirpath=conf.logdir,
+        filename="epoch={epoch:02d}-loss={loss:.4f}",
+        save_last=True,
+        save_top_k=3,
+        monitor="loss",
+        mode="min",
+        every_n_train_steps=max(
+            1,
+            conf.save_every_samples // conf.batch_size_effective,
+        ),
+    )
+
+    tb_logger = pl_loggers.TensorBoardLogger(
+        save_dir=conf.logdir, name=None, version="",
+    )
+
+    gpus = args.gpus
+    if len(gpus) == 1:
+        accelerator, strategy = "gpu", "auto"
+    elif len(gpus) > 1:
+        from pytorch_lightning.strategies import DDPStrategy
+        strategy = DDPStrategy(find_unused_parameters=True)
+        accelerator = "gpu"
+    else:
+        accelerator, strategy = "cpu", "auto"
+
+    trainer = pl.Trainer(
+        max_epochs=args.epochs,
+        devices=gpus,
+        strategy=strategy,
+        accelerator=accelerator,
+        precision="16-mixed" if conf.fp16 else 32,
+        callbacks=[ckpt_callback, LearningRateMonitor()],
+        logger=tb_logger,
+        accumulate_grad_batches=conf.accum_batches,
+    )
+
+    last_ckpt = os.path.join(conf.logdir, "last.ckpt")
+    if os.path.exists(last_ckpt):
+        print(f"[INFO] Resuming from {last_ckpt}")
+        trainer.fit(model, ckpt_path=last_ckpt)
+    else:
+        trainer.fit(model)
+
+    print(f"\n{'='*60}")
+    print("GENOMIC DIFFUSION FINE-TUNING COMPLETE")
+    print(f"  Output directory : {conf.logdir}")
+    print(f"  TensorBoard logs : {conf.logdir}")
+    print(f"{'='*60}\n")
 
 
-def save_checkpoint(
-    out_dir: str,
-    filename: str,
-    model: nn.Module,
-    ema_model: nn.Module,
-    projection_head: ProjectionHead,
-    conds_mean: torch.Tensor,
-    conds_std: torch.Tensor,
-    epoch: int,
-    loss: float,
-    args,
-):
-    """Save a combined checkpoint with diffusion model + projection head."""
-    os.makedirs(out_dir, exist_ok=True)
-    save_path = Path(out_dir) / filename
-    
-    torch.save({
-        "epoch": epoch,
-        "loss": loss,
-        "model_state_dict": model.state_dict(),
-        "ema_model_state_dict": ema_model.state_dict(),
-        "projection_head_state_dict": projection_head.state_dict(),
-        "projection_head_config": {
-            "in_dim": projection_head.in_dim,
-            "out_dim": projection_head.out_dim,
-            "arch": projection_head.arch,
-        },
-        "conds_mean": conds_mean.cpu(),
-        "conds_std": conds_std.cpu(),
-        "args": vars(args),
-    }, save_path)
-
-
-# ----------------------------------------------------------------------
-#   Main
-# ----------------------------------------------------------------------
+# ======================================================================
+#  CLI
+# ======================================================================
 
 def main():
     parser = argparse.ArgumentParser(
-        description="Fine-tune diffusion model with genomic conditioning"
+        description="Fine-tune diffusion model with genomic conditioning (v4)"
+                    " — joint projection-head + UNet training",
     )
-    
-    # Required paths
-    parser.add_argument("--projection-head-ckpt", type=str, required=True,
-                        help="Path to trained projection head checkpoint")
     parser.add_argument("--diffusion-ckpt", type=str, required=True,
-                        help="Path to pretrained diffusion model checkpoint")
+                        help="Path to pretrained diffusion checkpoint")
     parser.add_argument("--genomic-h5-dir", type=str, required=True,
-                        help="Directory with genomic feature H5 files")
+                        help="Dir with per-patient genomic .h5 files")
     parser.add_argument("--tiles-zip-dir", type=str, required=True,
-                        help="Directory with tile zip files")
-    parser.add_argument("--out-dir", type=str, required=True,
-                        help="Output directory for checkpoints")
-    
-    # Training settings
-    parser.add_argument("--epochs", type=int, default=10,
-                        help="Number of fine-tuning epochs")
-    parser.add_argument("--batch-size", type=int, default=8,
-                        help="Batch size (reduce if OOM)")
-    parser.add_argument("--grad-accum-steps", type=int, default=4,
-                        help="Gradient accumulation steps (effective batch = batch_size * grad_accum)")
+                        help="Dir with per-patient tile .zip archives")
+    parser.add_argument("--out-dir", type=str, required=True)
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch-size", type=int, default=4)
+    parser.add_argument("--accum-batches", type=int, default=8)
     parser.add_argument("--lr", type=float, default=1e-5,
-                        help="Learning rate (lower than pretraining)")
+                        help="UNet learning rate")
+    parser.add_argument("--proj-lr", type=float, default=3e-4,
+                        help="Projection head learning rate")
+    parser.add_argument("--proj-warmup", type=int, default=500,
+                        help="Linear warm-up steps for LR scheduler")
     parser.add_argument("--weight-decay", type=float, default=0.01)
-    
-    # Scheduler & early stopping
-    parser.add_argument("--scheduler", type=str, default="cosine",
-                        choices=["cosine", "cosine_warmup", "plateau"],
-                        help="LR scheduler type (default: cosine)")
-    parser.add_argument("--warmup-epochs", type=int, default=0,
-                        help="Number of linear-warmup epochs before cosine decay "
-                             "(only used with cosine/cosine_warmup scheduler)")
-    parser.add_argument("--early-stopping-patience", type=int, default=0,
-                        help="Stop after N epochs without improvement (0 = disabled)")
-    parser.add_argument("--early-stopping-min-delta", type=float, default=0.0,
-                        help="Minimum loss decrease to count as improvement")
-    
-    parser.add_argument("--tiles-per-patient", type=int, default=10,
-                        help="Tiles to sample per patient per epoch")
-    parser.add_argument("--split", type=str, default="train",
-                        choices=["train", "test", "all"])
-    
-    # Model settings
-    parser.add_argument("--freeze-projection-head", action="store_true",
-                        help="Keep projection head frozen during fine-tuning")
-    parser.add_argument("--img-size", type=int, default=512,
-                        help="Image size for training")
-    parser.add_argument("--fp16", action="store_true",
-                        help="Use mixed precision training (fp16) to reduce memory")
-    
-    # Hardware
-    parser.add_argument("--device", type=str, default="cuda:0")
+    parser.add_argument("--warmup", type=int, default=0,
+                        help="Global warm-up (MoPaDi config)")
+    parser.add_argument("--fp16", action="store_true")
+    parser.add_argument("--grad-clip", type=float, default=1.0)
+    parser.add_argument("--ema-decay", type=float, default=0.9999)
+
+    # Projection head architecture
+    parser.add_argument("--proj-ckpt", type=str, default=None,
+                        help="Optional: warm-start proj head from checkpoint")
+    parser.add_argument("--proj-layers", type=int, default=4)
+    parser.add_argument("--proj-hidden-dim", type=int, default=512)
+    parser.add_argument("--proj-dropout", type=float, default=0.1)
+
+    # Data
+    parser.add_argument("--tiles-per-patient", type=int, default=10)
+    parser.add_argument("--split", type=str, default="train")
+    parser.add_argument("--img-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=4)
-    
+
+    # Logging
+    parser.add_argument("--n-log-samples", type=int, default=16,
+                        help="Fixed validation tiles for 4×4 grid logging")
+    parser.add_argument("--reconstruct-every-samples", type=int,
+                        default=10_000)
+    parser.add_argument("--save-every-samples", type=int, default=5_000)
+
+    # Hardware
+    parser.add_argument("--gpus", type=int, nargs="+", default=[0])
+
     args = parser.parse_args()
-    
-    # Startup banner
-    print("\n" + "=" * 60)
-    print("DIFFUSION MODEL FINE-TUNING WITH GENOMIC CONDITIONING")
-    print("=" * 60)
-    print(f"PyTorch version: {torch.__version__}")
-    print(f"CUDA available: {torch.cuda.is_available()}")
-    print("=" * 60 + "\n")
-    
-    # Device setup
-    if torch.cuda.is_available() and args.device.startswith("cuda"):
-        device = args.device
-        props = torch.cuda.get_device_properties(0)
-        print(f"[OK] Using GPU: {props.name} ({props.total_memory/1024**3:.1f} GB)")
-    else:
-        device = "cpu"
-        print("[WARN] Using CPU (this will be slow)")
-    
-    # Validate paths
-    assert Path(args.projection_head_ckpt).exists(), \
-        f"Projection head checkpoint not found: {args.projection_head_ckpt}"
-    assert Path(args.diffusion_ckpt).exists(), \
-        f"Diffusion checkpoint not found: {args.diffusion_ckpt}"
-    assert Path(args.genomic_h5_dir).exists(), \
-        f"Genomic H5 directory not found: {args.genomic_h5_dir}"
-    assert Path(args.tiles_zip_dir).exists(), \
-        f"Tiles zip directory not found: {args.tiles_zip_dir}"
-    
-    os.makedirs(args.out_dir, exist_ok=True)
-    print(f"[OK] Output directory: {args.out_dir}")
-    
-    # Load projection head
-    print("\n" + "=" * 60)
-    print("LOADING PROJECTION HEAD")
-    print("=" * 60)
-    projection_head = load_projection_head(args.projection_head_ckpt, device)
-    
-    # Create dataset
-    print("\n" + "=" * 60)
-    print("CREATING DATASET")
-    print("=" * 60)
-    
-    transform = transforms.Compose([
-        transforms.Resize(args.img_size, interpolation=transforms.InterpolationMode.BILINEAR),
-        transforms.CenterCrop(args.img_size),
-        transforms.ToTensor(),
-        transforms.Normalize(mean=(0.5, 0.5, 0.5), std=(0.5, 0.5, 0.5)),
-    ])
-    
-    dataset = GenomicTileDataset(
-        genomic_h5_dir=args.genomic_h5_dir,
-        tiles_zip_dir=args.tiles_zip_dir,
-        transform=transform,
-        tiles_per_patient=args.tiles_per_patient,
-        split=args.split,
-    )
-    
-    train_loader = DataLoader(
-        dataset,
-        batch_size=args.batch_size,
-        shuffle=True,
-        num_workers=args.num_workers,
-        pin_memory=True,
-        drop_last=True,
-    )
-    
-    print(f"[OK] DataLoader: {len(train_loader)} batches")
-    
-    # Fine-tune
-    finetune_diffusion(
-        projection_head=projection_head,
-        diffusion_ckpt_path=args.diffusion_ckpt,
-        train_loader=train_loader,
-        args=args,
-        device=device,
-    )
-    
-    print("\n" + "=" * 60)
-    print("ALL DONE!")
-    print("=" * 60)
+
+    # ---- Banner ----
+    print(f"\n{'='*60}")
+    print("DIFFUSION FINE-TUNING WITH GENOMIC CONDITIONING (v4)")
+    print(f"  Joint UNet + ProjectionHead training")
+    print(f"  PyTorch : {torch.__version__}")
+    print(f"  UNet LR : {args.lr}  |  Proj LR : {args.proj_lr}")
+    print(f"{'='*60}\n")
+
+    run(args)
 
 
 if __name__ == "__main__":

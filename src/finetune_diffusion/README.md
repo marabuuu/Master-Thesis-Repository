@@ -9,35 +9,9 @@ This module enables generating histopathology tile images conditioned on genomic
 │                     GENOMIC → TILE GENERATION PIPELINE                          │
 └─────────────────────────────────────────────────────────────────────────────────┘
 
-                         TRAINING PHASE
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │                                                                          │
-  │   ┌─────────────┐      ┌──────────────────┐      ┌──────────────────┐   │
-  │   │  Genomic    │      │  Projection      │      │ Diffusion Model  │   │
-  │   │  Features   │─────▶│  Head Training   │─────▶│  Fine-tuning     │   │
-  │   │  (512-dim)  │      │  (Step 1)        │      │  (Step 2)        │   │
-  │   └─────────────┘      └──────────────────┘      └──────────────────┘   │
-  │                               │                          │              │
-  │                               ▼                          ▼              │
-  │                    projection_head_best.pt    diffusion_genomic_best.pt │
-  │                                                                          │
-  └──────────────────────────────────────────────────────────────────────────┘
-
-                         INFERENCE PHASE
-  ┌──────────────────────────────────────────────────────────────────────────┐
-  │                                                                          │
-  │   ┌─────────────┐      ┌──────────────────┐      ┌──────────────────┐   │
-  │   │  Genomic    │      │  Projection      │      │  cDDIM Sampler   │   │
-  │   │  Features   │─────▶│  Head            │─────▶│  (Denoising)     │──▶│ Tiles
-  │   │  (512-dim)  │      │                  │      │                  │   │
-  │   └─────────────┘      └──────────────────┘      └──────────────────┘   │
-  │                                                         ▲               │
-  │                                                         │               │
-  │                              Random Noise x_T ──────────┘               │
-  │                                   OR                                    │
-  │                              Encoded Real Tile                          │
-  │                                                                          │
-  └──────────────────────────────────────────────────────────────────────────┘
+Step 1: Genomic features (512-dim vectors) → Projection Head → Conditioning Space
+Step 2: Conditioning Space + Random Noise → Diffusion Model → Synthetic Tiles
+Step 3 (Optional): Encode real tiles → Noise → Decode with Genomic Conditioning
 ```
 
 ## Module Purpose
@@ -66,7 +40,7 @@ Loss function:
 ```
 L = L_mean + L_var + L_diversity
   = MSE(batch_mean, conds_mean) 
-  + MSE(batch_std, conds_std)
+  + MSE(batch_var, conds_std)
   + ReLU(τ - mean_pairwise_distance)
 ```
 
@@ -85,21 +59,13 @@ L = L_mean + L_var + L_diversity
 # Basic training with distribution matching
 python projection_head_genomic.py \
     --mode distribution_matching \
-    --genomic-h5-dir /path/to/genomic_features \
-    --diffusion-ckpt ./diffusion_without_encoder.ckpt \
-    --out-dir ./projection_head_output \
-    --epochs 50 \
+    --genomic-h5-dir ./genomic_features \
     --lr 1e-4
 
 # With custom architecture
 python projection_head_genomic.py \
     --mode distribution_matching \
-    --genomic-h5-dir /path/to/genomic_features \
-    --diffusion-ckpt ./diffusion_without_encoder.ckpt \
-    --out-dir ./projection_head_output \
-    --arch mlp \
-    --hidden-dim 512 \
-    --num-layers 2 \
+    --genomic-h5-dir ./genomic_features \
     --epochs 100
 ```
 
@@ -140,23 +106,15 @@ where `cond = normalize(ProjectionHead(genomic))`.
 # Basic fine-tuning
 python finetune_diffusion_with_genomic.py \
     --projection-head-ckpt ./projection_head_best.pt \
-    --diffusion-ckpt ./diffusion_without_encoder.ckpt \
-    --genomic-h5-dir /path/to/genomic_features \
-    --tiles-zip-dir /path/to/tile_zips \
-    --out-dir ./finetuned_diffusion \
-    --epochs 50 \
+    --genomic-h5-dir ./genomic_features \
+    --tiles-zip-dir ./tile_zips \
     --lr 5e-6
 
 # With more tiles per patient and gradient accumulation
 python finetune_diffusion_with_genomic.py \
     --projection-head-ckpt ./projection_head_best.pt \
-    --diffusion-ckpt ./diffusion_without_encoder.ckpt \
-    --genomic-h5-dir /path/to/genomic_features \
-    --tiles-zip-dir /path/to/tile_zips \
-    --out-dir ./finetuned_diffusion \
-    --epochs 50 \
-    --lr 5e-6 \
-    --tiles-per-patient 20 \
+    --genomic-h5-dir ./genomic_features \
+    --tiles-zip-dir ./tile_zips \
     --gradient-accumulation-steps 4
 ```
 
@@ -199,27 +157,24 @@ Generate synthetic tile images from genomic feature vectors using the fine-tuned
 # Mode 1: Random noise generation (fully synthetic)
 python sample_tiles_from_genomic.py \
     --checkpoint ./diffusion_genomic_best.pt \
-    --genomic-h5-dir /path/to/genomic_features \
+    --genomic-h5-dir ./genomic_features \
     --output-dir ./generated_tiles \
-    --mode random \
     --num-samples-per-patient 4
 
 # Mode 2: Encode-decode (preserve structure from real tiles)
 python sample_tiles_from_genomic.py \
     --checkpoint ./diffusion_genomic_best.pt \
-    --genomic-h5-dir /path/to/genomic_features \
-    --tiles-zip-dir /path/to/tile_zips \
+    --genomic-h5-dir ./genomic_features \
+    --tiles-zip-dir ./tile_zips \
     --output-dir ./generated_tiles \
     --mode encode-decode \
-    --num-samples-per-patient 4 \
-    --encode-steps 250
+    --num-samples-per-patient 4
 
 # Sample specific patients only
 python sample_tiles_from_genomic.py \
     --checkpoint ./diffusion_genomic_best.pt \
-    --genomic-h5-dir /path/to/genomic_features \
+    --genomic-h5-dir ./genomic_features \
     --output-dir ./generated_tiles \
-    --patient-ids TCGA-3C-AAAU TCGA-3C-AALJ \
     --num-samples-per-patient 8
 ```
 
@@ -241,6 +196,7 @@ output_dir/
 │   └── ...
 └── ...
 ```
+
 ---
 
 ## File Format Requirements
@@ -259,6 +215,3 @@ If multiple vectors (N > 1), they are averaged to get a single patient-level rep
 ├── tile_002.jpg
 └── ...
 ```
-Tiles should be 512×512 (or will be resized/cropped).
-
----

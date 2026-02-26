@@ -8,10 +8,17 @@ Components:
     - projection_head_genomic: Train a projection head to map genomic to image space
     - sample_tiles_from_genomic: Generate tiles conditioned on genomic features
 
+Pipeline Overview:
+    1. Train a projection head to map genomic features to the conditioning space.
+    2. Fine-tune the diffusion model with genomic conditioning.
+    3. Generate synthetic tiles using the fine-tuned model in two modes:
+        - Random noise generation
+        - Encode-decode with real tiles
+
 Note:
     The sampling script requires mopadi to be installed. Import individual components
     directly from their respective modules when needed:
-    
+
         from src.finetune_diffusion.sample_tiles_from_genomic import ProjectionHead
 
 Usage:
