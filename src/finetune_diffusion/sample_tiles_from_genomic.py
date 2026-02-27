@@ -113,6 +113,8 @@ def main():
 	parser.add_argument("--out-dir", required=True)
 	parser.add_argument("--n-samples", type=int, default=4)
 	parser.add_argument("--img-size", type=int, default=512)
+	parser.add_argument("--debug-save", action="store_true", help="Save debug images (original, x_t, generated) to out-dir")
+	parser.add_argument("--debug-n", type=int, default=4, help="Number of debug samples to save per patient")
 	parser.add_argument("--proj-hidden-dim", type=int, default=512)
 	parser.add_argument("--proj-layers", type=int, default=4)
 	parser.add_argument("--proj-dropout", type=float, default=0.1)
@@ -152,11 +154,17 @@ def main():
 
 	# Load checkpoint (same logic as finetune script)
 	ckpt = torch.load(args.ckpt, map_location="cpu")
+	# track whether projection head weights were loaded from the main ckpt or external proj_ckpt
+	proj_loaded_from_ckpt = False
+	proj_loaded_from_projckpt = False
 	if "state_dict" in ckpt:
 		state = dict(ckpt["state_dict"])
 		# Drop x_T mismatch if present
 		if "x_T" in state and hasattr(lit, "x_T") and state["x_T"].shape != getattr(lit, "x_T").shape:
 			del state["x_T"]
+		# detect if projection head is present in the saved state
+		if any("projection_head" in k for k in state.keys()):
+			proj_loaded_from_ckpt = True
 		lit.load_state_dict(state, strict=False)
 		print(f"Loaded state_dict from {args.ckpt}")
 	else:
@@ -170,6 +178,9 @@ def main():
 			print(f"Loaded bare model weights from {args.ckpt}")
 		except Exception:
 			# Fallback: try to load into full lit
+			# if the bare checkpoint is actually a state-dict-like mapping, check for projection_head keys
+			if isinstance(ckpt, dict) and any("projection_head" in k for k in ckpt.keys()):
+				proj_loaded_from_ckpt = True
 			lit.load_state_dict(ckpt, strict=False)
 			print(f"Loaded checkpoint into wrapper from {args.ckpt}")
 
@@ -182,6 +193,7 @@ def main():
 			state = pck.get("state_dict", pck) if isinstance(pck, dict) else pck
 			try:
 				lit.projection_head.load_state_dict(state, strict=False)
+				proj_loaded_from_projckpt = True
 				print(f"Loaded projection head from {args.proj_ckpt}")
 			except Exception as e:
 				print(f"Could not load proj ckpt: {e}")
@@ -195,6 +207,45 @@ def main():
 	primary_model = ema_model or lit.model
 	primary_model.to(device).eval()
 
+	# Log which model is used for sampling and write metadata to out_dir
+	try:
+		model_used = "EMA" if (ema_model is not None and primary_model is ema_model) else "BASE"
+		if model_used == "EMA":
+			print("[INFO] Sampling with EMA model (lit.ema_model)")
+		else:
+			print("[INFO] Sampling with base model (lit.model)")
+		# Decide where projection weights came from
+		if proj_loaded_from_projckpt:
+			proj_source = "proj_ckpt"
+		elif proj_loaded_from_ckpt:
+			proj_source = "main_ckpt"
+		else:
+			proj_source = "none"
+		# compute projection head parameter L2 norm (helps detect uninitialized random weights)
+		try:
+			ph_norm_sq = torch.tensor(0.0, device=device)
+			for p in lit.projection_head.parameters():
+				val = p.detach().float().norm()
+				ph_norm_sq = ph_norm_sq + (val * val)
+			ph_norm = float(torch.sqrt(ph_norm_sq))
+		except Exception:
+			ph_norm = None
+		meta = {
+			"model_used": model_used,
+			"ckpt": str(args.ckpt),
+			"proj_ckpt": str(args.proj_ckpt) if args.proj_ckpt else "",
+			"proj_loaded_from": proj_source,
+			"proj_param_l2_norm": str(ph_norm) if ph_norm is not None else "",
+			"mode": args.mode,
+			"tiles_zip_dir": args.tiles_zip_dir or "",
+			"seed": str(args.seed),
+		}
+		meta_path = out_dir / "sampling_metadata.txt"
+		meta_lines = [f"{k}: {v}" for k, v in meta.items()]
+		meta_path.write_text("\n".join(meta_lines))
+	except Exception as e:
+		print(f"[WARN] Could not write sampling metadata: {e}")
+
 	# Map genomic .h5 files by canonical patient id
 	genomic_map = find_genomic_map(args.genomic_h5_dir, split="all")
 	if not genomic_map:
@@ -205,6 +256,20 @@ def main():
 	zip_files = []
 	if zdir is not None and zdir.exists():
 		zip_files = sorted(zdir.glob("*.zip"))
+	# If user requested a specific patient, filter available zip files / genomic_map
+	if args.patient:
+		pid_key = canonical_patient_id(args.patient)
+		if zip_files:
+			# find matching zip(s) by canonical name
+			matched = [z for z in zip_files if canonical_patient_id(z.name) == pid_key]
+			if not matched:
+				print(f"[WARN] No tile zip matching patient {pid_key} in {zdir}; continuing but nothing will be processed for that patient")
+			zip_files = matched
+		else:
+			# restrict genomic_map lookup later by patient key (genomic_map is built below)
+			# no action here; genomic_map filtering happens after it's created
+			pass
+
 	# If user supplied a single tile file instead of zips, we'll handle that later
 
 	# Sampling
@@ -234,18 +299,9 @@ def main():
 				tile_names = list_tiles_in_zip(zpath)
 				sel = tile_names[:args.n_samples] if tile_names else []
 				gen_zip_path = out_dir / f"{pid}_generated_tiles.zip"
-				in_zip_path = out_dir / f"{pid}_input_tiles.zip"
-				# Write input tiles (copy originals) and generated tiles into zips
-				with zipfile.ZipFile(gen_zip_path, "w") as gz, zipfile.ZipFile(in_zip_path, "w") as iz:
-					# copy selected input tiles if available
-					with zipfile.ZipFile(zpath, "r") as srcz:
-						for n in sel:
-							data = srcz.read(n)
-							basename = Path(n).name
-							iz.writestr(basename, data)
-					# write generated images; name by original basename if available, else sample index
+				# Write generated tiles only; input tiles already exist in the source zip directory
+				with zipfile.ZipFile(gen_zip_path, "w") as gz:
 					for i in range(gen.shape[0]):
-						out_name = None
 						if i < len(sel):
 							out_name = Path(sel[i]).name
 						else:
@@ -325,15 +381,9 @@ def main():
 				if not isinstance(gen, torch.Tensor):
 					raise RuntimeError("Sampler returned non-tensor for encode-decode mode")
 
-				# Write input tiles and generated tiles to zip files, preserving original basenames
-				in_zip_path = out_dir / f"{pid}_input_tiles.zip"
+				# Write generated tiles only; input tiles remain in the source zip directory
 				gen_zip_path = out_dir / f"{pid}_generated_tiles.zip"
-				with zipfile.ZipFile(in_zip_path, "w") as iz, zipfile.ZipFile(gen_zip_path, "w") as gz, zipfile.ZipFile(zpath, "r") as srcz:
-					for n in sel:
-						data = srcz.read(n)
-						basename = Path(n).name
-						iz.writestr(basename, data)
-					# generated images: map one-to-one to sel entries
+				with zipfile.ZipFile(gen_zip_path, "w") as gz:
 					for i in range(gen.shape[0]):
 						if i < len(sel):
 							out_name = Path(sel[i]).name
@@ -346,6 +396,47 @@ def main():
 						buf = BytesIO()
 						pil.save(buf, format="PNG")
 						gz.writestr(out_name, buf.getvalue())
+
+				# Debug: save original, x_t (noisy), and generated images plus basic MSE
+				if args.debug_save:
+					from pathlib import Path as _P
+					_debug_dir = out_dir / f"debug_{pid}"
+					_debug_dir.mkdir(parents=True, exist_ok=True)
+					metrics_lines = ["pid,basename,mse"]
+					n_save = min(args.debug_n, gen.shape[0], len(sel) if sel else gen.shape[0])
+					for i in range(n_save):
+						# ensure variables exist for static analysis
+						member = None
+						orig_pil = None
+						# original image from zip
+						if i < len(sel):
+							member = sel[i]
+							with zipfile.ZipFile(zpath, "r") as srcz:
+								orig_bytes = srcz.read(member)
+								orig_pil = Image.open(BytesIO(orig_bytes)).convert("RGB")
+								orig_pil.save(_debug_dir / f"orig_{Path(member).name}")
+						# save x_t (noisy) - convert from tensor x_t range to image
+						x_img = x_t[i].detach().cpu()
+						x_img = ((x_img + 1) / 2).clamp(0, 1)
+						x_arr = (x_img * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						Image.fromarray(x_arr).save(_debug_dir / f"x_t_{i}.png")
+						# build and save generated image from tensor (avoid relying on outer 'pil' var)
+						gen_img = gen[i].detach().cpu()
+						gen_img = ((gen_img + 1) / 2).clamp(0, 1)
+						gen_arr = (gen_img * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						gen_pil = Image.fromarray(gen_arr)
+						gen_pil.save(_debug_dir / f"gen_{i}.png")
+						# compute simple MSE if original available
+						if orig_pil is not None:
+							orig_arr = np.asarray(orig_pil.resize(gen_pil.size)).astype(np.float32)
+							gen_arr_f = np.asarray(gen_pil).astype(np.float32)
+							mse = float(np.mean((orig_arr - gen_arr_f) ** 2))
+							member_name = Path(member).name if member is not None else ""
+							metrics_lines.append(f"{pid},{member_name},{mse:.4f}")
+					# end per-sample
+					# write metrics file
+					with open(_debug_dir / "metrics.csv", "w") as mf:
+						mf.write("\n".join(metrics_lines))
 		else:
 			# Fall back to single tile-file behavior
 			if args.tile_file is None:
@@ -389,14 +480,9 @@ def main():
 					raise RuntimeError("Sampler returned non-tensor for encode-decode mode")
 
 				pid = canonical_patient_id(h5p.name)
-				in_zip_path = out_dir / f"{pid}_input_tiles.zip"
 				gen_zip_path = out_dir / f"{pid}_generated_tiles.zip"
-				# write the single input tile and all generated variants
-				with zipfile.ZipFile(in_zip_path, "w") as iz, zipfile.ZipFile(gen_zip_path, "w") as gz:
-					# original tile
-					with open(tile_path, "rb") as f:
-						iz.writestr(Path(tile_path).name, f.read())
-					# generated tiles
+				# write generated variants only; the original tile exists at the provided path or in the tiles zip dir
+				with zipfile.ZipFile(gen_zip_path, "w") as gz:
 					for i in range(gen.shape[0]):
 						out_name = f"{Path(tile_path).stem}_gen_{i}.png"
 						img = gen[i].detach().cpu()
