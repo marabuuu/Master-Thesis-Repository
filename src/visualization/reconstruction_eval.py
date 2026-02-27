@@ -3,20 +3,39 @@
 """
 Reconstruction evaluation visualizations
 
-Moved from `quality_assurance.visualization` into the top-level `visualization`
-package and renamed to `reconstruction_eval.py`.
+This module also provides a simple command-line interface for generating
+plots from paired zip archives containing original and reconstructed image
+tiles. Example usage:
 
-Uses scientific colormaps from `crameri` when available and falls back to
-Matplotlib defaults otherwise.
+    python -m visualization.reconstruction_eval \
+        --real-zip-dir /path/to/real/zips \
+        --recon-zip-dir /path/to/recon/zips \
+        --out-dir /path/to/output/plots \
+        --plot metrics_summary          # or comparison_grid, per_patient
+
+Additional options include ``--max-pairs`` to limit the number of tile
+pairs in the comparison grid and ``--show`` to display plots interactively.
+
 """
 
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
-
+import matplotlib.pyplot as plt
 import numpy as np
+from PIL import Image
+import argparse
+import zipfile
+from io import BytesIO
+import os
+
+# metrics returned by ``quality_assurance.metrics.compute_all_metrics`` may
+# contain scalar floats as well as per‑channel ``np.ndarray`` values. the
+# various lists/dicts that store those results therefore need to be typed
+# accordingly. ``Dict`` is invariant so we can't pretend all values are
+# ``float``; instead create a dedicated alias that includes ``ndarray``.
+MetricDict = Dict[str, Union[float, np.ndarray]]
 
 try:
-    import matplotlib.pyplot as plt
     import matplotlib.gridspec as gridspec
     from matplotlib.figure import Figure
     HAS_MATPLOTLIB = True
@@ -76,7 +95,7 @@ def save_figure(fig: "Figure", save_path: Union[str, Path], close: bool = True) 
         plt.close(fig)
 
 
-def plot_metrics_summary(tile_results: List[Dict], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (14, 10)) -> Optional["Figure"]:
+def plot_metrics_summary(tile_results: List[MetricDict], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (14, 10)) -> Optional["Figure"]:
     _check_matplotlib()
     setup_style()
     if not tile_results:
@@ -262,7 +281,7 @@ def plot_comparison_grid(tile_pairs: List[Any], save_path: Optional[Union[str, P
     return fig
 
 
-def plot_metric_correlation(tile_results: List[Dict], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (12, 4)) -> Optional["Figure"]:
+def plot_metric_correlation(tile_results: List[MetricDict], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (12, 4)) -> Optional["Figure"]:
     _check_matplotlib()
     setup_style()
     if not tile_results:
@@ -318,3 +337,136 @@ def plot_single_comparison(original: "Image.Image", reconstructed: "Image.Image"
         plt.show()
         return None
     return fig
+
+
+def _canonical_patient_id(name: str) -> str:
+    name = Path(name).stem.upper()
+    for sep in ("_", "."):
+        name = name.replace(sep, "-")
+    while "--" in name:
+        name = name.replace("--", "-")
+    parts = name.split("-")
+    if len(parts) >= 3 and parts[0].startswith("TCGA"):
+        return "-".join(parts[:3])
+    return name
+
+
+def _load_image_from_zip(zpath: Path, member: str) -> Image.Image:
+    with zipfile.ZipFile(zpath, "r") as zf:
+        with zf.open(member) as fh:
+            return Image.open(BytesIO(fh.read())).convert("RGB")
+
+
+class PatientResult:
+    def __init__(self, pid: str, metrics_list: List[MetricDict]):
+        self.pid = pid
+        self.metrics_list = metrics_list
+
+    def get_summary(self) -> Dict[str, float]:
+        if not self.metrics_list:
+            return {}
+        import numpy as _np
+        mse = _np.array([m['mse'] for m in self.metrics_list])
+        psnr = _np.array([m['psnr'] for m in self.metrics_list])
+        ssim = _np.array([m['ssim'] for m in self.metrics_list])
+        return {
+            'mse_mean': float(mse.mean()), 'mse_std': float(mse.std()),
+            'psnr_mean': float(_np.nanmean(psnr)), 'psnr_std': float(_np.nanstd(psnr)),
+            'ssim_mean': float(_np.nanmean(ssim)), 'ssim_std': float(_np.nanstd(ssim)),
+        }
+
+
+def cli_main():
+    parser = argparse.ArgumentParser(description="Create reconstruction plots from zip archives")
+    parser.add_argument("--real-zip-dir", required=True, help="Directory with per-patient input tile zips")
+    parser.add_argument("--recon-zip-dir", required=True, help="Directory with per-patient reconstructed tile zips")
+    parser.add_argument("--out-dir", required=True, help="Directory to save generated plots")
+    parser.add_argument("--plot", choices=["metrics_summary", "comparison_grid", "per_patient", "all"], default="metrics_summary", help="Which plot to generate (use 'all' to save every available plot)")
+    parser.add_argument("--max-pairs", type=int, default=64, help="Max tile pairs to use for comparison grid")
+    parser.add_argument("--show", action="store_true", help="Show plots interactively")
+    args = parser.parse_args()
+
+    real_dir = Path(args.real_zip_dir)
+    recon_dir = Path(args.recon_zip_dir)
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    real_zips = { _canonical_patient_id(p.name): p for p in real_dir.glob("*.zip") }
+    recon_zips = { _canonical_patient_id(p.name): p for p in recon_dir.glob("*.zip") }
+    common = sorted(set(real_zips) & set(recon_zips))
+    if not common:
+        raise RuntimeError(f"No matching zip files between {real_dir} and {recon_dir}")
+
+    # Collect tile pairs and metrics
+    from quality_assurance.metrics import compute_all_metrics
+    tile_pairs = []
+    tile_results: List[MetricDict] = []
+    patient_metrics: Dict[str, List[MetricDict]] = {}
+
+    for pid in common:
+        rzip = real_zips[pid]
+        gzip = recon_zips[pid]
+        with zipfile.ZipFile(rzip, "r") as rz, zipfile.ZipFile(gzip, "r") as gz:
+            real_names = [n for n in rz.namelist() if n.lower().endswith((".png", ".jpg", ".jpeg"))]
+            recon_names = [n for n in gz.namelist() if n.lower().endswith((".png", ".jpg", ".jpeg"))]
+            # match by basename intersection
+            real_basenames = [Path(n).name for n in real_names]
+            recon_basenames = [Path(n).name for n in recon_names]
+            basenames = set(real_basenames) & set(recon_basenames)
+            if basenames:
+                for b in sorted(basenames)[: args.max_pairs]:
+                    orig = Image.open(BytesIO(rz.read([n for n in real_names if Path(n).name == b][0]))).convert("RGB")
+                    recon = Image.open(BytesIO(gz.read([n for n in recon_names if Path(n).name == b][0]))).convert("RGB")
+                    tile_pairs.append(type("TP", (), {"original": orig, "reconstructed": recon}))
+                    metrics = compute_all_metrics(orig, recon)
+                    tile_results.append(metrics)
+                    patient_metrics.setdefault(pid, []).append(metrics)
+            else:
+                # Fallback: if no matching basenames, try ordered pairing (first N files)
+                if not real_names or not recon_names:
+                    continue
+                print(f"[WARN] No basename intersection for patient {pid}; pairing by file order (may be incorrect)")
+                pairs = min(len(real_names), len(recon_names), args.max_pairs)
+                for i in range(pairs):
+                    orig = Image.open(BytesIO(rz.read(real_names[i]))).convert("RGB")
+                    recon = Image.open(BytesIO(gz.read(recon_names[i]))).convert("RGB")
+                    tile_pairs.append(type("TP", (), {"original": orig, "reconstructed": recon}))
+                    metrics = compute_all_metrics(orig, recon)
+                    tile_results.append(metrics)
+                    patient_metrics.setdefault(pid, []).append(metrics)
+
+    # Generate requested plot(s)
+    saved_any = False
+    if args.plot == "metrics_summary" or args.plot == "all":
+        fig = plot_metrics_summary(tile_results, save_path=out_dir / "metrics_summary.png", show=args.show)
+        if fig is None and not args.show:
+            print("[WARN] metrics_summary not created")
+        saved_any = saved_any or (fig is not None)
+
+    if args.plot == "comparison_grid" or args.plot == "all":
+        fig = plot_comparison_grid(tile_pairs, save_path=out_dir / "comparison_grid.png", show=args.show)
+        if fig is None and not args.show:
+            print("[WARN] comparison_grid not created")
+        saved_any = saved_any or (fig is not None)
+
+    if args.plot == "per_patient" or args.plot == "all":
+        patient_results = {pid: PatientResult(pid, metrics) for pid, metrics in patient_metrics.items()}
+        fig = plot_per_patient_metrics(patient_results, save_path=out_dir / "per_patient.png", show=args.show)
+        if fig is None and not args.show:
+            print("[WARN] per_patient not created")
+        saved_any = saved_any or (fig is not None)
+
+    # Also produce metric correlation when asking for all plots
+    if args.plot == "all":
+        fig = plot_metric_correlation(tile_results, save_path=out_dir / "metric_correlation.png", show=args.show)
+        if fig is None and not args.show:
+            print("[WARN] metric_correlation not created")
+        saved_any = saved_any or (fig is not None)
+
+    if saved_any and not args.show:
+        print(f"Saved plot(s) to {out_dir}")
+
+
+if __name__ == "__main__":
+    # Allow running this module directly to create plots from zip dirs
+    cli_main()
