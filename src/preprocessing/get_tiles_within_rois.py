@@ -1,3 +1,22 @@
+"""Filter pre-extracted tiles or WSIs using region-of-interest (ROI) annotations.
+
+This script was adapted from the mopadi repository to work with tiles stored in
+zip archives. It accepts either a directory of zip files and copies/extracts tiles 
+that overlap annotated regions by a configurable threshold.
+
+Example usage from the command line::
+
+    python -m src.preprocessing.get_tiles_within_rois \
+        --zip-dir /path/to/tiles/zips \
+        --roi-dir /path/to/annotations \
+        --save-dir /path/to/output \
+        --target-mpp 0.5 \
+        --native-slide-mpp 0.25 \
+        --plots --area-threshold 0.6 --selection-mode overlap
+
+The script supports parallel processing via `--num-workers` and outputs a
+zip archive and optional plot for each processed slide.
+"""
 # taken and adapted from mopadi repository to work with pre-extracted tiles in zip files
 # https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/get_tiles_within_rois.py
 import os
@@ -24,6 +43,8 @@ import zipfile
 import tarfile
 import argparse
 import json
+import yaml  # pyyaml is required for configuration file support
+
 
 load_dotenv()
 ws_path = os.getenv("WORKSPACE_PATH")
@@ -580,8 +601,8 @@ def main():
     parser.add_argument('--zip-dir', type=str, default=None, help='Directory containing zip files of tiles')
     parser.add_argument('--slide-dir', type=str, default=None, help='Directory containing WSI files (original behavior)')
     parser.add_argument('--img-dir', type=str, default=None, help='Directory containing tile folders (original behavior)')
-    parser.add_argument('--roi-dir', type=str, required=True, help='Directory containing annotation CSVs')
-    parser.add_argument('--save-dir', type=str, required=True, help='Directory to write filtered tiles / archives')
+    parser.add_argument('--roi-dir', type=str, help='Directory containing annotation CSVs')
+    parser.add_argument('--save-dir', type=str, help='Directory to write filtered tiles / archives')
     parser.add_argument('--target-mpp', type=float, default=(256/512), help='Target MPP to scale annotations to')
     parser.add_argument('--native-slide-mpp', type=float, default=0.25, help='Native slide MPP (microns/pixel). TCGA 40x slides are typically 0.25. Annotations are in native slide pixels.')
     parser.add_argument('--num-workers', type=int, default=8)
@@ -589,8 +610,28 @@ def main():
     parser.add_argument('--area-threshold', type=float, default=0.6)
     parser.add_argument('--selection-mode', type=str, choices=['center', 'overlap', 'both'], default='center', help='Tile selection mode: center, overlap, or both')
     parser.add_argument('--annotation-buffer', type=float, default=0.0, help='Buffer (in target-pixels) to expand annotations for center test')
+    parser.add_argument('--config', type=str, default=None, help='Path to YAML configuration file')
+
+    # allow loading defaults from config prior to final argument parsing
+    temp_args, _ = parser.parse_known_args()
+    if temp_args.config:
+        try:
+            with open(temp_args.config) as f:
+                cfg = yaml.safe_load(f) or {}
+            # support hierarchical config files where arguments live under a
+            # "preprocessing" section (makes it easier to combine with other
+            # workflows). if so, pull that sub-dictionary.
+            if isinstance(cfg, dict) and 'preprocessing' in cfg:
+                cfg = cfg['preprocessing'] or {}
+            parser.set_defaults(**cfg)
+        except Exception as e:
+            print(f"Failed to load config file {temp_args.config}: {e}")
 
     args = parser.parse_args()
+
+    # ensure essential parameters are supplied either via CLI or config
+    if not args.roi_dir or not args.save_dir:
+        parser.error('Both --roi-dir and --save-dir must be provided (via command line or config file)')
 
     target_mpp = args.target_mpp
     num_workers = args.num_workers
