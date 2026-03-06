@@ -16,6 +16,9 @@ latent_space
     cosine-distance heatmaps, K-means confusion matrices.
 distributions
     Count plots, stacked bars, mosaic plots for categorical data.
+training_plots
+    Loss curves, batch-loss trajectories, LR schedules, early-stopping
+    plots, and multi-panel training summaries for diffusion fine-tuning.
 
 Quick start
 -----------
@@ -69,6 +72,15 @@ from .latent_space import (
     plot_umap,
     plot_umap_interactive,
 )
+from .training_plots import (
+    plot_batch_loss_trajectory,
+    plot_early_stopping,
+    plot_loss_curves,
+    plot_lr_schedule,
+    plot_run_comparison,
+    plot_train_val_comparison,
+    plot_training_summary,
+)
 
 __all__ = [
     # core
@@ -101,4 +113,12 @@ __all__ = [
     "plot_countplot",
     "plot_stacked_bar",
     "plot_mosaic",
+    # training plots
+    "plot_loss_curves",
+    "plot_batch_loss_trajectory",
+    "plot_train_val_comparison",
+    "plot_lr_schedule",
+    "plot_early_stopping",
+    "plot_training_summary",
+    "plot_run_comparison",
 ]

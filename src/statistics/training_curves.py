@@ -1,380 +1,745 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
 """
-Training Curves Visualization
+Training Curves — Data Extraction
+==================================
 
-Plot training loss curves from:
-1. Checkpoint files (.pt) - extracts 'epoch' and 'loss' fields
-2. Log files (.log) - parses training output
-3. Manual data input
+Parse training metrics from diffusion fine-tuning runs.  Three data
+sources are supported:
 
-Usage:
-    # From checkpoints directory
-    python training_curves.py --checkpoint-dir ./experiments/training_run/
-    
-    # From log file
-    python training_curves.py --log-file ./slurm/logs/12345.out
-    
-    # Compare multiple runs
-    python training_curves.py --checkpoint-dir ./run1 ./run2 --labels "Run 1" "Run 2"
+1. **TensorBoard event files**  (``events.out.tfevents.*``)
+   — most reliable; contains scalar metrics logged via ``self.log()``.
+
+2. **Slurm / stdout log** (``*.out``)
+   — tqdm progress bars with ``loss_step``, ``loss_epoch``, ``val_loss``.
+
+3. **Slurm / stderr log** (``*.err``)
+   — early-stopping messages, model summary, val-loss improvement lines.
+
+All parsers return a unified ``TrainingRun`` dict (or populate one in
+place) so that :mod:`src.visualization.training_plots` can visualise
+the data without caring about the source.
+
+Usage
+-----
+.. code-block:: python
+
+    from src.statistics.training_curves import (
+        parse_tensorboard_events,
+        parse_lightning_log,
+        parse_experiment_dir,
+    )
+    from src.visualization.training_plots import plot_training_summary
+
+    run = parse_experiment_dir("/path/to/experiment/logdir")
+    plot_training_summary(run, save_path="summary.png", show=False)
+
+CLI
+---
+.. code-block:: bash
+
+    python -m src.statistics.training_curves \\
+        --logdir /path/to/experiment/logdir \\
+        --output training_summary.png
 """
 
+from __future__ import annotations
+
 import argparse
+import os
 import re
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Any, TYPE_CHECKING
-import matplotlib.pyplot as plt
-from matplotlib.figure import Figure
+from typing import Any, Dict, List, Optional, Tuple
+
 import numpy as np
 
-if TYPE_CHECKING:
-    import torch
 
-# Import torch at runtime inside functions that need it. This keeps the script
-# usable for log-only plotting when PyTorch isn't installed while still
-# informing static type checkers about `torch`.
+# ===================================================================
+#  TrainingRun type alias (documented in visualization.training_plots)
+# ===================================================================
+TrainingRun = Dict[str, Any]
 
 
-def parse_checkpoints(checkpoint_dir: Path) -> Dict[str, List[Tuple[int, float]]]:
+def _empty_run() -> TrainingRun:
+    """Return an empty ``TrainingRun`` template."""
+    return {
+        "epochs": [],
+        "loss_epoch": [],
+        "val_loss": [],
+        "loss_step": [],
+        "step_numbers": [],
+        "epoch_step_boundaries": [],
+        "lr": [],
+        "lr_steps": [],
+        "improved_epochs": [],
+        "best_val_epoch": None,
+        "best_val_loss": None,
+        "meta": {},
+    }
+
+
+# ===================================================================
+#  1.  TensorBoard event-file parsing
+# ===================================================================
+
+
+def parse_tensorboard_events(
+    logdir: str | Path,
+    tags: Optional[List[str]] = None,
+) -> TrainingRun:
+    """Parse TensorBoard ``events.out.tfevents.*`` files.
+
+    Parameters
+    ----------
+    logdir : str | Path
+        Directory containing the event file(s).
+    tags : list[str], optional
+        Scalar tags to extract.  ``None`` = auto-detect common ones.
+
+    Returns
+    -------
+    TrainingRun
+        Populated dict with whatever tags were found.
     """
-    Extract training history from checkpoint files.
-    
-    Returns dict with keys like 'loss', 'mean', 'var', 'diversity'
-    mapping to list of (epoch, value) tuples.
-    """
-    checkpoint_dir = Path(checkpoint_dir)
-
-    # Import torch at runtime to allow the module to be imported without
-    # PyTorch when only plotting logs. Static type checkers still see `torch`
-    # from the `TYPE_CHECKING` import above.
     try:
-        import torch  # type: ignore
-    except Exception:
-        raise ImportError("PyTorch is required to parse checkpoint files")
-    
-    # Find all checkpoint files
-    ckpt_files = sorted(checkpoint_dir.glob("*.pt"))
-    if not ckpt_files:
-        raise FileNotFoundError(f"No .pt files found in {checkpoint_dir}")
-    
-    history = {}
-    
-    for ckpt_path in ckpt_files:
-        try:
-            ckpt = torch.load(ckpt_path, map_location="cpu")
-            epoch = ckpt.get("epoch", None)
-            
-            if epoch is None:
-                # Try to extract from filename like "epoch010.pt"
-                match = re.search(r'epoch(\d+)', ckpt_path.stem)
-                if match:
-                    epoch = int(match.group(1))
-                else:
-                    continue
-            
-            # Extract loss values
-            if "loss" in ckpt:
-                if "loss" not in history:
-                    history["loss"] = []
-                history["loss"].append((epoch, float(ckpt["loss"])))
-            
-            # For projection head checkpoints with component losses
-            for key in ["loss_mean", "loss_var", "loss_diversity"]:
-                if key in ckpt:
-                    if key not in history:
-                        history[key] = []
-                    history[key].append((epoch, float(ckpt[key])))
-                    
-        except Exception as e:
-            print(f"Warning: Could not parse {ckpt_path}: {e}")
+        from tensorboard.backend.event_processing.event_accumulator import (
+            EventAccumulator,
+        )
+    except ImportError:
+        print(
+            "[WARN] tensorboard package not installed — "
+            "skipping event-file parsing.  "
+            "Install with: pip install tensorboard"
+        )
+        return _empty_run()
+
+    logdir = Path(logdir)
+    event_files = sorted(logdir.glob("events.out.tfevents.*"))
+    if not event_files:
+        # Also search one level down (common layout: logdir/version_0/)
+        event_files = sorted(logdir.rglob("events.out.tfevents.*"))
+    if not event_files:
+        print(f"[WARN] No TensorBoard event files in {logdir}")
+        return _empty_run()
+
+    # Use the directory containing the event file for the accumulator
+    event_dir = str(event_files[0].parent)
+    ea = EventAccumulator(event_dir)
+    ea.Reload()
+
+    available_tags = ea.Tags().get("scalars", [])
+    if not available_tags:
+        print("[WARN] No scalar tags in event file")
+        return _empty_run()
+
+    if tags is None:
+        # Common tags produced by the diffusion finetuning script
+        tags = [
+            "loss", "loss_step", "loss_epoch", "train/loss",
+            "val_loss", "val_loss_epoch",
+            "lr-AdamW", "lr-AdamW/pg1", "lr-AdamW/pg2",
+        ]
+
+    run = _empty_run()
+
+    for tag in tags:
+        if tag not in available_tags:
             continue
-    
-    # Sort by epoch
-    for key in history:
-        history[key] = sorted(history[key], key=lambda x: x[0])
-    
-    return history
+        events = ea.Scalars(tag)
+        steps = [e.step for e in events]
+        values = [e.value for e in events]
+
+        # Map tag → TrainingRun key
+        tag_lower = tag.lower().replace("/", "_").replace("-", "_")
+
+        if tag_lower in ("loss_epoch", "train_loss"):
+            run["loss_epoch"] = values
+            # Derive epoch indices (Lightning logs once per epoch for
+            # on_epoch=True metrics)
+            if not run["epochs"]:
+                run["epochs"] = list(range(len(values)))
+        elif tag_lower == "val_loss" or tag_lower == "val_loss_epoch":
+            run["val_loss"] = values
+            if not run["epochs"]:
+                run["epochs"] = list(range(len(values)))
+        elif tag_lower == "loss" or tag_lower == "loss_step":
+            run["loss_step"] = values
+            run["step_numbers"] = steps
+        elif "lr" in tag_lower:
+            run["lr"] = values
+            run["lr_steps"] = steps
+
+    # Ensure epochs list length matches
+    max_len = max(len(run["loss_epoch"]), len(run["val_loss"]))
+    if max_len and not run["epochs"]:
+        run["epochs"] = list(range(max_len))
+    elif len(run["epochs"]) < max_len:
+        run["epochs"] = list(range(max_len))
+
+    run["meta"]["source"] = "tensorboard"
+    run["meta"]["event_file"] = str(event_files[0])
+    run["meta"]["available_tags"] = available_tags
+    return run
 
 
-def parse_log_file(log_path: Path) -> Dict[str, List[Tuple[int, float]]]:
-    """
-    Parse training log file for loss values.
-    
-    Supports formats like:
-    - "Epoch 5/50 | Time: 12.3s | Loss: 0.028057"
-    - "Losses: total=0.026, mean=0.012, var=0.008, diversity=0.006"
+# ===================================================================
+#  2.  Lightning tqdm stdout log parsing
+# ===================================================================
+
+
+def parse_lightning_log(
+    log_path: str | Path,
+) -> TrainingRun:
+    """Parse a PyTorch Lightning stdout log (tqdm progress bars).
+
+    Extracts ``loss_step``, ``loss_epoch``, and ``val_loss`` from lines
+    such as::
+
+        Epoch 0: 100%|██| 4210/4210 [..., loss_step=0.047, val_loss=0.033, loss_epoch=0.037]
+
+    The parser picks the **last** occurrence of each metric per epoch
+    (the authoritative 100% tqdm update).
+
+    Parameters
+    ----------
+    log_path : str | Path
+        Path to the ``.out`` log file.
+
+    Returns
+    -------
+    TrainingRun
     """
     log_path = Path(log_path)
-    
     if not log_path.exists():
         raise FileNotFoundError(f"Log file not found: {log_path}")
-    
-    history = {"loss": [], "mean": [], "var": [], "diversity": []}
-    
-    with open(log_path, "r") as f:
-        content = f.read()
-    
-    # Pattern for diffusion fine-tuning logs
-    # "Epoch 5/50 | Time: 12.3s | Loss: 0.028057"
-    epoch_pattern = re.compile(
-        r"Epoch\s+(\d+)/\d+.*?Loss:\s*([\d.]+)",
-        re.IGNORECASE
+
+    text = log_path.read_text(errors="replace")
+    run = _empty_run()
+
+    # --- epoch-level metrics (last report per epoch) ---
+    # We collect all values per epoch and keep the last one.
+    epoch_loss: Dict[int, float] = {}
+    epoch_val: Dict[int, float] = {}
+
+    # Patterns for the tqdm suffix
+    epoch_re = re.compile(r"Epoch\s+(\d+)")
+    loss_epoch_re = re.compile(r"loss_epoch\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
+    val_loss_re = re.compile(r"val_loss\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
+
+    current_epoch: Optional[int] = None
+    for line in text.splitlines():
+        m_ep = epoch_re.search(line)
+        if m_ep:
+            current_epoch = int(m_ep.group(1))
+
+        if current_epoch is None:
+            continue
+
+        m_le = loss_epoch_re.search(line)
+        if m_le:
+            epoch_loss[current_epoch] = float(m_le.group(1))
+
+        m_vl = val_loss_re.search(line)
+        if m_vl:
+            epoch_val[current_epoch] = float(m_vl.group(1))
+
+    # Build sorted epoch-level lists
+    all_epochs = sorted(set(epoch_loss.keys()) | set(epoch_val.keys()))
+    run["epochs"] = all_epochs
+    run["loss_epoch"] = [epoch_loss.get(e, float("nan")) for e in all_epochs]
+    run["val_loss"] = [epoch_val.get(e, float("nan")) for e in all_epochs]
+
+    # Remove trailing NaNs
+    for key in ("loss_epoch", "val_loss"):
+        while run[key] and (run[key][-1] != run[key][-1]):  # NaN check
+            run[key].pop()
+
+    # --- per-step loss ---
+    step_loss_re = re.compile(r"loss_step\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
+    step_losses: List[float] = []
+    step_epoch_boundaries: List[int] = []
+    prev_epoch: Optional[int] = None
+
+    for line in text.splitlines():
+        m_ep = epoch_re.search(line)
+        if m_ep:
+            ep = int(m_ep.group(1))
+            if ep != prev_epoch:
+                step_epoch_boundaries.append(len(step_losses))
+                prev_epoch = ep
+
+        m_sl = step_loss_re.search(line)
+        if m_sl:
+            step_losses.append(float(m_sl.group(1)))
+
+    # Deduplicate consecutive identical values (tqdm re-renders)
+    deduped: List[float] = []
+    for v in step_losses:
+        if not deduped or v != deduped[-1]:
+            deduped.append(v)
+    run["loss_step"] = deduped
+    run["step_numbers"] = list(range(len(deduped)))
+    run["epoch_step_boundaries"] = step_epoch_boundaries
+
+    # --- metadata from header ---
+    lr_match = re.search(r"UNet LR\s*:\s*([\d.eE+-]+)", text)
+    proj_lr_match = re.search(r"Proj LR\s*:\s*([\d.eE+-]+)", text)
+    patients_match = re.search(r"(\d+)\s+in common", text)
+    train_split_match = re.search(
+        r"Patient split:\s*(\d+)\s*train,\s*(\d+)\s*val", text
     )
-    
-    for match in epoch_pattern.finditer(content):
-        epoch = int(match.group(1))
-        loss = float(match.group(2))
-        history["loss"].append((epoch, loss))
-    
-    # Pattern for projection head logs
-    # "Losses: total=0.026, mean=0.012, var=0.008, diversity=0.006"
-    component_pattern = re.compile(
-        r"Epoch\s+(\d+)/\d+.*?"
-        r"total=([\d.]+).*?mean=([\d.]+).*?var=([\d.]+).*?diversity=([\d.]+)",
-        re.IGNORECASE | re.DOTALL
+
+    run["meta"]["source"] = "lightning_log"
+    run["meta"]["log_path"] = str(log_path)
+    if lr_match:
+        run["meta"]["unet_lr"] = float(lr_match.group(1))
+    if proj_lr_match:
+        run["meta"]["proj_lr"] = float(proj_lr_match.group(1))
+    if patients_match:
+        run["meta"]["common_patients"] = int(patients_match.group(1))
+    if train_split_match:
+        run["meta"]["n_train"] = int(train_split_match.group(1))
+        run["meta"]["n_val"] = int(train_split_match.group(2))
+
+    return run
+
+
+# ===================================================================
+#  3.  Stderr log parsing (early stopping, model summary)
+# ===================================================================
+
+
+def parse_stderr_log(
+    err_path: str | Path,
+    run: Optional[TrainingRun] = None,
+) -> TrainingRun:
+    """Parse the ``.err`` log for early-stopping and model-summary info.
+
+    Parameters
+    ----------
+    err_path : str | Path
+        Path to the ``.err`` log file.
+    run : TrainingRun, optional
+        Existing run dict to augment *in-place*.  If ``None``, a fresh
+        one is created.
+
+    Returns
+    -------
+    TrainingRun
+    """
+    err_path = Path(err_path)
+    if not err_path.exists():
+        raise FileNotFoundError(f"Stderr log not found: {err_path}")
+
+    if run is None:
+        run = _empty_run()
+
+    text = err_path.read_text(errors="replace")
+
+    # val_loss improvement lines from ModelCheckpoint
+    # "Metric val_loss improved by 0.003 >= min_delta = 0.0001.
+    #  New best score: 0.030"
+    # or: "Metric val_loss improved. New best score: 0.033"
+    improved_re = re.compile(
+        r"val_loss improved.*?New best score:\s*([0-9]*\.?[0-9]+)"
     )
-    
-    for match in component_pattern.finditer(content):
-        epoch = int(match.group(1))
-        history["loss"].append((epoch, float(match.group(2))))
-        history["mean"].append((epoch, float(match.group(3))))
-        history["var"].append((epoch, float(match.group(4))))
-        history["diversity"].append((epoch, float(match.group(5))))
-    # Fallback parser (line-oriented) to support tqdm/progressbar logging
-    # Example lines:
-    # Epoch 1: 100%|...| 2581/2581 [24:51<00:00, ..., loss_step=0.045, loss_epoch=0.0384]
-    curr_epoch: Optional[int] = None
-    for line in content.splitlines():
-        # Update current epoch when present on the line
-        m_epoch = re.search(r"Epoch\s+(\d+)", line, re.IGNORECASE)
-        if m_epoch:
-            try:
-                curr_epoch = int(m_epoch.group(1))
-            except Exception:
-                curr_epoch = None
+    improved_scores: List[float] = []
+    for m in improved_re.finditer(text):
+        improved_scores.append(float(m.group(1)))
+    run["meta"]["improved_val_scores"] = improved_scores
 
-        # Prefer explicit loss_epoch (final epoch-level loss)
-        if curr_epoch is not None:
-            m_le = re.search(r"loss_epoch\s*=\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
-            if m_le:
-                try:
-                    history["loss"].append((curr_epoch, float(m_le.group(1))))
-                    continue
-                except Exception:
-                    pass
+    # The improvement messages come epoch-sequentially, so map them
+    # to epoch indices (0-based)
+    run["improved_epochs"] = list(range(len(improved_scores)))
 
-            # Fallback to loss_step if loss_epoch not present
-            m_ls = re.search(r"loss_step\s*=\s*([0-9]*\.?[0-9]+)", line, re.IGNORECASE)
-            if m_ls:
-                try:
-                    history["loss"].append((curr_epoch, float(m_ls.group(1))))
-                    continue
-                except Exception:
-                    pass
+    # Best score
+    if improved_scores:
+        run["best_val_loss"] = improved_scores[-1]
+        run["best_val_epoch"] = len(improved_scores) - 1
 
-            # Generic patterns like "Loss: 0.028057" or "loss=0.03"
-            m_generic = re.search(r"(?:Loss|loss)[:=]\s*([0-9]*\.?[0-9]+)", line)
-            if m_generic:
-                try:
-                    history["loss"].append((curr_epoch, float(m_generic.group(1))))
-                except Exception:
-                    pass
-    
-    # Remove empty keys and sort
-    history = {k: sorted(v, key=lambda x: x[0]) for k, v in history.items() if v}
-    
-    return history
-
-
-def plot_training_curves(
-    histories: List[Dict[str, List[Tuple[int, float]]]],
-    labels: Optional[List[str]] = None,
-    title: str = "Training Curves",
-    output_path: Optional[str] = None,
-    show: bool = True,
-    figsize: Tuple[int, int] = (12, 6),
-) -> Figure:
-    """
-    Plot training curves from one or more training runs.
-    
-    Args:
-        histories: List of history dicts from parse_checkpoints or parse_log_file
-        labels: Names for each run (for legend)
-        title: Plot title
-        output_path: Save figure to this path (if provided)
-        show: Display the plot interactively
-        figsize: Figure size (width, height)
-    
-    Returns:
-        matplotlib Figure object
-    """
-    if labels is None:
-        labels = [f"Run {i+1}" for i in range(len(histories))]
-    
-    # Determine which metrics are present
-    all_metrics = set()
-    for h in histories:
-        all_metrics.update(h.keys())
-
-    # Collapse multiple entries for the same epoch: keep the last reported value
-    def _collapse_entries(metric_list: List[Tuple[int, float]]) -> List[Tuple[int, float]]:
-        d: dict[int, float] = {}
-        for epoch, val in metric_list:
-            try:
-                d[int(epoch)] = float(val)
-            except Exception:
-                continue
-        return sorted(d.items())
-
-    for h in histories:
-        for metric in list(h.keys()):
-            h[metric] = _collapse_entries(h[metric])
-    
-    # Create subplot layout
-    n_metrics = len(all_metrics)
-    if n_metrics == 1:
-        fig, axes = plt.subplots(1, 1, figsize=figsize)
-        axes = [axes]
+    # Early-stopping trigger
+    stop_re = re.compile(
+        r"did not improve in the last (\d+) records.*"
+        r"Best score:\s*([0-9.]+)"
+    )
+    m_stop = stop_re.search(text)
+    if m_stop:
+        run["meta"]["early_stopping_patience"] = int(m_stop.group(1))
+        run["meta"]["early_stopping_best_score"] = float(m_stop.group(2))
+        run["meta"]["early_stopped"] = True
     else:
-        ncols = min(2, n_metrics)
-        nrows = (n_metrics + 1) // 2
-        fig, axes = plt.subplots(nrows, ncols, figsize=(figsize[0], figsize[1] * nrows // 2))
-        axes = axes.flatten() if n_metrics > 1 else [axes]
-    
-    # Color palette
-    colors = plt.get_cmap("tab10")(np.linspace(0, 1, len(histories)))
-    
-    # Plot each metric
-    for idx, metric in enumerate(sorted(all_metrics)):
-        ax = axes[idx]
-        
-        for run_idx, (history, label, color) in enumerate(zip(histories, labels, colors)):
-            if metric not in history:
-                continue
-            
-            epochs, values = zip(*history[metric])
-            ax.plot(epochs, values, marker='o', markersize=3, 
-                    color=color, label=label, linewidth=1.5, alpha=0.8)
-            
-            # Mark minimum
-            min_idx = np.argmin(values)
-            ax.scatter([epochs[min_idx]], [values[min_idx]], 
-                       color=color, s=100, marker='*', zorder=5,
-                       edgecolors='black', linewidth=0.5)
-            ax.annotate(f'{values[min_idx]:.4f}', 
-                        (epochs[min_idx], values[min_idx]),
-                        textcoords="offset points", xytext=(5, 5),
-                        fontsize=8, color=color)
-        
-        ax.set_xlabel('Epoch')
-        ax.set_ylabel(metric.replace('_', ' ').title())
-        ax.set_title(f'{metric.replace("_", " ").title()} over Training')
-        ax.grid(True, alpha=0.3)
-        ax.legend(loc='upper right')
-        
-        # Use log scale if values span multiple orders of magnitude
-        all_vals = []
-        for h in histories:
-            if metric in h:
-                all_vals.extend([v for _, v in h[metric]])
-        if all_vals and max(all_vals) / (min(all_vals) + 1e-10) > 100:
-            ax.set_yscale('log')
-    
-    # Hide unused subplots
-    for idx in range(len(all_metrics), len(axes)):
-        axes[idx].set_visible(False)
-    
-    fig.suptitle(title, fontsize=14, fontweight='bold')
-    fig.tight_layout()
-    
-    if output_path:
-        fig.savefig(output_path, dpi=150, bbox_inches='tight')
-        print(f"Saved figure to {output_path}")
-    else:
-        # Also auto-save a default file so users know where plots are stored
-        default_out = "training_curves.png"
-        fig.savefig(default_out, dpi=150, bbox_inches='tight')
-        print(f"Saved figure to {default_out} (default)")
-    
-    if show:
-        plt.show()
-    
-    return fig
+        run["meta"]["early_stopped"] = False
+
+    # Model parameters
+    params_re = re.compile(r"([\d,.]+)\s+Total params")
+    m_params = params_re.search(text)
+    if m_params:
+        run["meta"]["total_params_str"] = m_params.group(1)
+
+    trainable_re = re.compile(r"([\d,.]+)\s+Trainable params")
+    m_trainable = trainable_re.search(text)
+    if m_trainable:
+        run["meta"]["trainable_params_str"] = m_trainable.group(1)
+
+    run["meta"]["err_path"] = str(err_path)
+    return run
 
 
-def main():
+# ===================================================================
+#  4.  Convenience: parse an entire experiment directory
+# ===================================================================
+
+
+def parse_experiment_dir(
+    logdir: str | Path,
+    prefer_tensorboard: bool = True,
+) -> TrainingRun:
+    """Parse all available data sources in an experiment output directory.
+
+    The function looks for TensorBoard event files, ``.out`` logs, and
+    ``.err`` logs automatically.  Results are merged into a single
+    :pydata:`TrainingRun` dict.
+
+    Parameters
+    ----------
+    logdir : str | Path
+        Top-level experiment directory (the one containing ``last.ckpt``,
+        ``events.out.tfevents.*``, etc.).
+    prefer_tensorboard : bool
+        If both a TensorBoard event file **and** a parseable ``.out`` log
+        are found, prefer TensorBoard for epoch-level metrics (they are
+        more precise).
+
+    Returns
+    -------
+    TrainingRun
+    """
+    logdir = Path(logdir)
+
+    run = _empty_run()
+    run["meta"]["logdir"] = str(logdir)
+
+    # --- TensorBoard ---
+    tb_run = parse_tensorboard_events(logdir)
+
+    # --- stdout (.out) log ---
+    out_files = sorted(logdir.glob("*.out"))
+    log_run = _empty_run()
+    if out_files:
+        try:
+            log_run = parse_lightning_log(out_files[0])
+        except Exception as e:
+            print(f"[WARN] Could not parse {out_files[0]}: {e}")
+
+    # --- stderr (.err) log ---
+    err_files = sorted(logdir.glob("*.err"))
+    if err_files:
+        try:
+            parse_stderr_log(err_files[0], run=run)
+        except Exception as e:
+            print(f"[WARN] Could not parse {err_files[0]}: {e}")
+
+    # --- Merge strategy ---
+    # TensorBoard epoch-level metrics are more reliable (precise floats).
+    # The stdout log gives us per-step losses and metadata.
+    # The stderr log gives us early-stopping info.
+
+    if prefer_tensorboard and tb_run.get("loss_epoch"):
+        run["loss_epoch"] = tb_run["loss_epoch"]
+        run["epochs"] = tb_run["epochs"]
+    elif log_run.get("loss_epoch"):
+        run["loss_epoch"] = log_run["loss_epoch"]
+        run["epochs"] = log_run["epochs"]
+
+    if prefer_tensorboard and tb_run.get("val_loss"):
+        run["val_loss"] = tb_run["val_loss"]
+        if not run["epochs"]:
+            run["epochs"] = tb_run["epochs"]
+    elif log_run.get("val_loss"):
+        run["val_loss"] = log_run["val_loss"]
+        if not run["epochs"]:
+            run["epochs"] = log_run["epochs"]
+
+    # Per-step loss always comes from the log (TensorBoard may have it
+    # but with sample-count steps that are harder to interpret).
+    if log_run.get("loss_step"):
+        run["loss_step"] = log_run["loss_step"]
+        run["step_numbers"] = log_run["step_numbers"]
+        run["epoch_step_boundaries"] = log_run.get(
+            "epoch_step_boundaries", []
+        )
+    elif tb_run.get("loss_step"):
+        run["loss_step"] = tb_run["loss_step"]
+        run["step_numbers"] = tb_run["step_numbers"]
+
+    # LR from TensorBoard if available
+    if tb_run.get("lr"):
+        run["lr"] = tb_run["lr"]
+        run["lr_steps"] = tb_run["lr_steps"]
+
+    # Merge metadata
+    for src in (tb_run, log_run):
+        for k, v in src.get("meta", {}).items():
+            if k not in run["meta"]:
+                run["meta"][k] = v
+
+    return run
+
+
+# ===================================================================
+#  5.  Summary printing
+# ===================================================================
+
+
+def print_training_summary(run: TrainingRun) -> None:
+    """Print a concise textual summary of a training run."""
+    meta = run.get("meta", {})
+    epochs = run.get("epochs", [])
+    train_loss = run.get("loss_epoch", [])
+    val_loss = run.get("val_loss", [])
+
+    print("\n" + "=" * 60)
+    print("DIFFUSION FINE-TUNING — TRAINING SUMMARY")
+    print("=" * 60)
+
+    if meta.get("logdir"):
+        print(f"  Directory : {meta['logdir']}")
+    if meta.get("source"):
+        print(f"  Source    : {meta['source']}")
+
+    if epochs:
+        print(f"  Epochs    : {len(epochs)}")
+    if train_loss:
+        best_idx = int(np.argmin(train_loss))
+        print(
+            f"  Train loss: final={train_loss[-1]:.6f}  "
+            f"best={train_loss[best_idx]:.6f} (ep {epochs[best_idx]})"
+        )
+    if val_loss:
+        best_idx = int(np.argmin(val_loss))
+        print(
+            f"  Val loss  : final={val_loss[-1]:.6f}  "
+            f"best={val_loss[best_idx]:.6f} (ep {epochs[best_idx]})"
+        )
+
+    if meta.get("unet_lr"):
+        print(f"  UNet LR   : {meta['unet_lr']}")
+    if meta.get("proj_lr"):
+        print(f"  Proj LR   : {meta['proj_lr']}")
+    if meta.get("n_train"):
+        print(
+            f"  Patients  : {meta['n_train']} train, "
+            f"{meta.get('n_val', '?')} val"
+        )
+    if meta.get("early_stopped"):
+        print(
+            f"  Early stop: after "
+            f"{meta.get('early_stopping_patience', '?')} epochs patience  "
+            f"(best={meta.get('early_stopping_best_score', '?')})"
+        )
+
+    # Convergence assessment
+    if val_loss and len(val_loss) >= 4:
+        half = len(val_loss) // 2
+        first_half = np.mean(val_loss[:half])
+        second_half = np.mean(val_loss[half:])
+        rel_drop = (first_half - second_half) / (first_half + 1e-10)
+        std_last = np.std(val_loss[half:])
+        print(f"\n  Convergence:")
+        print(
+            f"    Relative improvement (1st vs 2nd half): {rel_drop:.1%}"
+        )
+        print(
+            f"    Std of 2nd-half val loss:               {std_last:.6f}"
+        )
+
+    n_step = len(run.get("loss_step", []))
+    if n_step:
+        print(f"\n  Batch-level: {n_step} step-loss data points")
+
+    print("=" * 60 + "\n")
+
+
+# ===================================================================
+#  CLI
+# ===================================================================
+
+
+def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Plot training curves from checkpoints or log files",
+        description="Parse & plot training statistics for diffusion "
+                    "fine-tuning runs",
         formatter_class=argparse.RawDescriptionHelpFormatter,
     )
-    
-    parser.add_argument("--checkpoint-dir", type=str, nargs="+",
-                        help="Directory(ies) containing .pt checkpoint files")
-    parser.add_argument("--log-file", type=str, nargs="+",
-                        help="Log file(s) to parse for training metrics")
-    parser.add_argument("--labels", type=str, nargs="+",
-                        help="Labels for each run (for legend)")
-    parser.add_argument("--output", "-o", type=str,
-                        help="Output file path for the plot (e.g., training_curves.png)")
-    parser.add_argument("--title", type=str, default="Training Curves",
-                        help="Title for the plot")
-    parser.add_argument("--no-show", action="store_true",
-                        help="Don't display the plot (only save)")
-    parser.add_argument("--figsize", type=int, nargs=2, default=[12, 6],
-                        help="Figure size (width height)")
-    
+    parser.add_argument(
+        "--config", type=str, default=None,
+        help="YAML config file with training_stats section "
+             "(overrides individual arguments)",
+    )
+    parser.add_argument(
+        "--logdir", type=str, nargs="+", default=None,
+        help="Experiment log directory(ies) containing event files "
+             "and/or .out/.err logs",
+    )
+    parser.add_argument(
+        "--labels", type=str, nargs="+", default=None,
+        help="Labels for each run (for legend)",
+    )
+    parser.add_argument(
+        "--output", "-o", type=str, default=None,
+        help="Output file path for the summary plot",
+    )
+    parser.add_argument(
+        "--no-show", action="store_true",
+        help="Don't display the plot (only save)",
+    )
+    parser.add_argument(
+        "--prefer-log", action="store_true",
+        help="Prefer .out log over TensorBoard for epoch-level metrics",
+    )
     args = parser.parse_args()
-    
-    if not args.checkpoint_dir and not args.log_file:
-        parser.error("Either --checkpoint-dir or --log-file is required")
-    
-    histories = []
-    source_names = []
-    
-    # Parse checkpoints
-    if args.checkpoint_dir:
-        for ckpt_dir in args.checkpoint_dir:
-            try:
-                history = parse_checkpoints(Path(ckpt_dir))
-                if not history:
-                    print(f"Warning: no metrics parsed from checkpoints in {ckpt_dir}")
-                else:
-                    histories.append(history)
-                    source_names.append(Path(ckpt_dir).name)
-                    print(f"Parsed {len(history.get('loss', []))} epochs from {ckpt_dir}")
-            except Exception as e:
-                print(f"Error parsing {ckpt_dir}: {e}")
-    
-    # Parse log files
-    if args.log_file:
-        for log_path in args.log_file:
-            try:
-                history = parse_log_file(Path(log_path))
-                if not history:
-                    print(f"Warning: no metrics parsed from log file {log_path}. Check log format or patterns in parse_log_file().")
-                else:
-                    histories.append(history)
-                    source_names.append(Path(log_path).stem)
-                    print(f"Parsed {len(history.get('loss', []))} epochs from {log_path}")
-            except Exception as e:
-                print(f"Error parsing {log_path}: {e}")
-    
-    if not histories:
+
+    # --- Load config if provided ---
+    stats_cfg = {}
+    if args.config:
+        try:
+            import yaml
+            with open(args.config) as f:
+                config = yaml.safe_load(f)
+            stats_cfg = config.get("training_stats", {})
+            
+            # Use config values if CLI args not explicitly set
+            if not args.logdir and stats_cfg.get("logdir"):
+                args.logdir = [stats_cfg["logdir"]]
+            if not args.output and stats_cfg.get("output_dir"):
+                args.output = str(Path(stats_cfg["output_dir"]) / "training_summary.png")
+        except Exception as e:
+            print(f"[WARN] Could not load config {args.config}: {e}")
+
+    # --- Validate required arguments ---
+    if not args.logdir:
+        parser.error(
+            "Either --logdir or --config with training_stats.logdir is required"
+        )
+
+    runs: List[TrainingRun] = []
+    source_names: List[str] = []
+
+    for logdir in args.logdir:
+        logdir_path = Path(logdir)
+        if not logdir_path.exists():
+            print(f"[ERROR] Directory not found: {logdir}")
+            continue
+        try:
+            run = parse_experiment_dir(
+                logdir_path,
+                prefer_tensorboard=not args.prefer_log,
+            )
+            runs.append(run)
+            source_names.append(logdir_path.name)
+            print_training_summary(run)
+        except Exception as e:
+            print(f"[ERROR] Failed to parse {logdir}: {e}")
+
+    if not runs:
         print("No training data found!")
         return
-    
-    # Use provided labels or auto-generate
+
     labels = args.labels if args.labels else source_names
-    
-    # Plot
-    plot_training_curves(
-        histories=histories,
-        labels=labels,
-        title=args.title,
-        output_path=args.output,
-        show=not args.no_show,
-        figsize=tuple(args.figsize),
+
+    # Import plotting from visualization module
+    from ..visualization.training_plots import (
+        plot_loss_curves,
+        plot_training_summary,
+        plot_batch_loss_trajectory,
+        plot_train_val_comparison,
+        plot_early_stopping,
+        plot_run_comparison,
     )
+
+    # Determine what plots to generate
+    requested_plots = stats_cfg.get("plots", ["summary"]) if stats_cfg else ["summary"]
+    output_dir = Path(stats_cfg.get("output_dir", ".")) if stats_cfg else Path(".")
+    output_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Shorthand for plot type mapping
+    plot_fn_map = {
+        "loss_curves": plot_loss_curves,
+        "batch_trajectory": plot_batch_loss_trajectory,
+        "train_val_comparison": plot_train_val_comparison,
+        "early_stopping": plot_early_stopping,
+        "summary": plot_training_summary,
+        "comparison": plot_run_comparison,
+    }
+    
+    # Common plotting kwargs from config
+    cmap_cat = stats_cfg.get("cmap_categorical", "batlowS")
+    cmap_seq = stats_cfg.get("cmap_sequential", "batlow")
+    figsize = tuple(stats_cfg.get("figsize", (16, 12)))
+    
+    # Generate each requested plot
+    for plot_type in requested_plots:
+        plot_type = plot_type.strip().lower()
+        if plot_type not in plot_fn_map:
+            print(f"[WARN] Unknown plot type '{plot_type}', skipping")
+            continue
+        
+        fn = plot_fn_map[plot_type]
+        fname = output_dir / f"training_{plot_type}.png"
+        
+        try:
+            if plot_type == "summary":
+                plot_training_summary(
+                    runs[0],
+                    figsize=figsize,
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "loss_curves":
+                plot_loss_curves(
+                    runs,
+                    labels=labels,
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "batch_trajectory":
+                plot_batch_loss_trajectory(
+                    runs[0],
+                    cmap_name=cmap_seq,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "train_val_comparison":
+                plot_train_val_comparison(
+                    runs[0],
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "early_stopping":
+                plot_early_stopping(
+                    runs[0],
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "comparison" and len(runs) > 1:
+                plot_run_comparison(
+                    runs,
+                    labels=labels,
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            else:
+                continue
+            
+            print(f"Saved {plot_type} plot to {fname}")
+                
+        except Exception as e:
+            print(f"[ERROR] Failed to generate {plot_type} plot: {e}")
 
 
 if __name__ == "__main__":
