@@ -94,8 +94,7 @@ python -m src.encoding.train \
 **Gene Expression CSV:**
 ```
 Patient_ID,Gene1,Gene2,...,GeneN,Majority_Subtype_mRNA
-TCGA-3C-AAAU,12.5,8.3,...,5.2,Basal
-TCGA-3C-AALJ,10.2,9.1,...,6.8,LumA
+TCGA-12-3456,10.2,9.1,...,6.8,LumA
 ...
 ```
 
