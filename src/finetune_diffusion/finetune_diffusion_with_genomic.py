@@ -40,6 +40,9 @@ from io import BytesIO
 from pathlib import Path
 from typing import Optional
 
+# optional YAML config
+import yaml
+
 import h5py
 import numpy as np
 import torch
@@ -53,7 +56,11 @@ from tqdm import tqdm
 
 import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.callbacks import (
+    EarlyStopping,
+    LearningRateMonitor,
+    ModelCheckpoint,
+)
 
 # MoPaDi imports
 from mopadi.train_diff_autoenc import LitModel, ema, is_time
@@ -123,6 +130,43 @@ def canonical_patient_id(name: str) -> str:
 
 
 # ======================================================================
+#  Patient discovery (lightweight — no data loaded)
+# ======================================================================
+
+def discover_common_patients(
+    genomic_h5_dir: str,
+    tiles_zip_dir: str,
+    split: str = "train",
+) -> list[str]:
+    """Return sorted patient IDs that have both genomic H5 and tile zip."""
+    g_dir = Path(genomic_h5_dir).expanduser()
+    t_dir = Path(tiles_zip_dir).expanduser()
+
+    # Genomic patient IDs
+    train_dir = g_dir / "train"
+    test_dir = g_dir / "test"
+    g_ids: set[str] = set()
+    if train_dir.is_dir() or test_dir.is_dir():
+        if split in ("train", "all") and train_dir.is_dir():
+            g_ids.update(
+                canonical_patient_id(f.name) for f in train_dir.glob("*.h5"))
+        if split in ("test", "all") and test_dir.is_dir():
+            g_ids.update(
+                canonical_patient_id(f.name) for f in test_dir.glob("*.h5"))
+    else:
+        g_ids.update(
+            canonical_patient_id(f.name) for f in g_dir.glob("*.h5"))
+
+    # Tile patient IDs
+    z_ids = {canonical_patient_id(f.name) for f in t_dir.glob("*.zip")}
+
+    common = sorted(g_ids & z_ids)
+    print(f"[discover_common_patients] {len(g_ids)} genomic, "
+          f"{len(z_ids)} tile zips, {len(common)} in common (split={split})")
+    return common
+
+
+# ======================================================================
 #  Dataset
 # ======================================================================
 
@@ -143,6 +187,7 @@ class GenomicTileDataset(Dataset):
         transform=None,
         tiles_per_patient: int = 1,
         split: str = "train",
+        patient_ids: Optional[list[str]] = None,
     ):
         super().__init__()
         self.genomic_h5_dir = Path(genomic_h5_dir).expanduser()
@@ -150,6 +195,10 @@ class GenomicTileDataset(Dataset):
         self.genomic_key = genomic_key
         self.transform = transform
         self.tiles_per_patient = tiles_per_patient
+        
+        # Corruption tracking
+        self.bad_tiles: dict[str, list[str]] = {}  # patient_id -> list of bad tile names
+        self.corruption_retries: int = 5  # max retries per sample
 
         genomic_files = self._find_genomic_files(split)
         zip_files = {
@@ -157,6 +206,9 @@ class GenomicTileDataset(Dataset):
             for f in self.tiles_zip_dir.glob("*.zip")
         }
         common_ids = sorted(set(genomic_files) & set(zip_files))
+        if patient_ids is not None:
+            allowed = set(patient_ids)
+            common_ids = [pid for pid in common_ids if pid in allowed]
         if not common_ids:
             raise RuntimeError(
                 f"No matching patients between\n"
@@ -218,6 +270,7 @@ class GenomicTileDataset(Dataset):
 
         print(f"[GenomicTileDataset] {len(self.samples)} total samples")
 
+
     def _find_genomic_files(self, split: str) -> dict[str, Path]:
         train_dir = self.genomic_h5_dir / "train"
         test_dir = self.genomic_h5_dir / "test"
@@ -246,17 +299,78 @@ class GenomicTileDataset(Dataset):
         pid, zpath = self.samples[idx]
         genomic = self.genomic_cache[pid]
 
-        tile_name = random.choice(self.tile_lists[pid])
-        with zipfile.ZipFile(zpath, "r") as zf:
-            with zf.open(tile_name) as fh:
-                img = Image.open(BytesIO(fh.read())).convert("RGB")
+        # Retry loop for handling corrupted tiles
+        available_tiles = [
+            t for t in self.tile_lists[pid]
+            if t not in self.bad_tiles.get(pid, [])
+        ]
+        
+        if not available_tiles:
+            raise RuntimeError(
+                f"[GenomicTileDataset] All tiles corrupted for patient {pid}")
 
-        if self.transform is not None:
-            img = self.transform(img)
-        else:
-            img = transforms.ToTensor()(img)
+        for attempt in range(self.corruption_retries):
+            tile_name = random.choice(available_tiles)
+            try:
+                with zipfile.ZipFile(zpath, "r") as zf:
+                    with zf.open(tile_name) as fh:
+                        img = Image.open(BytesIO(fh.read())).convert("RGB")
 
-        return {"img": img, "feat": genomic, "patient_id": pid}
+                if self.transform is not None:
+                    img = self.transform(img)
+                else:
+                    img = transforms.ToTensor()(img)
+
+                return {"img": img, "feat": genomic, "patient_id": pid}
+
+            except (zipfile.BadZipFile, EOFError, Exception) as e:
+                # Log the bad tile
+                if pid not in self.bad_tiles:
+                    self.bad_tiles[pid] = []
+                if tile_name not in self.bad_tiles[pid]:
+                    self.bad_tiles[pid].append(tile_name)
+                    print(f"[WARN] Corrupted tile skipped ({attempt+1}/{self.corruption_retries}): "
+                          f"{pid} / {tile_name} ({type(e).__name__})")
+                
+                # Remove from available list and retry
+                available_tiles = [t for t in available_tiles if t != tile_name]
+                
+                if not available_tiles:
+                    # No more tiles to try for this patient
+                    raise RuntimeError(
+                        f"[GenomicTileDataset] Patient {pid}: all {len(self.bad_tiles[pid])} "
+                        f"tiles corrupted after {attempt+1} attempts")
+        
+        # Should not reach here, but just in case
+        raise RuntimeError(
+            f"[GenomicTileDataset] Failed to load tile for patient {pid} "
+            f"after {self.corruption_retries} retries")
+
+    def log_corruption_summary(self):
+        """Log statistics about corrupted tiles encountered during training."""
+        if not self.bad_tiles:
+            print("\n[GenomicTileDataset] No corrupted tiles detected ✓")
+            return
+        
+        total_bad = sum(len(v) for v in self.bad_tiles.values())
+        affected_patients = len(self.bad_tiles)
+        
+        print(f"\n{'='*70}")
+        print(f"[GenomicTileDataset] CORRUPTION SUMMARY")
+        print(f"{'='*70}")
+        print(f"  Total corrupted tiles : {total_bad}")
+        print(f"  Affected patients    : {affected_patients}")
+        print(f"  Patients in dataset  : {len(self.pairs)}")
+        print(f"  Success rate         : {(1 - affected_patients/len(self.pairs)) * 100:.1f}%")
+        print(f"\nCorrupted tiles by patient:")
+        for pid in sorted(self.bad_tiles.keys()):
+            tiles = self.bad_tiles[pid]
+            print(f"  {pid}: {len(tiles)} tile(s)")
+            for tile in tiles[:3]:  # Show first 3 tiles
+                print(f"    - {tile[:60]}...")
+            if len(tiles) > 3:
+                print(f"    ... and {len(tiles) - 3} more")
+        print(f"{'='*70}\n")
 
 
 # ======================================================================
@@ -304,6 +418,7 @@ class LitDiffusionGenomicV4(LitModel):
         proj_lr: float = 3e-4,
         proj_warmup: int = 500,
         n_log_samples: int = 16,
+        val_fraction: float = 0.1,
     ):
         super().__init__(conf)
         self.projection_head = projection_head
@@ -315,6 +430,7 @@ class LitDiffusionGenomicV4(LitModel):
         self.proj_lr = proj_lr
         self.proj_warmup = proj_warmup
         self.n_log_samples = n_log_samples
+        self.val_fraction = val_fraction
 
         print(f"Projection head JOINTLY trained (lr={proj_lr}, "
               f"warmup={proj_warmup} steps)")
@@ -336,14 +452,45 @@ class LitDiffusionGenomicV4(LitModel):
             torch.cuda.manual_seed(seed)
 
         xform = make_tile_transform(self._img_size)
-        self.train_data = GenomicTileDataset(
-            genomic_h5_dir=self.genomic_h5_dir,
-            tiles_zip_dir=self.tiles_zip_dir,
-            transform=xform,
-            tiles_per_patient=self.tiles_per_patient,
-            split=self.split,
-        )
-        self.val_data = self.train_data
+
+        if self.val_fraction > 0:
+            # Discover all matched patients, then split for train / val
+            all_pids = discover_common_patients(
+                self.genomic_h5_dir, self.tiles_zip_dir, self.split)
+            n_val = max(1, int(len(all_pids) * self.val_fraction))
+            rng = np.random.RandomState(42)  # deterministic split
+            shuffled = list(all_pids)
+            rng.shuffle(shuffled)
+            val_pids = sorted(shuffled[:n_val])
+            train_pids = sorted(shuffled[n_val:])
+            print(f"[setup] Patient split: {len(train_pids)} train, "
+                  f"{len(val_pids)} val ({self.val_fraction:.0%})")
+
+            self.train_data = GenomicTileDataset(
+                genomic_h5_dir=self.genomic_h5_dir,
+                tiles_zip_dir=self.tiles_zip_dir,
+                transform=xform,
+                tiles_per_patient=self.tiles_per_patient,
+                split=self.split,
+                patient_ids=train_pids,
+            )
+            self.val_data = GenomicTileDataset(
+                genomic_h5_dir=self.genomic_h5_dir,
+                tiles_zip_dir=self.tiles_zip_dir,
+                transform=xform,
+                tiles_per_patient=self.tiles_per_patient,
+                split=self.split,
+                patient_ids=val_pids,
+            )
+        else:
+            self.train_data = GenomicTileDataset(
+                genomic_h5_dir=self.genomic_h5_dir,
+                tiles_zip_dir=self.tiles_zip_dir,
+                transform=xform,
+                tiles_per_patient=self.tiles_per_patient,
+                split=self.split,
+            )
+            self.val_data = self.train_data
 
         if len(self.train_data) == 0:
             raise RuntimeError(
@@ -398,6 +545,42 @@ class LitDiffusionGenomicV4(LitModel):
             pin_memory=True,
             drop_last=True,
         )
+
+    def val_dataloader(self):
+        if self.val_fraction <= 0:
+            return []  # skip validation when no val set
+        return DataLoader(
+            self.val_data,
+            batch_size=self.batch_size,
+            shuffle=False,
+            num_workers=self.conf.num_workers,
+            pin_memory=True,
+            drop_last=False,
+        )
+
+    # ------------------------------------------------------------------
+    #  Validation step
+    # ------------------------------------------------------------------
+
+    def validation_step(self, batch, batch_idx):
+        imgs = batch["img"].to(self.device)
+        genomic_raw = batch["feat"].to(self.device, dtype=torch.float32)
+
+        cond = self.projection_head(genomic_raw)
+
+        t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+        losses = self.sampler.training_losses(
+            model=self.model,
+            x_start=imgs,
+            cond=cond,
+            t=t,
+            model_kwargs={"cond": cond},
+        )
+        loss = losses["loss"].mean()
+
+        self.log("val_loss", loss, prog_bar=True,
+                 on_step=False, on_epoch=True, sync_dist=True)
+        return loss
 
     # ------------------------------------------------------------------
     #  Training step — joint UNet + projection head
@@ -549,8 +732,9 @@ class LitDiffusionGenomicV4(LitModel):
                 return 1.0
 
             # Apply warm-up to ALL param groups (UNet also benefits from
-            # a short ramp since we're loading pre-trained weights)
-            scheduler = LambdaLR(optim, lr_lambda=warmup_fn)
+            # a short ramp since we're loading pre-trained weights).
+            # Must pass a list of lambda fns (one per param group).
+            scheduler = LambdaLR(optim, lr_lambda=[warmup_fn, warmup_fn])
             return {
                 "optimizer": optim,
                 "lr_scheduler": {
@@ -649,6 +833,7 @@ def run(args):
         proj_lr=args.proj_lr,
         proj_warmup=args.proj_warmup,
         n_log_samples=args.n_log_samples,
+        val_fraction=args.val_fraction,
     )
 
     # ---- Load pretrained diffusion weights ----
@@ -681,18 +866,38 @@ def run(args):
     # ---- Trainer ----
     os.makedirs(conf.logdir, exist_ok=True)
 
-    ckpt_callback = ModelCheckpoint(
-        dirpath=conf.logdir,
-        filename="epoch={epoch:02d}-loss={loss:.4f}",
-        save_last=True,
-        save_top_k=3,
-        monitor="loss",
-        mode="min",
-        every_n_train_steps=max(
-            1,
-            conf.save_every_samples // conf.batch_size_effective,
-        ),
-    )
+    if args.val_fraction > 0:
+        ckpt_callback = ModelCheckpoint(
+            dirpath=conf.logdir,
+            filename="epoch={epoch:02d}-val_loss={val_loss:.4f}",
+            save_last=True,
+            save_top_k=3,
+            monitor="val_loss",
+            mode="min",
+        )
+        early_stop_callback = EarlyStopping(
+            monitor="val_loss",
+            patience=args.early_stopping_patience,
+            min_delta=1e-4,
+            mode="min",
+            verbose=True,
+        )
+        callbacks = [ckpt_callback, early_stop_callback,
+                     LearningRateMonitor()]
+    else:
+        ckpt_callback = ModelCheckpoint(
+            dirpath=conf.logdir,
+            filename="epoch={epoch:02d}-loss={loss:.4f}",
+            save_last=True,
+            save_top_k=3,
+            monitor="loss",
+            mode="min",
+            every_n_train_steps=max(
+                1,
+                conf.save_every_samples // conf.batch_size_effective,
+            ),
+        )
+        callbacks = [ckpt_callback, LearningRateMonitor()]
 
     tb_logger = pl_loggers.TensorBoardLogger(
         save_dir=conf.logdir, name=None, version="",
@@ -714,7 +919,7 @@ def run(args):
         strategy=strategy,
         accelerator=accelerator,
         precision="16-mixed" if conf.fp16 else 32,
-        callbacks=[ckpt_callback, LearningRateMonitor()],
+        callbacks=callbacks,
         logger=tb_logger,
         accumulate_grad_batches=conf.accum_batches,
     )
@@ -725,6 +930,10 @@ def run(args):
         trainer.fit(model, ckpt_path=last_ckpt)
     else:
         trainer.fit(model)
+
+    # Log corruption statistics after training
+    if hasattr(model, 'train_data') and model.train_data is not None:
+        model.train_data.log_corruption_summary()
 
     print(f"\n{'='*60}")
     print("GENOMIC DIFFUSION FINE-TUNING COMPLETE")
@@ -742,13 +951,15 @@ def main():
         description="Fine-tune diffusion model with genomic conditioning (v4)"
                     " — joint projection-head + UNet training",
     )
-    parser.add_argument("--diffusion-ckpt", type=str, required=True,
+    parser.add_argument("--config", type=str, default=None,
+                        help="Path to YAML config file with training settings")
+    parser.add_argument("--diffusion-ckpt", type=str, required=False,
                         help="Path to pretrained diffusion checkpoint")
-    parser.add_argument("--genomic-h5-dir", type=str, required=True,
+    parser.add_argument("--genomic-h5-dir", type=str, required=False,
                         help="Dir with per-patient genomic .h5 files")
-    parser.add_argument("--tiles-zip-dir", type=str, required=True,
+    parser.add_argument("--tiles-zip-dir", type=str, required=False,
                         help="Dir with per-patient tile .zip archives")
-    parser.add_argument("--out-dir", type=str, required=True)
+    parser.add_argument("--out-dir", type=str, required=False)
 
     # Training
     parser.add_argument("--epochs", type=int, default=20)
@@ -780,6 +991,14 @@ def main():
     parser.add_argument("--img-size", type=int, default=512)
     parser.add_argument("--num-workers", type=int, default=4)
 
+    # Validation & early stopping
+    parser.add_argument("--val-fraction", type=float, default=0.1,
+                        help="Fraction of patients held out for validation "
+                             "(0 to disable)")
+    parser.add_argument("--early-stopping-patience", type=int, default=5,
+                        help="Stop if val_loss does not improve for this "
+                             "many epochs")
+
     # Logging
     parser.add_argument("--n-log-samples", type=int, default=16,
                         help="Fixed validation tiles for 4×4 grid logging")
@@ -791,6 +1010,46 @@ def main():
     parser.add_argument("--gpus", type=int, nargs="+", default=[0])
 
     args = parser.parse_args()
+
+    # if config file is supplied, override corresponding args
+    # the YAML may contain a top‑level "training" dict or specify options
+    # directly (e.g. diffusion_ckpt, tiles_zip_dir) – any key matching an
+    # argparse attribute will be applied.
+    if args.config:
+        with open(args.config, 'r') as f:
+            cfg = yaml.safe_load(f) or {}
+        applied = {}
+        # first process top‑level keys
+        for key, value in cfg.items():
+            if key == 'training':
+                continue
+            if hasattr(args, key):
+                setattr(args, key, value)
+                applied[key] = value
+        # then process nested training block if present
+        train_cfg = cfg.get('training', {})
+        for key, value in train_cfg.items():
+            if hasattr(args, key):
+                setattr(args, key, value)
+                applied[key] = value
+        if applied:
+            print(f"[config] Applied settings from {args.config}: {applied}")
+
+    # Ensure numeric types are correct (YAML may parse as strings in edge cases)
+    args.lr = float(args.lr)
+    args.proj_lr = float(args.proj_lr)
+    args.batch_size = int(args.batch_size)
+    args.epochs = int(args.epochs)
+    args.val_fraction = float(args.val_fraction)
+    args.early_stopping_patience = int(args.early_stopping_patience)
+
+    # validate required arguments now that config merges have happened
+    missing = []
+    for req in ["diffusion_ckpt", "genomic_h5_dir", "tiles_zip_dir", "out_dir"]:
+        if getattr(args, req, None) is None:
+            missing.append(req)
+    if missing:
+        parser.error(f"the following arguments are required (either via CLI or config): {', '.join(missing)}")
 
     # ---- Banner ----
     print(f"\n{'='*60}")

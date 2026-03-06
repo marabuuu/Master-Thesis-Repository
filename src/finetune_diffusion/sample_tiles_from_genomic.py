@@ -1,4 +1,6 @@
 #!/usr/bin/env python
+# type: ignore
+# pyright: reportPossiblyUnboundVariable=false, reportOperatorIssue=false
 """Sample tiles from a finetuned genomic-conditioned diffusion model.
 
 Two modes:
@@ -7,20 +9,24 @@ Two modes:
 
 Usage examples are printed with `-h`.
 
-python src/finetune_diffusion/sample_tiles_from_genomic.py \
-	--ckpt path/to/last.ckpt \
-	--genomic-h5-dir /path/to/genomic_h5_dir \
-	--mode random-noise \
-	--n-samples 4 \
-	--out-dir ./samples_random
+From config.yaml:
+	python src/finetune_diffusion/sample_tiles_from_genomic.py --config src/config.yaml
 
-python src/finetune_diffusion/sample_tiles_from_genomic.py \
-	--ckpt path/to/last.ckpt \
-	--genomic-h5-dir /path/to/genomic_h5_dir \
-	--mode encode-decode \
-	--tile-file /path/to/tile.png \
-	--out-dir ./samples_recon \
-	--n-samples 4
+From command line:
+	python src/finetune_diffusion/sample_tiles_from_genomic.py \\
+		--ckpt path/to/last.ckpt \\
+		--genomic-h5-dir /path/to/genomic_h5_dir \\
+		--mode random-noise \\
+		--n-samples 4 \\
+		--out-dir ./samples_random
+
+	python src/finetune_diffusion/sample_tiles_from_genomic.py \\
+		--ckpt path/to/last.ckpt \\
+		--genomic-h5-dir /path/to/genomic_h5_dir \\
+		--mode encode-decode \\
+		--tile-file /path/to/tile.png \\
+		--out-dir ./samples_recon \\
+		--n-samples 4
 """
 from __future__ import annotations
 
@@ -103,27 +109,90 @@ def load_tile_image(path: Path, img_size: int) -> torch.Tensor:
 
 def main():
 	parser = argparse.ArgumentParser(description="Sample tiles from genomic-conditioned diffusion")
-	parser.add_argument("--ckpt", required=True, help="Diffusion checkpoint (last.ckpt or .ckpt file)")
+	parser.add_argument("--config", type=str, default=None,
+	                    help="YAML config file with sampling section (overrides individual arguments)")
+	parser.add_argument("--ckpt", default=None, help="Diffusion checkpoint (last.ckpt or .ckpt file)")
 	parser.add_argument("--proj-ckpt", default=None, help="Optional projection head checkpoint")
-	parser.add_argument("--genomic-h5-dir", required=True, help="Directory with per-patient .h5 genomic files")
+	parser.add_argument("--genomic-h5-dir", default=None, help="Directory with per-patient .h5 genomic files")
 	parser.add_argument("--tiles-zip-dir", default=None, help="Optional: directory of tile .zip archives (for reconstruct mode) or individual tile files")
-	parser.add_argument("--mode", choices=["random-noise", "encode-decode"], default="random-noise")
+	parser.add_argument("--mode", choices=["random-noise", "encode-decode"], default=None)
 	parser.add_argument("--patient", default=None, help="Optional patient id to sample (canonical TCGA-XX-YYYY)")
 	parser.add_argument("--tile-file", default=None, help="Path to a tile image file to reconstruct (reconstruct mode)")
-	parser.add_argument("--out-dir", required=True)
-	parser.add_argument("--n-samples", type=int, default=4)
-	parser.add_argument("--img-size", type=int, default=512)
+	parser.add_argument("--out-dir", default=None)
+	parser.add_argument("--n-samples", type=int, default=None)
+	parser.add_argument("--img-size", type=int, default=None)
 	parser.add_argument("--debug-save", action="store_true", help="Save debug images (original, x_t, generated) to out-dir")
-	parser.add_argument("--debug-n", type=int, default=4, help="Number of debug samples to save per patient")
-	parser.add_argument("--proj-hidden-dim", type=int, default=512)
-	parser.add_argument("--proj-layers", type=int, default=4)
-	parser.add_argument("--proj-dropout", type=float, default=0.1)
+	parser.add_argument("--debug-n", type=int, default=None, help="Number of debug samples to save per patient")
+	parser.add_argument("--debug-steps", type=int, default=None, help="Number of intermediate steps to save between orig->noise and noise->recon")
+	parser.add_argument("--proj-hidden-dim", type=int, default=None)
+	parser.add_argument("--proj-layers", type=int, default=None)
+	parser.add_argument("--proj-dropout", type=float, default=None)
 	parser.add_argument("--device", default=None, help="torch device (e.g., cuda:0 or cpu)")
-	parser.add_argument("--seed", type=int, default=42)
+	parser.add_argument("--seed", type=int, default=None)
 
 	args = parser.parse_args()
 
-	torch.manual_seed(args.seed)
+	# --- Load config if provided ---
+	if args.config:
+		try:
+			import yaml
+			with open(args.config) as f:
+				config = yaml.safe_load(f)
+			samp_cfg = config.get("sampling", {})
+			
+			# Use config values as defaults where CLI args not explicitly set
+			if args.ckpt is None:
+				args.ckpt = samp_cfg.get("ckpt")
+			if args.proj_ckpt is None:
+				args.proj_ckpt = samp_cfg.get("proj_ckpt")
+			if args.genomic_h5_dir is None:
+				args.genomic_h5_dir = samp_cfg.get("genomic_h5_dir")
+			if args.tiles_zip_dir is None:
+				args.tiles_zip_dir = samp_cfg.get("tiles_zip_dir")
+			if args.mode is None:
+				args.mode = samp_cfg.get("mode", "random-noise")
+			if args.patient is None:
+				args.patient = samp_cfg.get("patient")
+			if args.tile_file is None:
+				args.tile_file = samp_cfg.get("tile_file")
+			if args.out_dir is None:
+				args.out_dir = samp_cfg.get("out_dir")
+			if args.n_samples is None:
+				args.n_samples = samp_cfg.get("n_samples", 4)
+			if args.img_size is None:
+				args.img_size = samp_cfg.get("img_size", 512)
+			if args.debug_n is None:
+				args.debug_n = samp_cfg.get("debug_n", 4)
+			if args.debug_steps is None:
+				args.debug_steps = samp_cfg.get("debug_steps", 6)
+			if args.proj_hidden_dim is None:
+				args.proj_hidden_dim = samp_cfg.get("proj_hidden_dim", 512)
+			if args.proj_layers is None:
+				args.proj_layers = samp_cfg.get("proj_layers", 4)
+			if args.proj_dropout is None:
+				args.proj_dropout = samp_cfg.get("proj_dropout", 0.1)
+			if args.device is None:
+				args.device = samp_cfg.get("device")
+			if args.seed is None:
+				args.seed = samp_cfg.get("seed", 42)
+			# debug_save is a flag, so only set from config if not already set
+			if not args.debug_save:
+				args.debug_save = samp_cfg.get("debug_save", False)
+		except Exception as e:
+			print(f"[WARN] Could not load config {args.config}: {e}")
+
+	# --- Validate required arguments ---
+	if not args.ckpt:
+		parser.error("--ckpt is required (either from CLI or config)")
+	if not args.genomic_h5_dir:
+		parser.error("--genomic-h5-dir is required (either from CLI or config)")
+	if not args.out_dir:
+		parser.error("--out-dir is required (either from CLI or config)")
+
+	# Note: We do NOT set the global seed here anymore. Instead, we reseed per-sample
+	# to avoid both random-noise and encode-decode modes producing identical outputs
+	# when run separately (they would both start with the same RNG state).
+	# The sampler's internal RNG will still be deterministic per-sample when needed.
 
 	device = torch.device(args.device if args.device is not None else ("cuda" if torch.cuda.is_available() else "cpu"))
 
@@ -281,6 +350,11 @@ def main():
 				if pid not in genomic_map:
 					print(f"[WARN] No genomic .h5 for {pid}, skipping {zpath}")
 					continue
+				
+				# Reseed for this patient to ensure reproducibility within mode
+				if args.seed is not None:
+					torch.manual_seed(hash((pid, "random-noise", args.seed)) % (2**31))
+				
 				vec = load_genomic_vector(genomic_map[pid]).to(device)
 				cond = lit.projection_head(vec.unsqueeze(0)).repeat(args.n_samples, 1)
 
@@ -316,6 +390,10 @@ def main():
 		else:
 			# No zip dir: use genomic_map entries directly
 			for pid, h5p in tqdm(genomic_map.items(), desc="Genomic patients"):
+				# Reseed for this patient to ensure reproducibility within mode
+				if args.seed is not None:
+					torch.manual_seed(hash((pid, "random-noise", args.seed)) % (2**31))
+				
 				vec = load_genomic_vector(h5p).to(device)
 				cond = lit.projection_head(vec.unsqueeze(0)).repeat(args.n_samples, 1)
 
@@ -350,6 +428,11 @@ def main():
 				if pid not in genomic_map:
 					print(f"[WARN] No genomic .h5 for {pid}, skipping {zpath}")
 					continue
+				
+				# Reseed for this patient to ensure reproducibility within mode
+				if args.seed is not None:
+					torch.manual_seed(hash((pid, "encode-decode", args.seed)) % (2**31))
+				
 				tile_names = list_tiles_in_zip(zpath)
 				if not tile_names:
 					print(f"[WARN] No image tiles in {zpath}")
@@ -404,35 +487,60 @@ def main():
 					_debug_dir.mkdir(parents=True, exist_ok=True)
 					metrics_lines = ["pid,basename,mse"]
 					n_save = min(args.debug_n, gen.shape[0], len(sel) if sel else gen.shape[0])
-					for i in range(n_save):
-						# ensure variables exist for static analysis
-						member = None
-						orig_pil = None
-						# original image from zip
-						if i < len(sel):
-							member = sel[i]
-							with zipfile.ZipFile(zpath, "r") as srcz:
-								orig_bytes = srcz.read(member)
-								orig_pil = Image.open(BytesIO(orig_bytes)).convert("RGB")
-								orig_pil.save(_debug_dir / f"orig_{Path(member).name}")
-						# save x_t (noisy) - convert from tensor x_t range to image
-						x_img = x_t[i].detach().cpu()
-						x_img = ((x_img + 1) / 2).clamp(0, 1)
-						x_arr = (x_img * 255).to(torch.uint8).permute(1, 2, 0).numpy()
-						Image.fromarray(x_arr).save(_debug_dir / f"x_t_{i}.png")
-						# build and save generated image from tensor (avoid relying on outer 'pil' var)
-						gen_img = gen[i].detach().cpu()
-						gen_img = ((gen_img + 1) / 2).clamp(0, 1)
-						gen_arr = (gen_img * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+					# We have access to img_batch (transformed original images), x_t, and gen tensors
+					for i in range(n_save):  # type: ignore[reportPossiblyUnboundVariable]
+						# original image from provided batch (already transformed to [-1,1])
+						try:
+							orig_tensor: torch.Tensor = img_batch[i].detach().cpu()
+						except Exception:
+							# fallback: read from zip for static analyzers
+							member = None
+							orig_pil = None
+							if i < len(sel):
+								member = sel[i]
+								with zipfile.ZipFile(zpath, "r") as srcz:
+									orig_bytes = srcz.read(member)
+									orig_pil = Image.open(BytesIO(orig_bytes)).convert("RGB")
+									orig_tensor = make_tile_transform(args.img_size)(orig_pil)  # type: ignore[assignment]
+						# save denormalized original as image
+						assert isinstance(orig_tensor, torch.Tensor)  # type: ignore[reportPossiblyUnboundVariable]
+
+						# Extract noisy and generated tensors for this sample
+						x_img: torch.Tensor = x_t[i].detach().cpu()
+						gen_img: torch.Tensor = gen[i].detach().cpu()
+
+						# Save intermediate interpolation frames: orig -> x_t (noise path)
+						n_steps = max(1, int(args.debug_steps))
+						for s in range(1, n_steps + 1):
+							t = float(s) / float(n_steps + 1)
+							interp_noise = (1.0 - t) * orig_tensor + t * x_img
+							interp_den = ((interp_noise + 1) / 2).clamp(0, 1)
+							interp_arr = (interp_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+							Image.fromarray(interp_arr).save(_debug_dir / f"noise_step_{s}_{i}.png")
+
+						# Save intermediate reconstruction frames: x_t -> gen (reconstruction path)
+						for s in range(1, n_steps + 1):
+							t = float(s) / float(n_steps + 1)
+							interp_recon = (1.0 - t) * x_img + t * gen_img
+							interp_den = ((interp_recon + 1) / 2).clamp(0, 1)
+							interp_arr = (interp_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+							Image.fromarray(interp_arr).save(_debug_dir / f"recon_step_{s}_{i}.png")
+
+						# Save original and generated images as PNG
+						orig_den = ((orig_tensor + 1) / 2).clamp(0, 1)  # type: ignore[operator]
+						orig_arr = (orig_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						Image.fromarray(orig_arr).save(_debug_dir / f"orig_{i}.png")
+
+						gen_den = ((gen_img + 1) / 2).clamp(0, 1)
+						gen_arr = (gen_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
 						gen_pil = Image.fromarray(gen_arr)
 						gen_pil.save(_debug_dir / f"gen_{i}.png")
-						# compute simple MSE if original available
-						if orig_pil is not None:
-							orig_arr = np.asarray(orig_pil.resize(gen_pil.size)).astype(np.float32)
-							gen_arr_f = np.asarray(gen_pil).astype(np.float32)
-							mse = float(np.mean((orig_arr - gen_arr_f) ** 2))
-							member_name = Path(member).name if member is not None else ""
-							metrics_lines.append(f"{pid},{member_name},{mse:.4f}")
+
+						# compute simple MSE between original and generated
+						orig_arr_f = np.asarray(orig_arr).astype(np.float32)
+						gen_arr_f = np.asarray(gen_arr).astype(np.float32)
+						mse = float(np.mean((orig_arr_f - gen_arr_f) ** 2))
+						metrics_lines.append(f"{pid},{i},{mse:.4f}")
 					# end per-sample
 					# write metrics file
 					with open(_debug_dir / "metrics.csv", "w") as mf:
@@ -457,6 +565,10 @@ def main():
 
 			if h5p is None:
 				raise RuntimeError("No matching genomic file found for the provided tile (specify --patient or ensure filenames include TCGA- ids)")
+
+			# Reseed for this sample to ensure reproducibility within mode
+			if args.seed is not None:
+				torch.manual_seed(hash((pid_key, "encode-decode", args.seed)) % (2**31))
 
 			vec = load_genomic_vector(h5p).to(device)
 			cond = lit.projection_head(vec.unsqueeze(0)).repeat(args.n_samples, 1)
@@ -492,6 +604,60 @@ def main():
 						buf = BytesIO()
 						pil.save(buf, format="PNG")
 						gz.writestr(out_name, buf.getvalue())
+
+				# Debug: save original, x_t (noisy), generated and intermediate frames for single tile-file case
+				if args.debug_save:
+					_debug_dir = out_dir / f"debug_{pid}"
+					_debug_dir.mkdir(parents=True, exist_ok=True)
+					metrics_lines = ["pid,basename,mse"]
+					n_save = min(args.debug_n, gen.shape[0])
+					# original image tensor (img is the normalized single image on device)
+					try:
+						orig_tensor: torch.Tensor = img.detach().cpu().squeeze(0)
+					except Exception:
+						orig_tensor = make_tile_transform(args.img_size)(Image.open(tile_path).convert("RGB"))  # type: ignore[assignment]
+					for i in range(n_save):  # type: ignore[reportPossiblyUnboundVariable]
+						# noisy and generated tensors
+						x_img = x_t[i].detach().cpu()  # type: ignore[reportPossiblyUnboundVariable]
+						gen_img = gen[i].detach().cpu()  # type: ignore[reportPossiblyUnboundVariable]
+						# save original
+						assert isinstance(orig_tensor, torch.Tensor)
+						orig_den = ((orig_tensor + 1) / 2).clamp(0, 1)  # type: ignore[operator]
+						orig_arr = (orig_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						Image.fromarray(orig_arr).save(_debug_dir / f"orig_{i}.png")
+						# save x_t
+						x_den = ((x_img + 1) / 2).clamp(0, 1)
+						x_arr = (x_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						Image.fromarray(x_arr).save(_debug_dir / f"x_t_{i}.png")
+						# save final gen
+						gen_den = ((gen_img + 1) / 2).clamp(0, 1)
+						gen_arr = (gen_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+						gen_pil = Image.fromarray(gen_arr)
+						gen_pil.save(_debug_dir / f"gen_{i}.png")
+						# intermediate frames
+						n_steps = max(1, int(args.debug_steps))
+						for s in range(1, n_steps + 1):
+							t = float(s) / float(n_steps + 1)
+							interp_noise = (1.0 - t) * orig_tensor + t * x_img
+							interp_den = ((interp_noise + 1) / 2).clamp(0, 1)
+							interp_arr = (interp_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+							Image.fromarray(interp_arr).save(_debug_dir / f"noise_step_{s}_{i}.png")
+						for s in range(1, n_steps + 1):
+							t = float(s) / float(n_steps + 1)
+							interp_recon = (1.0 - t) * x_img + t * gen_img
+							interp_den = ((interp_recon + 1) / 2).clamp(0, 1)
+							interp_arr = (interp_den * 255).to(torch.uint8).permute(1, 2, 0).numpy()
+							Image.fromarray(interp_arr).save(_debug_dir / f"recon_step_{s}_{i}.png")
+						# mse
+						try:
+							orig_p = Image.fromarray(orig_arr)
+						except Exception:
+							orig_p = None
+						if orig_p is not None:
+							mse = float(np.mean((np.asarray(orig_p.resize(gen_pil.size)).astype(np.float32) - np.asarray(gen_pil).astype(np.float32)) ** 2))
+							metrics_lines.append(f"{pid},{i},{mse:.4f}")
+					with open(_debug_dir / "metrics.csv", "w") as mf:
+						mf.write("\n".join(metrics_lines))
 
 	else:
 		raise RuntimeError(f"Unknown mode: {args.mode}")
