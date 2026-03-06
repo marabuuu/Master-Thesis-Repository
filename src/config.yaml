@@ -1,0 +1,74 @@
+# python -m src.preprocessing.get_tiles_within_rois --config src/config.yaml
+preprocessing:
+  zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/TCGA           
+  roi_dir: /mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA     
+  save_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  target_mpp: 0.5                        # scale annotations into this pixel space
+  native_slide_mpp: 0.25                 # microns/pixel of original slide
+  num_workers: 8
+  plots: true                            # produce diagnostic plots
+  area_threshold: 0.6                    # overlap threshold for selection
+  selection_mode: overlap                # choices: center, overlap, both
+  annotation_buffer: 0.0                 # expand annotation for center test
+
+encoding:
+  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
+  gene_list_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/encoding/gene_list.txt
+  target_genes: 512
+  min_nonzero: 5
+  corr_threshold: 0.90
+  force_pam50: true
+  pam50_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/PAM50_gene_list.txt
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+foxa1_encoding:
+  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
+  patient_col: Patient_ID
+  feature_dim: 512
+
+training:
+  diffusion_ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
+  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train
+  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260303_finetune_vae/try
+  epochs: 50
+  batch_size: 2
+  val_fraction: 0.1
+  early_stopping_patience: 5
+  lr: 1e-5
+
+training_stats:
+  logdir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning/genomic_finetune_v4
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning
+  plots:
+    - loss_curves          # epoch-level train & val loss
+    - batch_trajectory     # per-step loss across all epochs
+    - train_val_comparison # train vs val with gap shading
+    - early_stopping       # val loss with best-epoch marker
+    - summary              # multi-panel figure
+  figsize: [16, 12]        # for summary, individual plots auto-size
+  cmap_categorical: batlowS   # Crameri colormap for categorical
+  cmap_sequential: batlow     # Crameri colormap for sequential
+
+sampling:
+  ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning/genomic_finetune_v4/last.ckpt
+  proj_ckpt: null          # optional separate projection head checkpoint
+  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/test
+  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all  # optional
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260304_finetune_vae_50epochs/sampling/random-noise
+  mode: random-noise       # choices: random-noise, encode-decode
+  patient: TCGA-A1-A0SM         # optional specific patient ID (TCGA-XX-YYYY)
+  tile_file: null          # optional single tile path (for encode-decode without zip dir)
+  n_samples: 4
+  img_size: 512
+  seed: 42
+  debug_save: true       # save intermediate frames and metrics
+  debug_n: 4
+  debug_steps: 6
+  proj_hidden_dim: 512
+  proj_layers: 4
+  proj_dropout: 0.1
+  device: null             # null = auto-detect cuda/cpu
