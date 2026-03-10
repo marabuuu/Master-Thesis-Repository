@@ -43,12 +43,28 @@ except Exception:
     HAS_MATPLOTLIB = False
 
 try:
-    # crameri provides scientifically-designed colormaps (Fabio Crameri)
-    import crameri.cm as crameri_cm  # type: ignore
-    HAS_CRAMERI = True
+    from .core import (
+        get_crameri_cmap,
+        get_categorical_colors,
+        setup_style as _core_setup_style,
+        save_figure as _core_save_figure,
+        show_or_save as _core_show_or_save,
+        HAS_CRAMERI,
+        DIVERGING_CMAP,
+        HEATMAP_CMAP,
+        SEQUENTIAL_CMAP,
+    )
+    _HAS_CORE = True
 except Exception:
-    crameri_cm = None
+    _HAS_CORE = False
     HAS_CRAMERI = False
+    DIVERGING_CMAP = "RdBu_r"
+    HEATMAP_CMAP = "hot"
+    SEQUENTIAL_CMAP = "viridis"
+
+    def get_crameri_cmap(name: str):  # type: ignore[misc]
+        import matplotlib as _mpl
+        return _mpl.colormaps.get(name, _mpl.colormaps["viridis"])
 
 
 def _check_matplotlib():
@@ -59,16 +75,39 @@ def _check_matplotlib():
 def _get_colors():
     """Return a short palette of colors to use for MSE/PSNR/SSIM.
 
-    If `crameri` is available, use three distinct scientific colormaps sampled
-    at their midpoints. Otherwise fall back to the original palette.
+    Uses Crameri scientific colormaps when available via ``core.py``.
     """
-    if HAS_CRAMERI and crameri_cm is not None:
+    if HAS_CRAMERI:
         try:
-            return [crameri_cm.batlow(0.5), crameri_cm.oleron(0.5), crameri_cm.turku(0.5)]
+            cmap = get_crameri_cmap("batlow")
+            return [cmap(0.25), cmap(0.55), cmap(0.85)]
         except Exception:
-            # If specific names missing, fall through
             pass
     return ["#3498db", "#2ecc71", "#e74c3c"]
+
+
+def _compute_ssim_diff_map(
+    original: "Image.Image",
+    reconstructed: "Image.Image",
+) -> np.ndarray:
+    """Compute a per-pixel SSIM difference map between two images.
+
+    Returns a 2-D float array in [0, 1] where 1 = identical.
+    """
+    from skimage.metrics import structural_similarity
+
+    orig_arr = np.asarray(original.convert("RGB"), dtype=np.float64) / 255.0
+    recon_arr = np.asarray(reconstructed.convert("RGB"), dtype=np.float64) / 255.0
+
+    _, ssim_map = structural_similarity(
+        orig_arr,
+        recon_arr,
+        channel_axis=2,
+        data_range=1.0,
+        full=True,
+    )
+    # Average across colour channels → single spatial map
+    return np.mean(ssim_map, axis=2)
 
 
 def setup_style():
@@ -239,7 +278,15 @@ def plot_per_patient_metrics(patient_results: Dict[str, Any], save_path: Optiona
     return fig
 
 
-def plot_comparison_grid(tile_pairs: List[Any], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Optional[Tuple[float, float]] = None, num_cols: int = 4, include_metrics: bool = True) -> Optional["Figure"]:
+def plot_comparison_grid(tile_pairs: List[Any], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Optional[Tuple[float, float]] = None, num_cols: int = 4, include_metrics: bool = True, include_diff: bool = True) -> Optional["Figure"]:
+    """Grid of Original | Reconstructed | SSIM-diff triptychs.
+
+    Parameters
+    ----------
+    include_diff : bool
+        Add a third column per pair showing the per-pixel SSIM map with a
+        Crameri diverging colourmap (default *True*).
+    """
     _check_matplotlib()
     setup_style()
     if not tile_pairs:
@@ -249,28 +296,50 @@ def plot_comparison_grid(tile_pairs: List[Any], save_path: Optional[Union[str, P
     from quality_assurance.metrics import compute_all_metrics
 
     n_pairs = len(tile_pairs)
+    panels_per_pair = 3 if include_diff else 2
     num_rows = (n_pairs + num_cols - 1) // num_cols
     if figsize is None:
-        figsize = (num_cols * 5, num_rows * 3)
+        figsize = (num_cols * panels_per_pair * 2.5, num_rows * 3.2)
 
     fig = plt.figure(figsize=figsize)
     fig.suptitle("Original vs Reconstructed Tile Comparison", fontsize=14, fontweight="bold")
 
+    diff_cmap = get_crameri_cmap(DIVERGING_CMAP) if include_diff else None
+
     for idx, pair in enumerate(tile_pairs):
         row = idx // num_cols
         col = idx % num_cols
-        ax_orig = plt.subplot2grid((num_rows, num_cols * 2), (row, col * 2))
-        ax_recon = plt.subplot2grid((num_rows, num_cols * 2), (row, col * 2 + 1))
+        base_col = col * panels_per_pair
+
+        ax_orig = plt.subplot2grid((num_rows, num_cols * panels_per_pair), (row, base_col))
+        ax_recon = plt.subplot2grid((num_rows, num_cols * panels_per_pair), (row, base_col + 1))
+
         ax_orig.imshow(pair.original)
-        ax_orig.set_title(f"Original", fontsize=9)
+        ax_orig.set_title("Original", fontsize=9)
         ax_orig.axis("off")
+
         ax_recon.imshow(pair.reconstructed)
-        ax_recon.set_title(f"Reconstructed", fontsize=9)
+        ax_recon.set_title("Reconstructed", fontsize=9)
         ax_recon.axis("off")
+
+        if include_diff:
+            ax_diff = plt.subplot2grid((num_rows, num_cols * panels_per_pair), (row, base_col + 2))
+            try:
+                ssim_map = _compute_ssim_diff_map(pair.original, pair.reconstructed)
+                ax_diff.imshow(ssim_map, cmap=diff_cmap, vmin=0, vmax=1)
+            except Exception:
+                orig_arr = np.asarray(pair.original.convert("RGB") if hasattr(pair.original, "convert") else pair.original, dtype=np.float32)
+                recon_arr = np.asarray(pair.reconstructed.convert("RGB") if hasattr(pair.reconstructed, "convert") else pair.reconstructed, dtype=np.float32)
+                diff = np.mean(np.abs(orig_arr - recon_arr), axis=2) / 255.0
+                ax_diff.imshow(diff, cmap=get_crameri_cmap(HEATMAP_CMAP), vmin=0, vmax=1)
+            ax_diff.set_title("SSIM Map", fontsize=9)
+            ax_diff.axis("off")
+
         if include_metrics:
             metrics = compute_all_metrics(pair.original, pair.reconstructed)
             metric_text = (f"MSE: {metrics['mse']:.1f} | " f"PSNR: {metrics['psnr']:.1f}dB | " f"SSIM: {metrics['ssim']:.3f}")
-            ax_recon.text(0.5, -0.1, metric_text, transform=ax_recon.transAxes, ha="center", va="top", fontsize=7, bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
+            target_ax = ax_diff if include_diff else ax_recon
+            target_ax.text(0.5, -0.1, metric_text, transform=target_ax.transAxes, ha="center", va="top", fontsize=7, bbox=dict(boxstyle="round", facecolor="wheat", alpha=0.5))
 
     plt.tight_layout(rect=(0, 0.02, 1, 0.96))  # type: ignore
     if save_path:
@@ -314,20 +383,52 @@ def plot_metric_correlation(tile_results: List[MetricDict], save_path: Optional[
     return fig
 
 
-def plot_single_comparison(original: "Image.Image", reconstructed: "Image.Image", title: str = "", save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (10, 5)) -> Optional["Figure"]:
+def plot_single_comparison(original: "Image.Image", reconstructed: "Image.Image", title: str = "", save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (15, 5), include_diff: bool = True) -> Optional["Figure"]:
+    """Plot Original | Reconstructed | SSIM diff heatmap for one tile pair.
+
+    Parameters
+    ----------
+    include_diff : bool
+        If *True* (default) a third panel shows the per-pixel SSIM map
+        rendered with the Crameri *vik* diverging colourmap.
+    """
     _check_matplotlib()
     setup_style()
     from quality_assurance.metrics import compute_all_metrics
     metrics = compute_all_metrics(original, reconstructed)
-    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    ncols = 3 if include_diff else 2
+    fig, axes = plt.subplots(1, ncols, figsize=figsize)
     if title:
         fig.suptitle(title, fontsize=12, fontweight="bold")
+
     axes[0].imshow(original)
     axes[0].set_title("Original")
     axes[0].axis("off")
+
     axes[1].imshow(reconstructed)
     axes[1].set_title("Reconstructed")
     axes[1].axis("off")
+
+    if include_diff:
+        try:
+            ssim_map = _compute_ssim_diff_map(original, reconstructed)
+            diff_cmap = get_crameri_cmap(DIVERGING_CMAP)
+            im = axes[2].imshow(ssim_map, cmap=diff_cmap, vmin=0, vmax=1)
+            axes[2].set_title("SSIM Map")
+            axes[2].axis("off")
+            fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+        except Exception:
+            # Fallback: plain absolute-difference image
+            orig_arr = np.asarray(original.convert("RGB"), dtype=np.float32)
+            recon_arr = np.asarray(reconstructed.convert("RGB"), dtype=np.float32)
+            diff = np.mean(np.abs(orig_arr - recon_arr), axis=2) / 255.0
+            diff_cmap = get_crameri_cmap(HEATMAP_CMAP)
+            im = axes[2].imshow(diff, cmap=diff_cmap, vmin=0, vmax=1)
+            axes[2].set_title("Absolute Diff")
+            axes[2].axis("off")
+            fig.colorbar(im, ax=axes[2], fraction=0.046, pad=0.04)
+
     metric_text = (f"MSE: {metrics['mse']:.2f}  |  " f"PSNR: {metrics['psnr']:.2f} dB  |  " f"SSIM: {metrics['ssim']:.4f}")
     fig.text(0.5, 0.02, metric_text, ha="center", va="bottom", fontsize=11, bbox=dict(boxstyle="round", facecolor="lightgray", alpha=0.8))
     plt.tight_layout(rect=(0, 0.08, 1, 0.95))  # type: ignore
@@ -340,15 +441,31 @@ def plot_single_comparison(original: "Image.Image", reconstructed: "Image.Image"
 
 
 def _canonical_patient_id(name: str) -> str:
-    name = Path(name).stem.upper()
+    """Extract TCGA-XX-XXXX patient ID, handling both long SVS and short names."""
+    stem = Path(name).stem.upper()
+    import re as _re
+    m = _re.match(r"(TCGA-[A-Z0-9]+-[A-Z0-9]+)", stem)
+    if m:
+        return m.group(1)
     for sep in ("_", "."):
-        name = name.replace(sep, "-")
-    while "--" in name:
-        name = name.replace("--", "-")
-    parts = name.split("-")
+        stem = stem.replace(sep, "-")
+    while "--" in stem:
+        stem = stem.replace("--", "-")
+    parts = stem.split("-")
     if len(parts) >= 3 and parts[0].startswith("TCGA"):
         return "-".join(parts[:3])
-    return name
+    return stem
+
+
+_COORD_RE_VIZ = __import__("re").compile(r"\(([\d.]+)[,_\s]+([\d.]+)\)")
+
+
+def _extract_coords_viz(name: str) -> Optional[Tuple[float, float]]:
+    """Extract ``(x, y)`` tile coordinates from a filename."""
+    m = _COORD_RE_VIZ.search(name)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    return None
 
 
 def _load_image_from_zip(zpath: Path, member: str) -> Image.Image:
@@ -409,31 +526,42 @@ def cli_main():
         with zipfile.ZipFile(rzip, "r") as rz, zipfile.ZipFile(gzip, "r") as gz:
             real_names = [n for n in rz.namelist() if n.lower().endswith((".png", ".jpg", ".jpeg"))]
             recon_names = [n for n in gz.namelist() if n.lower().endswith((".png", ".jpg", ".jpeg"))]
-            # match by basename intersection
-            real_basenames = [Path(n).name for n in real_names]
-            recon_basenames = [Path(n).name for n in recon_names]
-            basenames = set(real_basenames) & set(recon_basenames)
-            if basenames:
-                for b in sorted(basenames)[: args.max_pairs]:
-                    orig = Image.open(BytesIO(rz.read([n for n in real_names if Path(n).name == b][0]))).convert("RGB")
-                    recon = Image.open(BytesIO(gz.read([n for n in recon_names if Path(n).name == b][0]))).convert("RGB")
-                    tile_pairs.append(type("TP", (), {"original": orig, "reconstructed": recon}))
-                    metrics = compute_all_metrics(orig, recon)
-                    tile_results.append(metrics)
-                    patient_metrics.setdefault(pid, []).append(metrics)
+
+            # --- Strategy 1: exact basename match ---
+            real_basenames = {Path(n).name: n for n in real_names}
+            recon_basenames = {Path(n).name: n for n in recon_names}
+            common_basenames = set(real_basenames) & set(recon_basenames)
+
+            paired: List[Tuple[str, str]] = []  # (real_member, recon_member)
+            if common_basenames:
+                for b in sorted(common_basenames):
+                    paired.append((real_basenames[b], recon_basenames[b]))
             else:
-                # Fallback: if no matching basenames, try ordered pairing (first N files)
-                if not real_names or not recon_names:
-                    continue
-                print(f"[WARN] No basename intersection for patient {pid}; pairing by file order (may be incorrect)")
-                pairs = min(len(real_names), len(recon_names), args.max_pairs)
-                for i in range(pairs):
-                    orig = Image.open(BytesIO(rz.read(real_names[i]))).convert("RGB")
-                    recon = Image.open(BytesIO(gz.read(recon_names[i]))).convert("RGB")
-                    tile_pairs.append(type("TP", (), {"original": orig, "reconstructed": recon}))
-                    metrics = compute_all_metrics(orig, recon)
-                    tile_results.append(metrics)
-                    patient_metrics.setdefault(pid, []).append(metrics)
+                # --- Strategy 2: coordinate-based matching ---
+                orig_by_coord: Dict[Tuple[float, float], str] = {}
+                for n in real_names:
+                    c = _extract_coords_viz(Path(n).name)
+                    if c is not None:
+                        orig_by_coord[c] = n
+                for n in sorted(recon_names):
+                    c = _extract_coords_viz(Path(n).name)
+                    if c is not None and c in orig_by_coord:
+                        paired.append((orig_by_coord[c], n))
+
+                if not paired:
+                    # --- Strategy 3: ordered fallback ---
+                    if real_names and recon_names:
+                        print(f"[WARN] No basename/coord match for patient {pid}; pairing by file order")
+                        for rn, gn in zip(sorted(real_names), sorted(recon_names)):
+                            paired.append((rn, gn))
+
+            for real_member, recon_member in paired[: args.max_pairs]:
+                orig = Image.open(BytesIO(rz.read(real_member))).convert("RGB")
+                recon = Image.open(BytesIO(gz.read(recon_member))).convert("RGB")
+                tile_pairs.append(type("TP", (), {"original": orig, "reconstructed": recon}))
+                metrics = compute_all_metrics(orig, recon)
+                tile_results.append(metrics)
+                patient_metrics.setdefault(pid, []).append(metrics)
 
     # Generate requested plot(s)
     saved_any = False

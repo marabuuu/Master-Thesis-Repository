@@ -37,6 +37,10 @@ from .topological_frechet_distance import (
     compute_topofd_from_folders,
     TopoFDResult,
 )
+from .run_evaluation import (
+    run_evaluation,
+    load_config,
+)
 
 __all__ = [
     # Metrics
@@ -47,6 +51,8 @@ __all__ = [
     # Evaluation
     "ReconstructionEvaluator",
     "evaluate_patient_tiles",
+    "run_evaluation",
+    "load_config",
     # Visualization
     "plot_metrics_summary",
     "plot_comparison_grid",

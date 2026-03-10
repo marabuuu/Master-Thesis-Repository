@@ -31,6 +31,7 @@ Usage:
 import argparse
 import csv
 import json
+import re
 import zipfile
 from dataclasses import dataclass, field
 from io import BytesIO
@@ -100,16 +101,45 @@ class PatientResult:
 
 
 def canonical_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX patient ID from various filename formats."""
-    name = Path(name).stem.upper()
+    """Extract TCGA-XX-XXXX patient ID from various filename formats.
+
+    Handles both long SVS-derived names
+    (``TCGA-AR-A2LK-01Z-00-DX1.UUID.HASH.zip``)
+    and short reconstructed names (``TCGA-AR-A2LK.zip``).
+    """
+    stem = Path(name).stem.upper()
+    # Try TCGA regex first – most reliable
+    m = re.match(r"(TCGA-[A-Z0-9]+-[A-Z0-9]+)", stem)
+    if m:
+        return m.group(1)
+    # Fallback: normalise separators
     for sep in ("_", "."):
-        name = name.replace(sep, "-")
-    while "--" in name:
-        name = name.replace("--", "-")
-    parts = name.split("-")
+        stem = stem.replace(sep, "-")
+    while "--" in stem:
+        stem = stem.replace("--", "-")
+    parts = stem.split("-")
     if len(parts) >= 3 and parts[0].startswith("TCGA"):
         return "-".join(parts[:3])
-    return name
+    return stem
+
+
+# ------------------------------------------------------------------
+#  Coordinate-based tile matching helpers
+# ------------------------------------------------------------------
+
+_COORD_RE = re.compile(r"\(([\d.]+)[,_\s]+([\d.]+)\)")
+
+
+def _extract_coords(name: str) -> Optional[Tuple[float, float]]:
+    """Extract ``(x, y)`` coordinates embedded in a tile filename.
+
+    Handles originals like ``tile_(26386.952, 9222.624).png``
+    and reconstructed like ``reconstructed_00005_tile_(26386.952,_9222.624).png``.
+    """
+    m = _COORD_RE.search(name)
+    if m:
+        return (float(m.group(1)), float(m.group(2)))
+    return None
 
 
 def find_matching_zips(
@@ -184,22 +214,52 @@ def match_tiles(
     original_tiles: Dict[str, Image.Image],
     reconstructed_tiles: Dict[str, Image.Image],
 ) -> List[Tuple[str, Image.Image, Image.Image]]:
-    """
-    Match tiles by filename between original and reconstructed sets.
-    
+    """Match tiles between original and reconstructed sets.
+
+    First tries exact filename matching.  When that yields no hits the
+    function falls back to **coordinate-based matching**: it extracts
+    ``(x, y)`` coordinates embedded in the filenames and pairs tiles
+    whose coordinates agree.  This is necessary for genomic
+    reconstructions where filenames are prefixed with
+    ``reconstructed_NNNNN_``.
+
     Args:
         original_tiles: Dict of original tile name -> image
         reconstructed_tiles: Dict of reconstructed tile name -> image
-        
+
     Returns:
         List of (tile_name, original_image, reconstructed_image) tuples
     """
     matched = []
+
+    # --- Strategy 1: exact basename match ---
     common_names = set(original_tiles.keys()) & set(reconstructed_tiles.keys())
-    
-    for name in sorted(common_names):
-        matched.append((name, original_tiles[name], reconstructed_tiles[name]))
-    
+    if common_names:
+        for name in sorted(common_names):
+            matched.append((name, original_tiles[name], reconstructed_tiles[name]))
+        return matched
+
+    # --- Strategy 2: coordinate-based matching ---
+    # Build a lookup of original tiles by their embedded coordinates
+    orig_by_coord: Dict[Tuple[float, float], Tuple[str, Image.Image]] = {}
+    for name, img in original_tiles.items():
+        coords = _extract_coords(name)
+        if coords is not None:
+            orig_by_coord[coords] = (name, img)
+
+    for rname, rimg in sorted(reconstructed_tiles.items()):
+        coords = _extract_coords(rname)
+        if coords is not None and coords in orig_by_coord:
+            oname, oimg = orig_by_coord[coords]
+            matched.append((oname, oimg, rimg))
+
+    if not matched:
+        # --- Strategy 3: ordered pairing (last resort) ---
+        orig_sorted = sorted(original_tiles.items())
+        recon_sorted = sorted(reconstructed_tiles.items())
+        for (oname, oimg), (_, rimg) in zip(orig_sorted, recon_sorted):
+            matched.append((oname, oimg, rimg))
+
     return matched
 
 

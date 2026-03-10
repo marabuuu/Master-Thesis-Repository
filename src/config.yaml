@@ -1,4 +1,4 @@
-# python -m src.preprocessing.get_tiles_within_rois --config src/config.yaml
+# python run_pipeline.py --config src/config.yaml --stage evaluation
 preprocessing:
   zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/TCGA           
   roi_dir: /mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA     
@@ -54,11 +54,11 @@ training_stats:
   cmap_sequential: batlow     # Crameri colormap for sequential
 
 sampling:
-  ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning/genomic_finetune_v4/last.ckpt
+  ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt
   proj_ckpt: null          # optional separate projection head checkpoint
-  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/test
+  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
   tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all  # optional
-  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260304_finetune_vae_50epochs/sampling/random-noise
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/sampling/random-noise
   mode: random-noise       # choices: random-noise, encode-decode
   patient: TCGA-A1-A0SM         # optional specific patient ID (TCGA-XX-YYYY)
   tile_file: null          # optional single tile path (for encode-decode without zip dir)
@@ -72,3 +72,42 @@ sampling:
   proj_layers: 4
   proj_dropout: 0.1
   device: null             # null = auto-detect cuda/cpu
+
+evaluation:
+  # Directories for reconstruction quality assessment
+  original_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  reconstructed_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_genomic_images
+  
+  # Output locations
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance
+  plot_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance/plots
+  
+  # Patient filtering: optional list of specific TCGA patient IDs to evaluate
+  # Leave as null to evaluate all matching patients
+  patient_ids: null        # or e.g., [TCGA-A1-A0SM, TCGA-5L-AAT0, TCGA-5T-A9QA]
+  
+  # Metrics and results
+  save_csv: true           # save per-tile and per-patient CSV summaries
+  save_json: true          # save evaluation summary to JSON
+  
+  # Visualization options
+  plot_types:              # which plots to generate
+    - metrics_summary      # 2×3 histograms & box plots for MSE/PSNR/SSIM
+    - per_patient_metrics  # bar charts per patient
+    - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs
+    - metric_correlation   # scatter plots of metric pairs
+  
+  num_comparison_samples: 32  # max tile pairs to visualize in comparison grid
+  include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
+  
+  # Plot styling
+  figsize_metrics_summary: [14, 10]
+  figsize_per_patient: null   # auto-size based on patient count
+  figsize_comparison_grid: null  # auto-size based on num_cols × num_pairs
+  num_cols_comparison: 4      # columns in comparison grid
+  
+  # Colormaps (from Fabio Crameri scientific colormaps)
+  cmap_categorical: batlowS
+  cmap_sequential: batlow
+  cmap_diverging: vik         # for SSIM difference maps
+  cmap_heatmap: lajolla       # for fallback tile difference images
