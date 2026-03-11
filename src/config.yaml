@@ -111,3 +111,47 @@ evaluation:
   cmap_sequential: batlow
   cmap_diverging: vik         # for SSIM difference maps
   cmap_heatmap: lajolla       # for fallback tile difference images
+
+segmentation:
+  # Cell segmentation and topological analysis pipeline
+  # Step 1: Segment original (reference) tiles using DeepCMorph
+  # Step 2: Segment reconstructed tiles using the same model
+  # Step 3: Compute Topological Fréchet Distance (TopoFD) between the two sets
+  
+  reference_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  synthetic_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_genomic_images
+  
+  # Output directories for segmentation masks (one .npy per tile)
+  reference_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/reference_masks
+  synthetic_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/synthetic_masks
+  
+  # DeepCMorph configuration
+  num_classes: 32              # TCGA pre-trained model has 32 cell types
+  weights_dataset: TCGA        # use TCGA pre-trained weights
+  device: null                 # null = auto-detect cuda/cpu
+  batch_size: 4                # inference batch size (adjust based on GPU memory)
+  num_workers: 4               # parallel tile loading
+  
+  # Segmentation options
+  input_format: zip            # choices: zip (STAMP archives) or images (flat directory)
+  save_nuclei_seg: true        # save global nuclei segmentation mask
+  per_patient_dirs: true       # organize outputs by patient subdirectories
+  max_tiles_per_zip: null      # null = process all tiles per ZIP; else cap at N
+  
+  # Optional cell-type grouping (reduces 32 classes to fewer categories)
+  # Set to null to keep all 32 classes, or point to a JSON file like:
+  #   {"immune_cells": [0,1,2], "cancer_cells": [3,4,5], ...}
+  grouping_json: null
+  
+  # Topological Fréchet Distance (TopoFD) computation
+  topofd:
+    enabled: true                      # compute TopoFD after segmentation
+    use_alpha_complex: true            # use Alpha complex (faster) vs Rips
+    n_landscape_bins: 100              # persistence landscape resolution
+    n_landscape_layers: 1              # number of landscape layers
+    min_cells_per_image: 3             # skip images with fewer cells
+    
+    # Output
+    output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/topofd_results
+    save_detailed_report: true         # save per-channel and summary JSON
+    save_visualizations: false         # (requires persim + matplotlib)

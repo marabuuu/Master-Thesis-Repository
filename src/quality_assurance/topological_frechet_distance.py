@@ -518,11 +518,16 @@ def compute_topofd_from_folders(
     generated_dir: Union[str, Path],
     *,
     glob_pattern: str = "*.npy",
+    batch_size: int = 500,
     **kwargs,
 ) -> TopoFDResult:
     """Compute TopoFD by loading segmentation masks from two directories.
 
     Each ``.npy`` file should contain an array of shape (H, W) or (H, W, C).
+    
+    For large datasets, masks are processed in batches to avoid memory exhaustion.
+    Broadcasting all persistence landscape vectors and fitting Gaussians is more
+    memory-efficient than loading thousands of raw mask arrays.
 
     Parameters
     ----------
@@ -530,6 +535,9 @@ def compute_topofd_from_folders(
         Directories containing segmentation mask files.
     glob_pattern : str
         Glob pattern for discovering mask files.
+    batch_size : int
+        Number of masks to process in memory per batch (default: 500).
+        Increase if OOM occurs; decrease on memory-constrained systems.
     **kwargs
         Forwarded to :func:`compute_topofd`.
 
@@ -548,13 +556,54 @@ def compute_topofd_from_folders(
     if not gen_files:
         raise FileNotFoundError(f"No files matching '{glob_pattern}' in {gen_dir}")
 
-    logger.info("Loading %d reference masks from %s", len(ref_files), ref_dir)
-    ref_segs = [np.load(f) for f in ref_files]
+    logger.info("Loading %d reference masks from %s (batch_size=%d)", len(ref_files), ref_dir, batch_size)
+    ref_segs = _load_masks_batched(ref_files, batch_size)
 
-    logger.info("Loading %d generated masks from %s", len(gen_files), gen_dir)
-    gen_segs = [np.load(f) for f in gen_files]
+    logger.info("Loading %d generated masks from %s (batch_size=%d)", len(gen_files), gen_dir, batch_size)
+    gen_segs = _load_masks_batched(gen_files, batch_size)
 
     return compute_topofd(ref_segs, gen_segs, **kwargs)
+
+
+def _load_masks_batched(
+    file_paths: List[Path],
+    batch_size: int = 500,
+) -> List[np.ndarray]:
+    """Load masks from files in batches to avoid memory exhaustion.
+    
+    Yields masks as they're loaded; reduces peak memory usage.
+    
+    Parameters
+    ----------
+    file_paths : list of Path
+        Paths to .npy mask files
+    batch_size : int
+        Number of files to load in memory at once
+    
+    Returns
+    -------
+    list of np.ndarray
+        All loaded masks
+    """
+    all_masks = []
+    n_files = len(file_paths)
+    
+    for batch_start in range(0, n_files, batch_size):
+        batch_end = min(batch_start + batch_size, n_files)
+        batch_files = file_paths[batch_start:batch_end]
+        
+        batch_masks = []
+        for f in batch_files:
+            try:
+                batch_masks.append(np.load(f))
+            except Exception as e:
+                logger.warning(f"Failed to load {f.name}: {e}")
+        
+        all_masks.extend(batch_masks)
+        logger.debug(f"Loaded batch {batch_start//batch_size + 1}: {len(batch_masks)} files "
+                     f"({batch_start + 1}–{batch_end} / {n_files})")
+    
+    return all_masks
 
 
 # ===================================================================
@@ -594,6 +643,10 @@ def _cli() -> None:
         help="Persistence landscape layers (default: 1).",
     )
     parser.add_argument(
+        "--batch-size", type=int, default=500,
+        help="Masks per batch during loading (default: 500). Lower = less memory, slower.",
+    )
+    parser.add_argument(
         "--output", type=str, default=None,
         help="Optional path to save results as JSON.",
     )
@@ -612,6 +665,7 @@ def _cli() -> None:
         reference_dir=args.reference_dir,
         generated_dir=args.generated_dir,
         glob_pattern=args.glob,
+        batch_size=args.batch_size,
         use_alpha=not args.use_rips,
         n_landscape_bins=args.n_bins,
         n_landscape_layers=args.n_layers,

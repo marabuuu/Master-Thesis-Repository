@@ -240,9 +240,18 @@ class DeepCMorphSegmenter:
 
         # Otherwise try to find pretrained checkpoint in the DeepCMorph repo
         if path_to_checkpoint is None and weights_dataset in dataset_to_fname:
-            candidate = checkpoints_dir / dataset_to_fname[weights_dataset]
-            if candidate.exists():
-                path_to_checkpoint = str(candidate)
+            fname = dataset_to_fname[weights_dataset]
+            # Search several possible locations for the checkpoint
+            search_dirs = [
+                checkpoints_dir,                                       # DeepCMorph/pretrained_models/
+                Path(__file__).resolve().parents[3] / "models" / "DeepCMorph",  # models/DeepCMorph/
+            ]
+            for search_dir in search_dirs:
+                candidate = search_dir / fname
+                if candidate.exists():
+                    path_to_checkpoint = str(candidate)
+                    logger.info("Found checkpoint at %s", path_to_checkpoint)
+                    break
 
         if path_to_checkpoint is not None:
             self.model.load_weights(path_to_checkpoints=path_to_checkpoint)
