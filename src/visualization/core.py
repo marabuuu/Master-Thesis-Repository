@@ -108,6 +108,36 @@ def get_categorical_colors(
     return [mpl.colors.to_hex(cmap(i)) for i in indices]
 
 
+def build_label_palette(
+    labels: np.ndarray,
+    cmap_name: str = CATEGORICAL_CMAP,
+) -> Dict[str, str]:
+    """Map unique label strings to Crameri hex colours.
+    
+    Parameters
+    ----------
+    labels : np.ndarray
+        Array of label values (strings or objects).
+    cmap_name : str
+        Name of Crameri categorical colourmap (default: CATEGORICAL_CMAP).
+        
+    Returns
+    -------
+    dict
+        Dictionary mapping unique label strings to hex colour codes.
+        
+    Examples
+    --------
+    >>> labels = np.array(['A', 'B', 'C', 'A', 'B'])
+    >>> palette = build_label_palette(labels)
+    >>> palette['A']
+    '#FF00FF'
+    """
+    unique = sorted(np.unique(labels))
+    colours = get_categorical_colors(len(unique), cmap_name=cmap_name)
+    return dict(zip(unique, colours))
+
+
 # ===================================================================
 #  Plot styling
 # ===================================================================

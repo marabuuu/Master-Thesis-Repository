@@ -14,11 +14,17 @@ All metrics can operate on:
 - PyTorch tensors (C, H, W) or (B, C, H, W)
 """
 
-from typing import Dict, Optional, Tuple, Union
+from typing import TYPE_CHECKING, Dict, Optional, Tuple, Union
 
 import numpy as np
 from PIL import Image
 
+# For type checking only - helps IDE understand types
+if TYPE_CHECKING:
+    import torch
+    from skimage.metrics import structural_similarity as skimage_ssim
+
+# Runtime imports with graceful fallback
 try:
     import torch
     HAS_TORCH = True
@@ -26,7 +32,7 @@ except ImportError:
     HAS_TORCH = False
 
 try:
-    from skimage.metrics import structural_similarity as skimage_ssim
+    from skimage.metrics import structural_similarity as skimage_ssim  # type: ignore
     HAS_SKIMAGE = True
 except ImportError:
     HAS_SKIMAGE = False
@@ -48,7 +54,7 @@ def _to_numpy(img: ImageType) -> np.ndarray:
     """
     if isinstance(img, Image.Image):
         arr = np.array(img.convert("RGB"))
-    elif HAS_TORCH and isinstance(img, torch.Tensor):
+    elif HAS_TORCH and isinstance(img, torch.Tensor):  # type: ignore[union-attr]
         arr = img.detach().cpu().numpy()
         # Handle batch dimension
         if arr.ndim == 4:
@@ -209,13 +215,16 @@ def compute_ssim(
     
     if HAS_SKIMAGE:
         # Use scikit-image implementation
-        ssim_value = skimage_ssim(
+        ssim_value = skimage_ssim(  # type: ignore[operator]
             orig,
             recon,
             win_size=win_size,
             channel_axis=2 if multichannel else None,
             data_range=data_range,
         )
+        # skimage_ssim can return tuple (value, map) or scalar depending on version
+        if isinstance(ssim_value, tuple):
+            ssim_value = ssim_value[0]
         return float(ssim_value)
     else:
         # Fallback: simplified SSIM implementation
@@ -301,65 +310,4 @@ def compute_all_metrics(
     return results
 
 
-def compute_batch_metrics(
-    originals: list,
-    reconstructeds: list,
-) -> Dict[str, np.ndarray]:
-    """
-    Compute metrics for a batch of image pairs.
-    
-    Args:
-        originals: List of original images
-        reconstructeds: List of reconstructed images
-        
-    Returns:
-        Dictionary with arrays of metric values for each pair
-    """
-    if len(originals) != len(reconstructeds):
-        raise ValueError(
-            f"Batch sizes don't match: {len(originals)} vs {len(reconstructeds)}"
-        )
-    
-    mse_values = []
-    psnr_values = []
-    ssim_values = []
-    
-    for orig, recon in zip(originals, reconstructeds):
-        metrics = compute_all_metrics(orig, recon)
-        mse_values.append(metrics["mse"])
-        psnr_values.append(metrics["psnr"])
-        ssim_values.append(metrics["ssim"])
-    
-    return {
-        "mse": np.array(mse_values),
-        "psnr": np.array(psnr_values),
-        "ssim": np.array(ssim_values),
-    }
 
-
-def summarize_metrics(metrics: Dict[str, np.ndarray]) -> Dict[str, Dict[str, float]]:
-    """
-    Compute summary statistics for batch metrics.
-    
-    Args:
-        metrics: Dictionary of metric arrays from compute_batch_metrics
-        
-    Returns:
-        Dictionary with mean, std, min, max for each metric
-    """
-    summary = {}
-    for name, values in metrics.items():
-        values = np.array(values)
-        # Filter out infinities for PSNR
-        finite_values = values[np.isfinite(values)]
-        
-        summary[name] = {
-            "mean": float(np.mean(finite_values)) if len(finite_values) > 0 else float("nan"),
-            "std": float(np.std(finite_values)) if len(finite_values) > 0 else float("nan"),
-            "min": float(np.min(finite_values)) if len(finite_values) > 0 else float("nan"),
-            "max": float(np.max(finite_values)) if len(finite_values) > 0 else float("nan"),
-            "count": len(values),
-            "finite_count": len(finite_values),
-        }
-    
-    return summary

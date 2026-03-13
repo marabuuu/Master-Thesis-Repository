@@ -28,6 +28,7 @@ from .core import (
     SEQUENTIAL_CMAP,
     _check_matplotlib,
     _check_seaborn,
+    build_label_palette,
     get_categorical_colors,
     get_crameri_cmap,
     save_figure,
@@ -69,16 +70,6 @@ def _unwrap_embedding(raw: Any) -> np.ndarray:
     if hasattr(candidate, "toarray"):
         return candidate.toarray()  # type: ignore[union-attr]
     return np.asarray(candidate)
-
-
-def _build_palette(
-    labels: np.ndarray,
-    cmap_name: str = CATEGORICAL_CMAP,
-) -> Dict[str, str]:
-    """Map unique label strings to Crameri hex colours."""
-    unique = sorted(np.unique(labels))
-    colours = get_categorical_colors(len(unique), cmap_name=cmap_name)
-    return dict(zip(unique, colours))
 
 
 # ===================================================================
@@ -234,7 +225,7 @@ def plot_projection(
     _check_seaborn()
     setup_style()
 
-    palette = _build_palette(hue_labels, cmap_name)
+    palette = build_label_palette(hue_labels, cmap_name)
 
     tmp = pd.DataFrame(
         {"x": coords[:, 0], "y": coords[:, 1], "hue": hue_labels}
@@ -545,7 +536,7 @@ def plot_silhouette_per_group(
     labels = np.asarray(labels)
     sil_vals = silhouette_samples(X, labels, metric=metric)
 
-    palette = _build_palette(labels, cmap_name)
+    palette = build_label_palette(labels, cmap_name)
     tmp = pd.DataFrame({group_col_name: labels, "silhouette": sil_vals})
 
     fig, ax = plt.subplots(figsize=figsize)

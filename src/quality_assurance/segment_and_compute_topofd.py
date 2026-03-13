@@ -30,6 +30,9 @@ import argparse
 import subprocess
 from collections import defaultdict
 
+from .utils import extract_patient_id
+from .topological_frechet_distance import compute_topofd_from_folders
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 logger = logging.getLogger(__name__)
 
@@ -47,7 +50,7 @@ def discover_tiles_in_zip(zip_path: Path) -> Set[Tuple[str, str]]:
             for name in zf.namelist():
                 if name.lower().endswith(('.png', '.jpg', '.jpeg', '.tif', '.tiff')):
                     # Extract patient ID from zip name
-                    patient_id = _extract_patient_id(zip_path.stem)
+                    patient_id = extract_patient_id(zip_path.stem)
                     tile_basename = Path(name).name
                     tiles.add((patient_id, tile_basename))
     except Exception as e:
@@ -65,31 +68,15 @@ def discover_tiles_in_dir(dir_path: Path) -> Set[Tuple[str, str]]:
     tiles = set()
     for file_path in dir_path.iterdir():
         if file_path.suffix.lower() in {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}:
-            patient_id = _extract_patient_id_from_basename(file_path.name)
+            patient_id = extract_patient_id(file_path.name)
             tiles.add((patient_id, file_path.name))
     return tiles
 
 
-import re
-
-
-def _extract_patient_id(name: str) -> str:
-    """Extract a TCGA-style patient identifier from *anywhere* in the string.
-
-    The pattern we look for is ``TCGA-<group>-<sample>`` where ``<group>`` and
-    ``<sample>`` consist of alphanumeric characters.  The search is
-    case-insensitive and returns the first match.  If nothing is found,
-    ``'unknown'`` is returned.
-    """
-    m = re.search(r"(?i)(TCGA-[A-Z0-9]+-[A-Z0-9]+)", name)
-    if m:
-        return m.group(1).upper()
-    return 'unknown'
-
-
-def _extract_patient_id_from_basename(basename: str) -> str:
-    """Extract patient ID from a tile basename using the same regex logic."""
-    return _extract_patient_id(basename)
+try:
+    from .utils import extract_patient_id
+except Exception:
+    from quality_assurance.utils import extract_patient_id
 
 
 def discover_synthetic_tiles(synthetic_dir: Path) -> Set[Tuple[str, str]]:
@@ -140,7 +127,7 @@ def filter_reference_zips(
     logger.info(f"Filtering {len(zip_files)} reference ZIPs against synthetic patients")
     
     for zip_path in zip_files:
-        patient_id = _extract_patient_id(zip_path.stem)
+        patient_id = extract_patient_id(zip_path.stem)
         if patient_id.lower() in patient_ids:
             # keep entire archive unmodified
             try:
@@ -364,24 +351,28 @@ def run_topofd(
             f"  Synthetic: {syn_count} files"
         )
     
+    # Compute TopoFD directly (no subprocess)
+    logger.info(f"\nComputing Topological Fréchet Distance...")
+    result = compute_topofd_from_folders(
+        reference_dir=reference_masks_dir,
+        generated_dir=synthetic_masks_dir,
+        n_landscape_bins=n_bins,
+        n_landscape_layers=n_layers,
+        verbose=True,
+    )
+    
     # Save results to a JSON file in output_dir
+    output_dir.mkdir(parents=True, exist_ok=True)
     output_file = output_dir / "topofd_results.json"
     
-    cmd = [
-        'python', '-m', 'src.quality_assurance.topological_frechet_distance',
-        '--reference-dir', str(reference_masks_dir),
-        '--generated-dir', str(synthetic_masks_dir),
-        '--output', str(output_file),
-        '--n-bins', str(n_bins),
-        '--n-layers', str(n_layers),
-        '--verbose',
-    ]
-    
-    logger.info(f"\nRunning: {' '.join(cmd)}")
-    result = subprocess.run(cmd, cwd=Path(__file__).parent.parent.parent)
-    
-    if result.returncode != 0:
-        raise RuntimeError(f"TopoFD computation failed with exit code {result.returncode}")
+    with open(output_file, "w") as f:
+        json.dump({
+            "topofd": float(result.topofd),
+            "per_channel": {str(k): float(v) for k, v in result.per_channel.items()},
+            "n_reference": result.n_reference,
+            "n_generated": result.n_generated,
+            "n_channels": result.n_channels,
+        }, f, indent=2)
     
     logger.info(f"✅ TopoFD computation complete. Results saved to {output_file}")
 

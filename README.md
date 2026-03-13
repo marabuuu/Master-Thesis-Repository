@@ -5,11 +5,22 @@
 ```
 Master-Thesis-Repository/
 ├── src/                           # Main source code
-│   ├── quality_assurance/         # Evaluation metrics, segmentation, topological analysis
+│   ├── joint_training/            # Joint Genomic VAE + Diffusion training
+│   │   ├── train.py               # Training orchestration
+│   │   ├── model.py               # JointLitModel implementation
+│   │   ├── dataset.py             # GenomicTileDataset
+│   │   └── JOINT_TRAINING_SUMMARY.md
+│   ├── quality_assurance/         # Evaluation: metrics, segmentation, topological analysis
+│   │   ├── evaluate_reconstruction.py
+│   │   ├── topological_frechet_distance.py
+│   │   ├── segment_and_compute_topofd.py
+│   │   ├── metrics.py
+│   │   ├── utils.py               # Shared utilities
+│   │   └── EVALUATION_GUIDE.md
 │   ├── encoding/                  # Genomic feature encoding, VAE training
 │   ├── classifier/                # Cell segmentation (DeepCMorph)
 │   ├── preprocessing/             # Data preparation utilities
-│   ├── finetune_diffusion/        # Diffusion model fine-tuning
+│   ├── finetune_diffusion/        # Diffusion model fine-tuning (legacy)
 │   ├── visualization/             # Plotting and visualization helpers
 │   ├── statistics/                # Statistical analysis
 │   └── config.yaml                # Central configuration file
@@ -24,9 +35,9 @@ Master-Thesis-Repository/
 │
 ├── run_pipeline.py                # Main entry point for pipeline execution
 │
-├── compare_ablation.py            # Ablation study comparison script
+├── CODE_CLEANUP_ANALYSIS.md       # Detailed code review and consolidation report
 │
-├── EVALUATION_GUIDE.md            # Detailed evaluation methodology
+├── CLEANUP_SUMMARY.md             # Summary of recent refactoring
 │
 ├── pyproject.toml                 # Project metadata & dependencies
 │

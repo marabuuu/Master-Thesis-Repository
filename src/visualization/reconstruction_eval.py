@@ -44,11 +44,12 @@ except Exception:
 
 try:
     from .core import (
-        get_crameri_cmap,
+        _check_matplotlib,
         get_categorical_colors,
-        setup_style as _core_setup_style,
-        save_figure as _core_save_figure,
-        show_or_save as _core_show_or_save,
+        get_crameri_cmap,
+        save_figure,
+        setup_style,
+        show_or_save,
         HAS_CRAMERI,
         DIVERGING_CMAP,
         HEATMAP_CMAP,
@@ -65,11 +66,40 @@ except Exception:
     def get_crameri_cmap(name: str):  # type: ignore[misc]
         import matplotlib as _mpl
         return _mpl.colormaps.get(name, _mpl.colormaps["viridis"])
-
-
-def _check_matplotlib():
-    if not HAS_MATPLOTLIB:
-        raise ImportError("matplotlib is required for visualization. Install it with: pip install matplotlib")
+    
+    def _check_matplotlib():
+        if not HAS_MATPLOTLIB:
+            raise ImportError("matplotlib is required for visualization. Install it with: pip install matplotlib")
+    
+    def setup_style():
+        _check_matplotlib()
+        plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "seaborn-whitegrid")
+        plt.rcParams.update({
+            "figure.figsize": (12, 8),
+            "figure.dpi": 100,
+            "savefig.dpi": 150,
+            "font.size": 10,
+            "axes.titlesize": 12,
+            "axes.labelsize": 10,
+            "legend.fontsize": 9,
+        })
+    
+    def save_figure(fig: "Figure", save_path: Union[str, Path], close: bool = True) -> None:
+        _check_matplotlib()
+        save_path = Path(save_path)
+        save_path.parent.mkdir(parents=True, exist_ok=True)
+        fig.savefig(save_path, bbox_inches="tight", facecolor="white", edgecolor="none")
+        print(f"[OK] Saved figure: {save_path}")
+        if close:
+            plt.close(fig)
+    
+    def show_or_save(fig, save_path=None, show=True, close=True):
+        if save_path:
+            save_figure(fig, save_path, close=False)
+        if show:
+            plt.show()
+        if close:
+            plt.close(fig)
 
 
 def _get_colors():
@@ -108,30 +138,6 @@ def _compute_ssim_diff_map(
     )
     # Average across colour channels → single spatial map
     return np.mean(ssim_map, axis=2)
-
-
-def setup_style():
-    _check_matplotlib()
-    plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "seaborn-whitegrid")
-    plt.rcParams.update({
-        "figure.figsize": (12, 8),
-        "figure.dpi": 100,
-        "savefig.dpi": 150,
-        "font.size": 10,
-        "axes.titlesize": 12,
-        "axes.labelsize": 10,
-        "legend.fontsize": 9,
-    })
-
-
-def save_figure(fig: "Figure", save_path: Union[str, Path], close: bool = True) -> None:
-    _check_matplotlib()
-    save_path = Path(save_path)
-    save_path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(save_path, bbox_inches="tight", facecolor="white", edgecolor="none")
-    print(f"[OK] Saved figure: {save_path}")
-    if close:
-        plt.close(fig)
 
 
 def plot_metrics_summary(tile_results: List[MetricDict], save_path: Optional[Union[str, Path]] = None, show: bool = False, figsize: Tuple[float, float] = (14, 10)) -> Optional["Figure"]:

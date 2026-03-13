@@ -43,19 +43,13 @@ from PIL import Image
 from tqdm import tqdm
 
 try:
-    from .metrics import (
-        compute_all_metrics,
-        compute_batch_metrics,
-        summarize_metrics,
-    )
+    from .metrics import compute_all_metrics
+    from .utils import extract_patient_id
 except Exception:
     # Allow running the script directly (not as a package) by falling
     # back to absolute import when the relative import fails.
-    from quality_assurance.metrics import (
-        compute_all_metrics,
-        compute_batch_metrics,
-        summarize_metrics,
-    )
+    from quality_assurance.metrics import compute_all_metrics
+    from quality_assurance.utils import extract_patient_id
 try:
     from visualization.reconstruction_eval import plot_metrics_summary, plot_per_patient_metrics, plot_comparison_grid, plot_metric_correlation, plot_single_comparison
 except ImportError:
@@ -100,27 +94,8 @@ class PatientResult:
         }
 
 
-def canonical_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX patient ID from various filename formats.
-
-    Handles both long SVS-derived names
-    (``TCGA-AR-A2LK-01Z-00-DX1.UUID.HASH.zip``)
-    and short reconstructed names (``TCGA-AR-A2LK.zip``).
-    """
-    stem = Path(name).stem.upper()
-    # Try TCGA regex first – most reliable
-    m = re.match(r"(TCGA-[A-Z0-9]+-[A-Z0-9]+)", stem)
-    if m:
-        return m.group(1)
-    # Fallback: normalise separators
-    for sep in ("_", "."):
-        stem = stem.replace(sep, "-")
-    while "--" in stem:
-        stem = stem.replace("--", "-")
-    parts = stem.split("-")
-    if len(parts) >= 3 and parts[0].startswith("TCGA"):
-        return "-".join(parts[:3])
-    return stem
+# Patient ID extraction now consolidated in utils.py
+# Use: from .utils import extract_patient_id
 
 
 # ------------------------------------------------------------------
