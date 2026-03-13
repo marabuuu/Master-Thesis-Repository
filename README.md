@@ -1,9 +1,37 @@
 # Master-Thesis-Repository
-This repository hosts code for my master thesis entitled "Generation of synthetic histology H&E patches of breast cancer from RNA-seq data using diffusion models"
 
-_Hypothesis_: The difference between Luminal A and Basal-like molecular subtype can be preserved when generating synthetic histology H&E patches.
+## Project Structure
 
-## Project Structure 
+```
+Master-Thesis-Repository/
+├── src/                           # Main source code
+│   ├── quality_assurance/         # Evaluation metrics, segmentation, topological analysis
+│   ├── encoding/                  # Genomic feature encoding, VAE training
+│   ├── classifier/                # Cell segmentation (DeepCMorph)
+│   ├── preprocessing/             # Data preparation utilities
+│   ├── finetune_diffusion/        # Diffusion model fine-tuning
+│   ├── visualization/             # Plotting and visualization helpers
+│   ├── statistics/                # Statistical analysis
+│   └── config.yaml                # Central configuration file
+│
+├── notebooks/                     # Jupyter notebooks for exploration & analysis
+│
+├── slurm/                         # HPC job submission scripts
+│
+├── tests/                         # Unit tests
+│
+├── plots/                         # Generated visualizations & results
+│
+├── run_pipeline.py                # Main entry point for pipeline execution
+│
+├── compare_ablation.py            # Ablation study comparison script
+│
+├── EVALUATION_GUIDE.md            # Detailed evaluation methodology
+│
+├── pyproject.toml                 # Project metadata & dependencies
+│
+└── README.md                      # This file
+```
 
 ## Getting Started
 

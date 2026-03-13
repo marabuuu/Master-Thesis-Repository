@@ -1,4 +1,75 @@
-# python run_pipeline.py --config src/config.yaml --stage evaluation
+# python run_pipeline.py --config src/config.yaml --stage joint_training
+#
+# ─── Joint Genomic VAE + Diffusion Training ─────────────────────────────
+# Subclasses mopadi's LitModel. The genomic VAE replaces image feature
+# extractors; everything else (EMA, scheduler, checkpointing, DDP) is
+# inherited from mopadi.
+#
+joint_training:
+  # ── Data ──────────────────────────────────────────────────────────────
+  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
+  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA       # non-numeric column to drop from gene data
+  gene_list_path: null                    # optional: path to .txt with one gene per line
+  max_tiles_per_patient: null             # null = use all tiles
+  val_fraction: 0.1
+  test_fraction: 0.1                      # held out entirely for later evaluation
+
+  # ── Output ────────────────────────────────────────────────────────────
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/joint_training
+  latent_dir: null                        # where to save h5 latent features (default: out_dir/latents)
+
+  # ── Genomic VAE ───────────────────────────────────────────────────────
+  latent_dim: 512                         # VAE latent dimension
+  vae_hidden_dims: [2048, 1024]           # encoder hidden layers (decoder mirrors)
+  vae_dropout: 0.2
+  lambda_vae: 1.0                         # weight of VAE loss vs diffusion loss
+  beta_mmd: 1.0                           # weight of MMD regularization within VAE loss
+  vae_ckpt: null                          # optional: pre-trained VAE checkpoint
+
+  # ── Projection Head ───────────────────────────────────────────────────
+  cond_dim: 512                           # must match UNet embed_channels
+  proj_hidden_dim: 512
+  proj_layers: 2
+  proj_dropout: 0.1
+
+  # ── Diffusion UNet (mopadi architecture) ──────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_num_res_blocks: 2
+  T: 1000                                 # diffusion timesteps
+  T_eval: 20                              # DDIM steps for sampling / visualization
+  sample_size: 8                          # images to generate for TensorBoard
+  diffusion_ckpt: null                    # optional: pre-trained mopadi checkpoint
+
+  # ── Training ──────────────────────────────────────────────────────────
+  batch_size: 2
+  lr: 1e-4                                # default LR for all components
+  vae_lr: 1e-3                            # VAE-specific LR (higher is often better)
+  proj_lr: 3e-4                           # projection head LR
+  unet_lr: 1e-5                           # UNet LR (low if using pre-trained ckpt)
+  optimizer: adam                          # adam | adamw
+  weight_decay: 0.0
+  warmup_steps: 500
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  accumulate_grad_batches: 1
+  num_workers: 4
+  fp16: false
+  seed: 42
+  gpus: [0]
+
+  # ── Scheduling (mopadi-style: sample-count based) ─────────────────────
+  epochs: 100                             # max epochs (safety cap)
+  total_samples: 200000000                # training duration in total samples seen
+  steps_per_epoch: 5000                   # batches per PL epoch
+  save_every_samples: 200000              # checkpoint frequency
+  reconstruct_every_samples: 50000        # sample visualization frequency
+
+# ─── Existing pipeline stages ───────────────────────────────────────────
+
 preprocessing:
   zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/TCGA           
   roi_dir: /mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA     
@@ -76,11 +147,11 @@ sampling:
 evaluation:
   # Directories for reconstruction quality assessment
   original_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
-  reconstructed_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_genomic_images
+  reconstructed_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_no_genomics_ablation
   
   # Output locations
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance
-  plot_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance/plots
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance_no_genomics_ablation
+  plot_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance_no_genomics_ablation/plots
   
   # Patient filtering: optional list of specific TCGA patient IDs to evaluate
   # Leave as null to evaluate all matching patients

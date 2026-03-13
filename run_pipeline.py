@@ -40,6 +40,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"[INFO] Encoding stage not yet configured in this CLI")
         print(f"       Run: python -m src.encoding.encode_genomics --config {config_path}")
     
+    elif stage == "joint_training":
+        from src.joint_training.train import run_joint_training
+        if "joint_training" not in config:
+            raise ValueError("No 'joint_training' section in config.yaml")
+        run_joint_training(config["joint_training"], verbose=verbose)
+
     elif stage == "training":
         print(f"[INFO] Training stage not yet configured in this CLI")
         print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
@@ -93,7 +99,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "training", "sampling", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "joint_training", "training", "sampling", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

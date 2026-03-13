@@ -45,7 +45,7 @@ dependencies = [
 package = true
 
 [tool.uv.sources]
-mopadi = { path = "../mopadi" }
+mopadi = { git = "https://github.com/marabuuu/mopadi.git", rev = "11ccaca94abf95d6fbecdd185b6ef8b7c47ff78d" }
 TopoCellGen = { path = "../TopoCellGen"}
 
 [build-system]
