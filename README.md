@@ -1,5 +1,7 @@
 # Master-Thesis-Repository
 
+This repository contains code for my Master Thesis entitled "Reconstructing histological images from genomic data using diffusion models".
+
 ## Project Structure
 
 ```

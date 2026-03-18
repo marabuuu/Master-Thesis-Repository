@@ -11,16 +11,3 @@ The key innovation is that **the VAE latent representation directly conditions t
 
 ---
 
-## System Architecture
-
-```
-┌─────────────────────────────────────────────────────────────────┐
-│                        ONE TRAINING STEP                        │
-└─────────────────────────────────────────────────────────────────┘
-
-INPUT DATA
-  ├─ Gene Expression CSV:    (n_patients, ~19000 genes)
-  └─ Tile Images (ZIP):      (many tiles per patient, 512×512 RGB)
-```
-
-For full architecture details and training dynamics, see [JOINT_TRAINING_SUMMARY.md](JOINT_TRAINING_SUMMARY.md) in the src/joint_training directory.
