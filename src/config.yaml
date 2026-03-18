@@ -1,10 +1,40 @@
 # python run_pipeline.py --config src/config.yaml --stage joint_training
-#
-# ─── Joint Genomic VAE + Diffusion Training ─────────────────────────────
-# Subclasses mopadi's LitModel. The genomic VAE replaces image feature
-# extractors; everything else (EMA, scheduler, checkpointing, DDP) is
-# inherited from mopadi.
-#
+
+preprocessing:
+  zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/TCGA           
+  roi_dir: /mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA     
+  save_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  target_mpp: 0.5                        # scale annotations into this pixel space
+  native_slide_mpp: 0.25                 # microns/pixel of original slide
+  num_workers: 8
+  plots: true                            # produce diagnostic plots
+  area_threshold: 0.6                    # overlap threshold for selection
+  selection_mode: overlap                # choices: center, overlap, both
+  annotation_buffer: 0.0                 # expand annotation for center test
+
+encoding:
+  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
+  gene_list_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/encoding/gene_list.txt
+  target_genes: 512
+  min_nonzero: 5
+  corr_threshold: 0.90
+  force_pam50: true
+  pam50_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/PAM50_gene_list.txt
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+training:
+  diffusion_ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
+  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train
+  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260303_finetune_vae/try
+  epochs: 50
+  batch_size: 2
+  val_fraction: 0.1
+  early_stopping_patience: 5
+  lr: 1e-5
+
 joint_training:
   # ── Data ──────────────────────────────────────────────────────────────
   csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
@@ -68,52 +98,22 @@ joint_training:
   save_every_samples: 200000              # checkpoint frequency
   reconstruct_every_samples: 50000        # sample visualization frequency
 
-# ─── Existing pipeline stages ───────────────────────────────────────────
+extract_joint_latents:
+  ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
+  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/encoding_latents
+  split: all                              # train, val, test, or all
 
-preprocessing:
-  zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/TCGA           
-  roi_dir: /mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA     
-  save_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
-  target_mpp: 0.5                        # scale annotations into this pixel space
-  native_slide_mpp: 0.25                 # microns/pixel of original slide
-  num_workers: 8
-  plots: true                            # produce diagnostic plots
-  area_threshold: 0.6                    # overlap threshold for selection
-  selection_mode: overlap                # choices: center, overlap, both
-  annotation_buffer: 0.0                 # expand annotation for center test
-
-encoding:
+visualize_latents:
+  latent_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/encoding_latents
   csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
-  gene_list_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/encoding/gene_list.txt
-  target_genes: 512
-  min_nonzero: 5
-  corr_threshold: 0.90
-  force_pam50: true
-  pam50_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/PAM50_gene_list.txt
+  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/patient_splits.json
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/latent_plots
   patient_col: Patient_ID
-  subtype_col: Majority_Subtype_mRNA
-
-foxa1_encoding:
-  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/encoding
-  patient_col: Patient_ID
-  feature_dim: 512
-
-training:
-  diffusion_ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
-  genomic_h5_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train
-  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
-  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260303_finetune_vae/try
-  epochs: 50
-  batch_size: 2
-  val_fraction: 0.1
-  early_stopping_patience: 5
-  lr: 1e-5
+  label_col: Majority_Subtype_mRNA
 
 training_stats:
-  logdir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning/genomic_finetune_v4
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260302_gene_subselection/finetuning
+  logdir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/training_stats
   plots:
     - loss_curves          # epoch-level train & val loss
     - batch_trajectory     # per-step loss across all epochs
@@ -146,16 +146,16 @@ sampling:
 
 evaluation:
   # Directories for reconstruction quality assessment
-  original_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
-  reconstructed_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_no_genomics_ablation
+  original_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_random_noise/original_samples
+  reconstructed_zip_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_random_noise/reconstructed_samples
   
   # Output locations
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance_no_genomics_ablation
-  plot_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/quality_assurance_no_genomics_ablation/plots
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/evaluation_random_noise
+  plot_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/evaluation_random_noise/plots
   
   # Patient filtering: optional list of specific TCGA patient IDs to evaluate
   # Leave as null to evaluate all matching patients
-  patient_ids: null        # or e.g., [TCGA-A1-A0SM, TCGA-5L-AAT0, TCGA-5T-A9QA]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]         # or e.g., [TCGA-A1-A0SM, TCGA-5L-AAT0, TCGA-5T-A9QA]
   
   # Metrics and results
   save_csv: true           # save per-tile and per-patient CSV summaries
@@ -168,7 +168,7 @@ evaluation:
     - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs
     - metric_correlation   # scatter plots of metric pairs
   
-  num_comparison_samples: 32  # max tile pairs to visualize in comparison grid
+  num_comparison_samples: 16  # max tile pairs to visualize in comparison grid
   include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
   
   # Plot styling
@@ -189,12 +189,12 @@ segmentation:
   # Step 2: Segment reconstructed tiles using the same model
   # Step 3: Compute Topological Fréchet Distance (TopoFD) between the two sets
   
-  reference_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
-  synthetic_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/reconstruct_1k_genomic_images
+  reference_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_image_guided/original_samples
+  synthetic_tiles_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_image_guided/reconstructed_samples
   
   # Output directories for segmentation masks (one .npy per tile)
-  reference_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/reference_masks
-  synthetic_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/synthetic_masks
+  reference_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/segmentation/reference_masks
+  synthetic_masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/segmentation/synthetic_masks
   
   # DeepCMorph configuration
   num_classes: 32              # TCGA pre-trained model has 32 cell types
@@ -214,6 +214,12 @@ segmentation:
   #   {"immune_cells": [0,1,2], "cancer_cells": [3,4,5], ...}
   grouping_json: null
   
+  # Segmentation Visualization
+  # Creates comparison grids showing reference vs synthetic tiles with overlaid masks
+  save_visualizations: true                          # create visual comparison plots
+  num_visualization_samples: 1                       # how many tiles per patient to visualize
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/segmentation/visualizations  # where to save plots
+  
   # Topological Fréchet Distance (TopoFD) computation
   topofd:
     enabled: true                      # compute TopoFD after segmentation
@@ -223,6 +229,31 @@ segmentation:
     min_cells_per_image: 3             # skip images with fewer cells
     
     # Output
-    output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_mopadi_training_attempt_from_scratch/segmentation/topofd_results
+    output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/segmentation/topofd_results
     save_detailed_report: true         # save per-channel and summary JSON
     save_visualizations: false         # (requires persim + matplotlib)
+
+# ─── Tile Reconstruction from Genomic Features ──────────────────────────
+
+reconstruction:
+  # ── Model Checkpoint ──────────────────────────────────────────────────
+  checkpoint_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
+  
+  # ── Data Input ────────────────────────────────────────────────────────
+  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
+  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  patient_col: Patient_ID
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]  # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/patient_splits.json  # optional: required if patient_ids is a split name
+  
+  # ── Reconstruction Parameters ─────────────────────────────────────────
+  n_tiles_per_patient: 2    # number of tiles to sample per patient
+  mode: random_noise         # choices: image_guided, random_noise
+  investigate: false         # save intermediate noising steps for visualization
+  
+  # ── Output ────────────────────────────────────────────────────────────
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_random_noise
+  
+  # ── Execution ─────────────────────────────────────────────────────────
+  device: null               # null = auto-detect cuda/cpu
+  batch_size: 1              # reconstructions are single-tile (no batching needed)

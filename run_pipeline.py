@@ -40,6 +40,35 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"[INFO] Encoding stage not yet configured in this CLI")
         print(f"       Run: python -m src.encoding.encode_genomics --config {config_path}")
     
+    elif stage == "extract_joint_latents":
+        from src.joint_training.train import extract_latents
+        if "extract_joint_latents" not in config:
+            raise ValueError("No 'extract_joint_latents' section in config.yaml")
+        if "joint_training" not in config:
+            raise ValueError("No 'joint_training' section in config.yaml to provide model definitions")
+            
+        joint_cfg = config["joint_training"].copy()
+        extract_cfg = config["extract_joint_latents"]
+        
+        # Enforce output directory override
+        joint_cfg["latent_dir"] = extract_cfg.get("out_dir")
+        
+        if verbose:
+            print(f"[INFO] Extracting joint latents from {extract_cfg.get('ckpt')}...")
+            
+        extract_latents(
+            joint_cfg=joint_cfg,
+            ckpt_path=extract_cfg.get("ckpt"),
+            split=extract_cfg.get("split", "all"),
+            verbose=verbose
+        )
+    
+    elif stage == "visualize_latents":
+        from src.visualization.visualize_latents import run_visualizations
+        if "visualize_latents" not in config:
+            raise ValueError("No 'visualize_latents' section in config.yaml")
+        run_visualizations(config["visualize_latents"], verbose=verbose)
+    
     elif stage == "joint_training":
         from src.joint_training.train import run_joint_training
         if "joint_training" not in config:
@@ -50,9 +79,33 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"[INFO] Training stage not yet configured in this CLI")
         print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
     
+    elif stage == "training_stats":
+        # This stage wraps src.statistics.training_curves CLI using the provided config
+        from src.statistics import training_curves
+        if "training_stats" not in config:
+            raise ValueError("No 'training_stats' section in config.yaml")
+        old_argv = sys.argv
+        try:
+            sys.argv = [old_argv[0], "--config", config_path]
+            training_curves.main()
+        finally:
+            sys.argv = old_argv
+
     elif stage == "sampling":
         print(f"[INFO] Sampling stage not yet configured in this CLI")
         print(f"       Run: python -m src.sampling.sample_from_model --config {config_path}")
+    
+    elif stage == "reconstruction":
+        from src.reconstruction import run_reconstruction
+        if "reconstruction" not in config:
+            raise ValueError("No 'reconstruction' section in config.yaml")
+        run_reconstruction(config["reconstruction"], verbose=verbose)
+    
+    elif stage == "segmentation":
+        from src.classifier.segment_and_classify_cells import run_segmentation
+        if "segmentation" not in config:
+            raise ValueError("No 'segmentation' section in config.yaml")
+        run_segmentation(config["segmentation"], verbose=verbose)
     
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
@@ -68,7 +121,9 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
                     return
     
     else:
-        raise ValueError(f"Unknown stage: {stage}. Choose from: preprocessing, encoding, training, sampling, evaluation, all")
+        raise ValueError(
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, training_stats, sampling, reconstruction, segmentation, evaluation, all"
+        )
 
 
 def main():
@@ -99,7 +154,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "joint_training", "training", "sampling", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "training_stats", "sampling", "reconstruction", "segmentation", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
