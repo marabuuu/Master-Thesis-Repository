@@ -133,12 +133,8 @@ def parse_tensorboard_events(
         return _empty_run()
 
     if tags is None:
-        # Common tags produced by the diffusion finetuning script
-        tags = [
-            "loss", "loss_step", "loss_epoch", "train/loss",
-            "val_loss", "val_loss_epoch",
-            "lr-AdamW", "lr-AdamW/pg1", "lr-AdamW/pg2",
-        ]
+        # If not specified, examine all available tags
+        tags = available_tags
 
     run = _empty_run()
 
@@ -152,17 +148,17 @@ def parse_tensorboard_events(
         # Map tag → TrainingRun key
         tag_lower = tag.lower().replace("/", "_").replace("-", "_")
 
-        if tag_lower in ("loss_epoch", "train_loss"):
+        if tag_lower in ("loss_epoch", "train_loss", "train_loss_epoch", "train_loss_epoch"):
             run["loss_epoch"] = values
             # Derive epoch indices (Lightning logs once per epoch for
             # on_epoch=True metrics)
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
-        elif tag_lower == "val_loss" or tag_lower == "val_loss_epoch":
+        elif tag_lower in ("val_loss", "val_loss_epoch", "valid_loss", "val_loss_epoch"):
             run["val_loss"] = values
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
-        elif tag_lower == "loss" or tag_lower == "loss_step":
+        elif tag_lower in ("loss", "loss_step", "train_loss_step"):
             run["loss_step"] = values
             run["step_numbers"] = steps
         elif "lr" in tag_lower:
@@ -476,6 +472,49 @@ def parse_experiment_dir(
     if tb_run.get("lr"):
         run["lr"] = tb_run["lr"]
         run["lr_steps"] = tb_run["lr_steps"]
+
+    # --- INFER MISSING EPOCH METRICS FROM STEP METRICS ---
+    if not run.get("loss_epoch") and run.get("loss_step"):
+        step_losses = run["loss_step"]
+        boundaries = run.get("epoch_step_boundaries", [])
+        inferred_epochs = []
+        
+        if boundaries and len(boundaries) > 1:
+            for i in range(len(boundaries) - 1):
+                chunk = step_losses[boundaries[i]:boundaries[i+1]]
+                if chunk: inferred_epochs.append(sum(chunk) / len(chunk))
+            last_chunk = step_losses[boundaries[-1]:]
+            if last_chunk: inferred_epochs.append(sum(last_chunk) / len(last_chunk))
+        else:
+            # Try to infer the number of epochs from checkpoint filenames (if any).
+            # If we have a checkpoint named `epoch=99-step=500000.ckpt`, we can use
+            # that to set a realistic epoch count instead of an arbitrary 50.
+            n_epochs = None
+            for ckpt in Path(logdir).glob("epoch=*.ckpt"):
+                m = re.search(r"epoch=(\d+)", ckpt.name)
+                if m:
+                    epoch_id = int(m.group(1))
+                    if n_epochs is None or epoch_id + 1 > n_epochs:
+                        n_epochs = epoch_id + 1
+
+            if n_epochs is None:
+                n_epochs = min(50, len(step_losses))
+
+            # Ensure we have at most one loss value per epoch
+            n_epochs = min(n_epochs, len(step_losses))
+
+            chunk_size = len(step_losses) // n_epochs
+            for i in range(n_epochs):
+                start = i * chunk_size
+                end = (i + 1) * chunk_size if i < n_epochs - 1 else len(step_losses)
+                chunk = step_losses[start:end]
+                if chunk:
+                    inferred_epochs.append(sum(chunk) / len(chunk))
+
+        run["loss_epoch"] = inferred_epochs
+        if not run.get("epochs") or len(run["epochs"]) != len(inferred_epochs):
+            run["epochs"] = list(range(len(inferred_epochs)))
+        run["meta"]["inferred_epoch_loss"] = True
 
     # Merge metadata
     for src in (tb_run, log_run):

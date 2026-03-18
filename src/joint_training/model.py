@@ -133,6 +133,7 @@ class JointLitModel(LitModel):
     """
 
     def __init__(self, conf: TrainConfig, joint_cfg: dict, n_genes: int):
+        self.save_hyperparameters(ignore=["conf"])
         super().__init__(conf)
         self.joint_cfg = joint_cfg
 
@@ -274,6 +275,14 @@ class JointLitModel(LitModel):
             drop_last=True, persistent_workers=nw > 0,
         )
 
+    def val_dataloader(self):
+        nw = self.joint_cfg.get("num_workers", 4)
+        return DataLoader(
+            self.val_data, batch_size=self.batch_size,
+            shuffle=False, num_workers=nw, pin_memory=True,
+            drop_last=False, persistent_workers=nw > 0,
+        )
+
     def on_fit_start(self):
         """Move VAE and projection to correct device before training starts."""
         # Explicitly move all VAE components and projection to the training device
@@ -328,13 +337,48 @@ class JointLitModel(LitModel):
 
             loss = diff_loss + self.lambda_vae * vae_total
 
-        if self.global_rank == 0:
+        # Standard PyTorch Lightning logging for epoch aggregation and progress bars
+        self.log('loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
+        self.log('loss_step', loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+
+        if self.global_rank == 0 and hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
             self.logger.experiment.add_scalar('loss', loss.item(), self.num_samples)  # type: ignore[union-attr]
             self.logger.experiment.add_scalar('loss/diff', diff_loss.item(), self.num_samples)  # type: ignore[union-attr]
             self.logger.experiment.add_scalar('loss/vae_recon', recon_loss.item(), self.num_samples)  # type: ignore[union-attr]
             self.logger.experiment.add_scalar('loss/vae_mmd', mmd_loss.item(), self.num_samples)  # type: ignore[union-attr]
 
         return {'loss': loss}
+
+    def validation_step(self, batch, batch_idx):
+        with autocast(device_type='cuda', enabled=self.conf.fp16):
+            imgs = batch['img'].to(self.device)
+            genomic = batch['genomic'].to(self.device, dtype=torch.float32)
+
+            # VAE → conditioning
+            cond, z, vae_recon = self.encode_genomic(genomic)
+
+            # Diffusion loss
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+            losses = self.sampler.training_losses(
+                model=self.model, x_start=imgs, cond=cond,
+                t=t, model_kwargs={'cond': cond},
+            )
+            diff_loss = losses['loss'].mean()
+
+            # VAE loss
+            recon_loss = nn.functional.mse_loss(vae_recon, genomic)
+            mmd_loss = compute_mmd(torch.randn_like(z), z).sum()
+            vae_total = recon_loss + self.beta_mmd * mmd_loss
+
+            loss = diff_loss + self.lambda_vae * vae_total
+
+        # Log validation metrics (aggregated over epoch automatically)
+        self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
+        self.log('val_loss/diff', diff_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
+        self.log('val_loss/vae_recon', recon_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
+        self.log('val_loss/vae_mmd', mmd_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
+        
+        return {'val_loss': loss}
 
     def on_train_batch_start(self, batch, batch_idx):
         """Ensure VAE and projection are on correct device at the start of each batch."""
@@ -503,16 +547,11 @@ class JointLitModel(LitModel):
 
                 h5_path = os.path.join(out_dir, f"{pid}.h5")
                 with h5py.File(h5_path, "w") as f:
-                    f.create_dataset("z", data=z.cpu().numpy().squeeze(0))
-                    f.create_dataset("mu", data=mu.cpu().numpy().squeeze(0))
-                    f.create_dataset("log_var", data=log_var.cpu().numpy().squeeze(0))
-                    f.create_dataset("recon", data=recon.cpu().numpy().squeeze(0))
-                    f.create_dataset("cond", data=cond.cpu().numpy().squeeze(0))
+                    # Save 'feats' with shape (1, latent_dim) as expected by downstream tools
+                    f.create_dataset("feats", data=z.cpu().numpy().astype(np.float32))
+                    
                     f.attrs["patient_id"] = pid
                     f.attrs["split"] = split_name
-                    f.attrs["genes"] = [
-                        g.encode("utf-8") for g in raw_ds.gene_names
-                    ]
                 saved += 1
 
         print(f"[Joint] Saved latent features for {saved} patients to {out_dir}")
