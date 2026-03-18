@@ -38,6 +38,9 @@ dependencies = [
     "rtree>=1.4.1",
     "pytest>=7.4.4",
     "lifelines>=0.30.3",
+    "gudhi>=3.8.0",
+    "giotto-tda>=0.6.0",
+    "pot>=0.9.3",
 ]
 
 
