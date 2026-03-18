@@ -430,9 +430,11 @@ def plot_umap_interactive(
 
 def plot_cosine_distance_clustermap(
     X: np.ndarray,
+    labels: Optional[np.ndarray] = None,
     n_samples: int = 200,
     cmap_name: str = HEATMAP_CMAP,
-    figsize: Tuple[float, float] = (9, 9),
+    cat_cmap_name: str = CATEGORICAL_CMAP,
+    figsize: Tuple[float, float] = (10, 10),
     random_state: int = 42,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -442,10 +444,14 @@ def plot_cosine_distance_clustermap(
     Parameters
     ----------
     X : ndarray, shape (n, d)
+    labels : ndarray, optional
+        Categorical labels to plot as color bars along the axes.
     n_samples : int
         Subset size (capped at ``len(X)``).
     cmap_name : str
         Crameri colourmap for the heatmap.
+    cat_cmap_name : str
+        Crameri colormap for the label color bar.
 
     Returns
     -------
@@ -457,16 +463,35 @@ def plot_cosine_distance_clustermap(
     setup_style()
     rng = np.random.RandomState(random_state)
     idx = rng.choice(len(X), size=min(n_samples, len(X)), replace=False)
-    dist_mat = pairwise_distances(X[idx], metric="cosine")
+    
+    sub_X = X[idx]
+    dist_mat = pairwise_distances(sub_X, metric="cosine")
     cmap = get_crameri_cmap(cmap_name)
+    
+    # Handle label color bars if labels are provided
+    row_colors = None
+    if labels is not None:
+        sub_labels = labels[idx]
+        palette = build_label_palette(sub_labels, cat_cmap_name)
+        row_colors = pd.Series(sub_labels).map(palette).values
 
     g = sns.clustermap(
         dist_mat,
         cmap=cmap,
         figsize=figsize,
+        row_colors=row_colors,
+        col_colors=row_colors,
         xticklabels=False,
         yticklabels=False,
     )
+    
+    # Add a custom legend for the subtypes if labels were provided
+    if labels is not None:
+        from matplotlib.patches import Patch
+        handles = [Patch(facecolor=c, edgecolor='w', label=l) for l, c in palette.items()]
+        # Add legend to the upper left corner of the figure
+        g.fig.legend(handles=handles, title="Subtypes", loc="upper left", bbox_to_anchor=(0.02, 0.98))
+        
     g.fig.suptitle(f"Cosine distance matrix ({len(idx)} random samples)", y=1.02)
     show_or_save(g.fig, save_path=save_path, show=show, close=True)
     return g.fig

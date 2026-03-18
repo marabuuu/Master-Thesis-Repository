@@ -57,7 +57,7 @@ except ImportError:  # pragma: no cover
 # ===================================================================
 
 # Curated defaults – override via function arguments
-CATEGORICAL_CMAP = "batlowS"  # qualitative / categorical
+CATEGORICAL_CMAP = "romaO"  # qualitative / categorical (alternating diverging for good contrast)
 SEQUENTIAL_CMAP = "batlow"  # sequential heatmaps
 DIVERGING_CMAP = "vik"  # diverging (e.g. fold-change)
 HEATMAP_CMAP = "lajolla"  # single-hue heatmaps (e.g. distance matrices)
@@ -114,6 +114,9 @@ def build_label_palette(
 ) -> Dict[str, str]:
     """Map unique label strings to Crameri hex colours.
     
+    For categorical data, uses strategic spacing to ensure maximum visual contrast
+    between distinct categories.
+    
     Parameters
     ----------
     labels : np.ndarray
@@ -125,16 +128,36 @@ def build_label_palette(
     -------
     dict
         Dictionary mapping unique label strings to hex colour codes.
-        
-    Examples
-    --------
-    >>> labels = np.array(['A', 'B', 'C', 'A', 'B'])
-    >>> palette = build_label_palette(labels)
-    >>> palette['A']
-    '#FF00FF'
     """
     unique = sorted(np.unique(labels))
-    colours = get_categorical_colors(len(unique), cmap_name=cmap_name)
+    n = len(unique)
+    
+    # For categorical data, use strategic spacing to maximize visual contrast
+    # Avoid extremes (0, 1) and spread categories across colormap
+    if n == 1:
+        indices = [0.5]
+    elif n == 2:
+        indices = [0.15, 0.85]  # far apart
+    elif n == 3:
+        indices = [0.1, 0.5, 0.9]  # spread across
+    elif n == 4:
+        indices = [0.1, 0.35, 0.65, 0.9]  # evenly spaced
+    elif n == 5:
+        indices = [0.05, 0.3, 0.5, 0.7, 0.95]  # zig-zag for contrast
+    elif n <= 10:
+        # For larger category counts, use non-uniform spacing
+        # Start with aggressive outer points, then fill interior
+        indices = np.concatenate([
+            np.linspace(0.05, 0.3, n//3, endpoint=False),
+            np.linspace(0.35, 0.65, n//3, endpoint=False),
+            np.linspace(0.7, 0.95, n - 2*(n//3))
+        ])
+    else:
+        # For many categories, use linear spacing but avoid extremes
+        indices = np.linspace(0.05, 0.95, n)
+    
+    cmap = get_crameri_cmap(cmap_name)
+    colours = [mpl.colors.to_hex(cmap(float(i))) for i in indices]
     return dict(zip(unique, colours))
 
 
