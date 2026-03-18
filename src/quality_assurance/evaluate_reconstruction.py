@@ -45,11 +45,13 @@ from tqdm import tqdm
 try:
     from .metrics import compute_all_metrics
     from .utils import extract_patient_id
+    from ..joint_training.dataset import canonical_patient_id
 except Exception:
     # Allow running the script directly (not as a package) by falling
     # back to absolute import when the relative import fails.
     from quality_assurance.metrics import compute_all_metrics
     from quality_assurance.utils import extract_patient_id
+    from joint_training.dataset import canonical_patient_id
 try:
     from visualization.reconstruction_eval import plot_metrics_summary, plot_per_patient_metrics, plot_comparison_grid, plot_metric_correlation, plot_single_comparison
 except ImportError:

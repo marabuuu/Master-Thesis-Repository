@@ -308,6 +308,7 @@ def run_topofd(
     reference_masks_dir: Path,
     synthetic_masks_dir: Path,
     output_dir: Path,
+    batch_size: int = 100,
     n_bins: int = 100,
     n_layers: int = 1,
 ) -> None:
@@ -353,12 +354,13 @@ def run_topofd(
     
     # Compute TopoFD directly (no subprocess)
     logger.info(f"\nComputing Topological Fréchet Distance...")
+    logger.info(f"  Batch size: {batch_size} masks (reduce if OOM occurs)")
     result = compute_topofd_from_folders(
         reference_dir=reference_masks_dir,
         generated_dir=synthetic_masks_dir,
+        batch_size=batch_size,
         n_landscape_bins=n_bins,
         n_landscape_layers=n_layers,
-        verbose=True,
     )
     
     # Save results to a JSON file in output_dir
@@ -386,6 +388,7 @@ def main(
     num_classes: int = 32,
     batch_size: int = 4,
     num_workers: int = 4,
+    batch_size_topofd: int = 100,
     device: Optional[str] = None,
     checkpoint_path: Optional[str] = None,
     n_landscape_bins: int = 100,
@@ -483,6 +486,7 @@ def main(
         reference_masks_output,
         synthetic_masks_output,
         topofd_output,
+        batch_size=batch_size_topofd,
         n_bins=n_landscape_bins,
         n_layers=n_landscape_layers,
     )
@@ -526,6 +530,10 @@ EXAMPLES:
     p.add_argument(
         '--checkpoint-path', type=str, default=None,
         help='Optional explicit path to DeepCMorph checkpoint (overrides config)',
+    )
+    p.add_argument(
+        '--batch-size-topofd', type=int, default=100,
+        help='Batch size for loading masks during TopoFD computation (default: 100, reduce to 50-75 if OOM)',
     )
     return p
 
@@ -663,6 +671,7 @@ if __name__ == '__main__':
     num_classes = config.get('num_classes', 32)
     batch_size = config.get('batch_size', 4)
     num_workers = config.get('num_workers', 4)
+    batch_size_topofd = args.batch_size_topofd or topofd_config.get('batch_size', 100)
     device = config.get('device')
     checkpoint_path = config.get('checkpoint_path')
     n_landscape_bins = topofd_config.get('n_landscape_bins', 100)
@@ -684,6 +693,7 @@ if __name__ == '__main__':
             num_classes=num_classes,
             batch_size=batch_size,
             num_workers=num_workers,
+            batch_size_topofd=batch_size_topofd,
             device=device,
             checkpoint_path=checkpoint_path,
             n_landscape_bins=n_landscape_bins,

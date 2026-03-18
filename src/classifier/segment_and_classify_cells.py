@@ -49,11 +49,13 @@ import argparse
 import json
 import logging
 import os
+import shutil
 import sys
+import tempfile
 import zipfile
 from io import BytesIO
 from pathlib import Path
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
@@ -553,6 +555,195 @@ def process_tiles_from_images(
 # ===================================================================
 # § 6  CLI
 # ===================================================================
+
+def run_segmentation(config: Dict[str, Any], verbose: bool = True) -> None:
+    """
+    Run cell segmentation on reference and synthetic tiles using config parameters.
+    
+    Args:
+        config: Dictionary with segmentation configuration (from config.yaml)
+        verbose: Whether to print progress information
+    """
+    # Required parameters
+    reference_tiles_dir = config.get("reference_tiles_dir")
+    synthetic_tiles_dir = config.get("synthetic_tiles_dir")
+    reference_masks_dir = config.get("reference_masks_dir")
+    synthetic_masks_dir = config.get("synthetic_masks_dir")
+    
+    if not all([reference_tiles_dir, synthetic_tiles_dir, reference_masks_dir, synthetic_masks_dir]):
+        raise ValueError(
+            "config.segmentation must specify: "
+            "reference_tiles_dir, synthetic_tiles_dir, reference_masks_dir, synthetic_masks_dir"
+        )
+    
+    # Type assertion after validation
+    reference_tiles_dir = str(reference_tiles_dir)
+    synthetic_tiles_dir = str(synthetic_tiles_dir)
+    reference_masks_dir = str(reference_masks_dir)
+    synthetic_masks_dir = str(synthetic_masks_dir)
+    num_classes = config.get("num_classes", 32)
+    weights_dataset = config.get("weights_dataset", "TCGA")
+    device = config.get("device")  # None = auto-detect
+    input_format = config.get("input_format", "zip")
+    max_tiles_per_zip = config.get("max_tiles_per_zip")
+    grouping_json = config.get("grouping_json")
+    save_nuclei_seg = config.get("save_nuclei_seg", True)
+    per_patient_dirs = config.get("per_patient_dirs", True)
+    
+    if verbose:
+        print("\n" + "="*70)
+        print("CELL SEGMENTATION (DeepCMorph)")
+        print("="*70)
+        print(f"Reference tiles:     {reference_tiles_dir}")
+        print(f"Synthetic tiles:     {synthetic_tiles_dir}")
+        print(f"Reference output:    {reference_masks_dir}")
+        print(f"Synthetic output:    {synthetic_masks_dir}")
+        print(f"Num classes:         {num_classes}")
+        print(f"Input format:        {input_format}")
+        print("="*70 + "\n")
+    
+    # Build argv for main() - segment reference tiles
+    argv_ref = [
+        "--input-dir", str(reference_tiles_dir),
+        "--output-dir", str(reference_masks_dir),
+        "--input-format", input_format,
+        "--num-classes", str(num_classes),
+        "--weights-dataset", weights_dataset,
+    ]
+    
+    if device:
+        argv_ref.extend(["--device", device])
+    if max_tiles_per_zip:
+        argv_ref.extend(["--max-tiles-per-zip", str(max_tiles_per_zip)])
+    if grouping_json:
+        argv_ref.extend(["--grouping-json", str(grouping_json)])
+    if not save_nuclei_seg:
+        argv_ref.append("--no-seg")
+    if not per_patient_dirs:
+        argv_ref.append("--flat-output")
+    if verbose:
+        argv_ref.append("--verbose")
+    
+    if verbose:
+        print("[INFO] Segmenting reference tiles...")
+    main(argv=argv_ref)
+    
+    # Build argv for main() - segment synthetic tiles
+    argv_syn = [
+        "--input-dir", str(synthetic_tiles_dir),
+        "--output-dir", str(synthetic_masks_dir),
+        "--input-format", input_format,
+        "--num-classes", str(num_classes),
+        "--weights-dataset", weights_dataset,
+    ]
+    
+    if device:
+        argv_syn.extend(["--device", device])
+    if max_tiles_per_zip:
+        argv_syn.extend(["--max-tiles-per-zip", str(max_tiles_per_zip)])
+    if grouping_json:
+        argv_syn.extend(["--grouping-json", str(grouping_json)])
+    if not save_nuclei_seg:
+        argv_syn.append("--no-seg")
+    if not per_patient_dirs:
+        argv_syn.append("--flat-output")
+    if verbose:
+        argv_syn.append("--verbose")
+    
+    if verbose:
+        print("\n[INFO] Segmenting synthetic tiles...")
+    main(argv=argv_syn)
+    
+    # Optional: create visualizations if enabled
+    if config.get("save_visualizations", False):
+        if verbose:
+            print("\n[INFO] Creating segmentation visualizations...")
+        try:
+            from visualization.segmentation_comparison import visualize_segmentation_results
+            
+            vis_output_dir = config.get("output_dir") or str(Path(reference_masks_dir).parent / "visualizations")
+            num_samples_vis = config.get("num_visualization_samples", 1)
+            
+            visualize_segmentation_results(
+                reference_tiles_dir=reference_tiles_dir,
+                reference_masks_dir=reference_masks_dir,
+                synthetic_tiles_dir=synthetic_tiles_dir,
+                synthetic_masks_dir=synthetic_masks_dir,
+                output_dir=vis_output_dir,
+                num_classes=num_classes,
+                num_samples=num_samples_vis,
+                verbose=verbose,
+            )
+        except Exception as e:
+            if verbose:
+                print(f"[WARNING] Visualization creation failed: {e}")
+            raise
+    
+    # Optional: run TopoFD if enabled
+    topofd_config = config.get("topofd", {})
+    if topofd_config.get("enabled", False):
+        if verbose:
+            print("\n[INFO] Computing Topological Fréchet Distance...")
+        try:
+            # Handle zip-based output: extract .npy files to temporary directories
+            if input_format == "zip":
+                # Extract npy files from ZIP archives to temporary flat directories
+                ref_temp_dir = tempfile.mkdtemp(prefix="topofd_ref_")
+                syn_temp_dir = tempfile.mkdtemp(prefix="topofd_syn_")
+                
+                if verbose:
+                    print(f"[INFO] Extracting reference masks from ZIPs to {ref_temp_dir}...")
+                _extract_npy_from_zips(Path(reference_masks_dir), Path(ref_temp_dir), verbose=verbose)
+                
+                if verbose:
+                    print(f"[INFO] Extracting synthetic masks from ZIPs to {syn_temp_dir}...")
+                _extract_npy_from_zips(Path(synthetic_masks_dir), Path(syn_temp_dir), verbose=verbose)
+                
+                # Run TopoFD on extracted files
+                from quality_assurance.topological_frechet_distance import run_topofd
+                run_topofd(ref_temp_dir, syn_temp_dir, topofd_config, verbose=verbose)
+                
+                # Clean up temp directories
+                shutil.rmtree(ref_temp_dir, ignore_errors=True)
+                shutil.rmtree(syn_temp_dir, ignore_errors=True)
+            else:
+                # For flat image input, masks are already in flat directories
+                from quality_assurance.topological_frechet_distance import run_topofd
+                run_topofd(reference_masks_dir, synthetic_masks_dir, topofd_config, verbose=verbose)
+        except Exception as e:
+            if verbose:
+                print(f"[WARNING] TopoFD computation failed: {e}")
+            raise
+
+
+def _extract_npy_from_zips(zip_dir: Path, output_dir: Path, verbose: bool = False) -> int:
+    """Extract all .npy files from ZIP archives in zip_dir to output_dir."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    total_files = 0
+    
+    for zip_path in sorted(zip_dir.glob("*.zip")):
+        if verbose:
+            print(f"  Extracting from {zip_path.name}...")
+        
+        try:
+            with zipfile.ZipFile(zip_path, 'r') as zf:
+                for name in zf.namelist():
+                    if name.endswith('.npy'):
+                        # Extract with flattened name to avoid subdirectory issues
+                        npy_data = zf.read(name)
+                        output_path = output_dir / Path(name).name
+                        with open(output_path, 'wb') as f:
+                            f.write(npy_data)
+                        total_files += 1
+        except Exception as e:
+            if verbose:
+                print(f"    Warning: failed to extract from {zip_path.name}: {e}")
+    
+    if verbose:
+        print(f"  Extracted {total_files} .npy files total")
+    
+    return total_files
+
 
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
