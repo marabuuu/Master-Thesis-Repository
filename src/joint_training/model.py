@@ -1,10 +1,10 @@
 """
-Joint Genomic VAE + Diffusion Model.
+Joint Genomic Encoder + Diffusion Model.
 
 Subclasses mopadi's LitModel, adding only:
-  - A genomic VAE to encode bulk-RNA data
-  - A projection head mapping VAE latent → UNet conditioning
-  - Modified training_step with joint VAE + diffusion loss
+  - A genomic encoder to encode bulk-RNA data
+  - A projection head mapping encoder latent → UNet conditioning
+  - Modified training_step with pure diffusion loss (no VAE loss)
 
 Everything else (EMA, optimizer, scheduler, gradient clipping, checkpointing,
 sample visualization, DDP) is inherited from mopadi's LitModel.
@@ -28,11 +28,9 @@ from mopadi.configs.templates import autoenc_base
 from mopadi.utils.dist_utils import get_world_size
 
 try:
-    from encoding.architecture import ProbabilisticEncoder, ProbabilisticDecoder, VAE
-    from encoding.architecture.loss import compute_mmd
+    from encoding.architecture import ProbabilisticEncoder
 except ImportError:
-    from src.encoding.architecture import ProbabilisticEncoder, ProbabilisticDecoder, VAE  # type: ignore[import-not-found]
-    from src.encoding.architecture.loss import compute_mmd  # type: ignore[import-not-found]
+    from src.encoding.architecture import ProbabilisticEncoder  # type: ignore[import-not-found]
 
 
 # ──────────────────────────────────────────────────────────────────────
@@ -125,11 +123,13 @@ def build_conf(joint_cfg: dict) -> TrainConfig:
 
 class JointLitModel(LitModel):
     """
-    mopadi LitModel + genomic VAE + projection head.
+    mopadi LitModel + genomic encoder + projection head.
 
-    Replaces image feature extractors with a jointly-trained VAE
-    on bulk-RNA data. Inherits from mopadi: EMA, gradient clipping,
-    sample visualization, checkpointing, DDP support.
+    Uses a genomic encoder to encode bulk-RNA data into a latent space,
+    then projects to the UNet conditioning space. The diffusion model is
+    trained with only diffusion loss (no VAE loss).
+    Inherits from mopadi: EMA, gradient clipping, sample visualization,
+    checkpointing, DDP support.
     """
 
     def __init__(self, conf: TrainConfig, joint_cfg: dict, n_genes: int):
@@ -137,30 +137,15 @@ class JointLitModel(LitModel):
         super().__init__(conf)
         self.joint_cfg = joint_cfg
 
-        # ── VAE ───────────────────────────────────────────────────────
+        # ── Genomic Encoder (VAE encoder only, no decoder) ──────────────────────────────────
         latent_dim = int(joint_cfg.get("latent_dim", 512))
         hidden_dims = [int(x) for x in joint_cfg.get("vae_hidden_dims", [2048, 1024])]
         vae_dropout = float(joint_cfg.get("vae_dropout", 0.2))
-        self.lambda_vae = float(joint_cfg.get("lambda_vae", 1.0))
-        self.beta_mmd = float(joint_cfg.get("beta_mmd", 1.0))
 
-        encoder = ProbabilisticEncoder(
+        self.encoder = ProbabilisticEncoder(
             input_dim=n_genes, hidden_dim=hidden_dims,
             latent_dim=latent_dim, dropout=vae_dropout,
         )
-        decoder = ProbabilisticDecoder(
-            latent_dim=latent_dim, hidden_dim=list(reversed(hidden_dims)),
-            output_dim=n_genes, dropout=vae_dropout,
-        )
-        # Create VAE without explicitly specifying device initially
-        # We'll use torch.device('cpu') as a placeholder and move it on_fit_start
-        try:
-            self.vae = VAE(encoder, decoder, device=torch.device("cpu"))
-        except Exception:
-            # Fallback: create with no device arg and rely on to() calls
-            self.vae = VAE(encoder, decoder, device=None)  # type: ignore[arg-type]
-        # Disable VAE's internal device relocation
-        self.vae._relocate = lambda: None
 
         # ── Projection head ───────────────────────────────────────────
         cond_dim = int(joint_cfg.get("cond_dim", conf.feat_dim))
@@ -179,19 +164,19 @@ class JointLitModel(LitModel):
             sd = state.get("state_dict", state)
             self.load_state_dict(sd, strict=False)
 
-        vae_ckpt = joint_cfg.get("vae_ckpt")
-        if vae_ckpt and os.path.exists(vae_ckpt):
-            print(f"[Joint] Loading VAE checkpoint: {vae_ckpt}")
-            self.vae.load_state_dict(
-                torch.load(vae_ckpt, map_location="cpu", weights_only=False),
+        encoder_ckpt = joint_cfg.get("encoder_ckpt")
+        if encoder_ckpt and os.path.exists(encoder_ckpt):
+            print(f"[Joint] Loading encoder checkpoint: {encoder_ckpt}")
+            self.encoder.load_state_dict(
+                torch.load(encoder_ckpt, map_location="cpu", weights_only=False),
                 strict=False,
             )
 
-        n_vae = sum(p.numel() for p in self.vae.parameters())
+        n_encoder = sum(p.numel() for p in self.encoder.parameters())
         n_proj = sum(p.numel() for p in self.projection.parameters())
         n_unet = sum(p.numel() for p in self.model.parameters())
-        print(f"[Joint] VAE: {n_vae:,}  Proj: {n_proj:,}  UNet: {n_unet:,}  "
-              f"Total: {n_vae + n_proj + n_unet:,}")
+        print(f"[Joint] Encoder: {n_encoder:,}  Proj: {n_proj:,}  UNet: {n_unet:,}  "
+              f"Total: {n_encoder + n_proj + n_unet:,}")
 
     # ──────────────────────────────────────────────────────────────────
     #  Dataset (overrides mopadi's WebDataset setup)
@@ -284,78 +269,68 @@ class JointLitModel(LitModel):
         )
 
     def on_fit_start(self):
-        """Move VAE and projection to correct device before training starts."""
-        # Explicitly move all VAE components and projection to the training device
-        if hasattr(self.vae, 'encoder'):
-            self.vae.encoder = self.vae.encoder.to(self.device)
-        if hasattr(self.vae, 'decoder'):
-            self.vae.decoder = self.vae.decoder.to(self.device)
-        if hasattr(self.vae, 'device'):
-            self.vae.device = self.device
+        """Move encoder and projection to correct device before training starts."""
+        self.encoder = self.encoder.to(self.device)
         self.projection = self.projection.to(self.device)
         
         if self.global_rank == 0:
-            print(f"[Joint] Moved VAE and projection to device: {self.device}")
+            print(f"[Joint] Moved encoder and projection to device: {self.device}")
 
     # ──────────────────────────────────────────────────────────────────
     #  Training (overrides mopadi's training_step)
     # ──────────────────────────────────────────────────────────────────
 
     def encode_genomic(self, genomic):
-        """RNA-seq → VAE → projection → cond, plus reconstruction for loss."""
-        # Safety: ensure VAE is on the correct device before forward pass
-        if next(self.vae.encoder.parameters()).device != self.device:
-            self.vae.encoder = self.vae.encoder.to(self.device)
-            self.vae.decoder = self.vae.decoder.to(self.device)
+        """RNA-seq → encoder → projection → conditioning vector."""
+        # Ensure encoder is on the correct device
+        if next(self.encoder.parameters()).device != self.device:
+            self.encoder = self.encoder.to(self.device)
         
-        mean, log_var = self.vae.encoder(genomic)
-        z = self.vae.reparameterization(mean, torch.exp(0.5 * log_var))
-        vae_recon = self.vae.decoder(z)
+        mean, log_var = self.encoder(genomic)
+        # Use reparameterization trick (stochastic latent)
+        z = mean + torch.exp(0.5 * log_var) * torch.randn_like(log_var)
         cond = self.projection(z)
-        return cond, z, vae_recon
+        return cond
 
     def training_step(self, batch, batch_idx):
+        """
+        Diffusion-only training step (no VAE loss).
+        Follows mopadi's pattern: encoder → projection → diffusion loss.
+        """
         with autocast(device_type='cuda', enabled=self.conf.fp16):
             imgs = batch['img'].to(self.device)
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
-            # VAE → conditioning
-            cond, z, vae_recon = self.encode_genomic(genomic)
+            # Encoder → conditioning vector
+            cond = self.encode_genomic(genomic)
 
-            # Diffusion loss (mopadi's sampler)
+            # Diffusion loss (same as mopadi's sampler)
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             losses = self.sampler.training_losses(
                 model=self.model, x_start=imgs, cond=cond,
                 t=t, model_kwargs={'cond': cond},
             )
-            diff_loss = losses['loss'].mean()
+            loss = losses['loss'].mean()
 
-            # VAE loss
-            recon_loss = nn.functional.mse_loss(vae_recon, genomic)
-            mmd_loss = compute_mmd(torch.randn_like(z), z).sum()
-            vae_total = recon_loss + self.beta_mmd * mmd_loss
-
-            loss = diff_loss + self.lambda_vae * vae_total
-
-        # Standard PyTorch Lightning logging for epoch aggregation and progress bars
+        # Standard PyTorch Lightning logging
         self.log('loss_epoch', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
         self.log('loss_step', loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
 
         if self.global_rank == 0 and hasattr(self, 'logger') and hasattr(self.logger, 'experiment'):
             self.logger.experiment.add_scalar('loss', loss.item(), self.num_samples)  # type: ignore[union-attr]
-            self.logger.experiment.add_scalar('loss/diff', diff_loss.item(), self.num_samples)  # type: ignore[union-attr]
-            self.logger.experiment.add_scalar('loss/vae_recon', recon_loss.item(), self.num_samples)  # type: ignore[union-attr]
-            self.logger.experiment.add_scalar('loss/vae_mmd', mmd_loss.item(), self.num_samples)  # type: ignore[union-attr]
 
         return {'loss': loss}
 
     def validation_step(self, batch, batch_idx):
+        """
+        Diffusion-only validation step (no VAE loss).
+        """
         with autocast(device_type='cuda', enabled=self.conf.fp16):
             imgs = batch['img'].to(self.device)
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
-            # VAE → conditioning
-            cond, z, vae_recon = self.encode_genomic(genomic)
+            # Encoder → conditioning vector
+            cond = self.encode_genomic(genomic)
 
             # Diffusion loss
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
@@ -363,30 +338,19 @@ class JointLitModel(LitModel):
                 model=self.model, x_start=imgs, cond=cond,
                 t=t, model_kwargs={'cond': cond},
             )
-            diff_loss = losses['loss'].mean()
+            loss = losses['loss'].mean()
 
-            # VAE loss
-            recon_loss = nn.functional.mse_loss(vae_recon, genomic)
-            mmd_loss = compute_mmd(torch.randn_like(z), z).sum()
-            vae_total = recon_loss + self.beta_mmd * mmd_loss
-
-            loss = diff_loss + self.lambda_vae * vae_total
-
-        # Log validation metrics (aggregated over epoch automatically)
+        # Log validation metrics
         self.log('val_loss', loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
-        self.log('val_loss/diff', diff_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
-        self.log('val_loss/vae_recon', recon_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
-        self.log('val_loss/vae_mmd', mmd_loss, on_step=False, on_epoch=True, sync_dist=True, batch_size=len(imgs))
         
         return {'val_loss': loss}
 
     def on_train_batch_start(self, batch, batch_idx):
-        """Ensure VAE and projection are on correct device at the start of each batch."""
+        """Ensure encoder and projection are on correct device at the start of each batch."""
         try:
-            encoder_device = next(self.vae.encoder.parameters()).device
+            encoder_device = next(self.encoder.parameters()).device
             if encoder_device != self.device:
-                self.vae.encoder = self.vae.encoder.to(self.device)
-                self.vae.decoder = self.vae.decoder.to(self.device)
+                self.encoder = self.encoder.to(self.device)
             proj_device = next(self.projection.parameters()).device
             if proj_device != self.device:
                 self.projection = self.projection.to(self.device)
@@ -401,8 +365,7 @@ class JointLitModel(LitModel):
             # Compute cond from genomic for mopadi's log_sample
             with torch.no_grad():
                 genomic = batch['genomic'].to(self.device, dtype=torch.float32)
-                mean, _ = self.vae.encoder(genomic)
-                cond = self.projection(mean)
+                cond = self.encode_genomic(genomic)
 
             self.log_sample(x_start=batch['img'], cond=cond)
             self.evaluate_scores()
@@ -418,7 +381,7 @@ class JointLitModel(LitModel):
 
         param_groups = [
             {"params": self.model.parameters(), "lr": float(jcfg.get("unet_lr", lr))},
-            {"params": self.vae.parameters(), "lr": float(jcfg.get("vae_lr", lr))},
+            {"params": self.encoder.parameters(), "lr": float(jcfg.get("encoder_lr", lr))},
             {"params": self.projection.parameters(), "lr": float(jcfg.get("proj_lr", lr))},
         ]
 
@@ -452,10 +415,11 @@ class JointLitModel(LitModel):
     # ──────────────────────────────────────────────────────────────────
 
     @torch.no_grad()
+    @torch.no_grad()
     def encode(self, genomic: torch.Tensor) -> torch.Tensor:
         """Encode gene expression → diffusion conditioning (deterministic)."""
         self.eval()
-        mean, _ = self.vae.encoder(genomic)
+        mean, _ = self.encoder(genomic)
         return self.projection(mean)
 
     @torch.no_grad()
@@ -470,15 +434,11 @@ class JointLitModel(LitModel):
 
     @torch.no_grad()
     def save_latent_features(self, out_dir: str, split: str = "all") -> str:
-        """Extract VAE latent features and save one h5 file per patient.
+        """Extract encoder latent features and save one h5 file per patient.
 
         Each ``<patient_id>.h5`` contains:
-            - ``z``     : (latent_dim,) latent vector (using the mean, deterministic)
-            - ``mu``    : (latent_dim,) encoder mean
-            - ``log_var``: (latent_dim,) encoder log-variance
-            - ``recon`` : (n_genes,) reconstructed gene expression
-            - ``cond``  : (cond_dim,) projected conditioning vector
-            - ``genes`` : gene names as UTF-8 byte strings (attribute on root)
+            - ``feats`` : (latent_dim,) latent vector from encoder (deterministic mean)
+            - Patient ID and split as HDF5 attributes.
 
         Parameters
         ----------
@@ -540,9 +500,8 @@ class JointLitModel(LitModel):
                 seen_patients.add(pid)
 
                 g = genomic_vec.unsqueeze(0).to(self.device)
-                mu, log_var = self.vae.encoder(g)
+                mu, log_var = self.encoder(g)
                 z = mu  # deterministic: use the mean
-                recon = self.vae.decoder(z)
                 cond = self.projection(z)
 
                 h5_path = os.path.join(out_dir, f"{pid}.h5")

@@ -47,7 +47,7 @@ def _count_genes(joint_cfg: dict) -> int:
 
 
 def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
-    """Run joint genomic VAE + diffusion training (called from pipeline or CLI)."""
+    """Run joint genomic encoder + diffusion training (called from pipeline or CLI)."""
     seed = joint_cfg.get("seed", 42)
     pl.seed_everything(seed)
 
