@@ -93,6 +93,16 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
     else:
         strategy = 'auto'
 
+    # Validation frequency tuning for faster training
+    val_check_interval = int(joint_cfg.get("val_check_interval", 1))  # epochs between validation
+    limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))  # fraction of val set to use
+    
+    if verbose:
+        if val_check_interval > 1:
+            print(f"[Joint] Validation every {val_check_interval} epochs (reduced frequency)")
+        if limit_val_batches < 1.0:
+            print(f"[Joint] Using {limit_val_batches*100:.0f}% of validation set per check")
+
     trainer = pl.Trainer(
         max_epochs=int(joint_cfg.get("epochs", 100)),
         limit_train_batches=int(conf.steps_per_epoch),
@@ -103,6 +113,9 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
         callbacks=[checkpoint, LearningRateMonitor()],
         logger=tb_logger,
         accumulate_grad_batches=int(conf.accum_batches),
+        val_check_interval=val_check_interval,
+        limit_val_batches=limit_val_batches,
+        num_sanity_val_steps=2,  # quick sanity check before training
     )
 
     trainer.fit(model, ckpt_path=ckpt_path)

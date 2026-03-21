@@ -95,6 +95,11 @@ joint_training:
   save_every_samples: 200000              # checkpoint frequency
   reconstruct_every_samples: 50000        # sample visualization frequency
 
+  # ── Validation Frequency Tuning ───────────────────────────────────────
+  # Reduce validation overhead for faster training with more epochs
+  val_check_interval: 1                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
+  limit_val_batches: 1.0                  # fraction of val set to use (1.0=full, 0.1=10%)
+
 extract_joint_latents:
   ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
   out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/encoding_latents
