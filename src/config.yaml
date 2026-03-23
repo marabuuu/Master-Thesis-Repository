@@ -100,6 +100,16 @@ joint_training:
   val_check_interval: 1                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
   limit_val_batches: 1.0                  # fraction of val set to use (1.0=full, 0.1=10%)
 
+  # ── Cross-Attention (new variant) ───────────────────────────────────
+  cross_attention:
+    heads: 4
+    dim_per_head: 64
+    cond_dims: [512, 256, 128]
+  # Dropouts to force conditioning reliance (training only)
+  xT_dropout_prob: 0.05          # replace x_start with pure noise for a fraction of the batch
+  cond_dropout_prob: 0.05        # zero full cond for a fraction of the batch
+  cond_feature_dropout: 0.05     # per-feature dropout on cond
+
 extract_joint_latents:
   ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
   out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/encoding_latents
@@ -114,8 +124,8 @@ visualize_latents:
   label_col: Majority_Subtype_mRNA
 
 training_stats:
-  logdir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/training_stats
+  logdir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/joint
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/training_stats
   plots:
     - loss_curves          # epoch-level train & val loss
     - batch_trajectory     # per-step loss across all epochs
@@ -239,22 +249,22 @@ segmentation:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
+  checkpoint_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/joint/last.ckpt
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
   tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]  # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]  # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: random_noise         # choices: image_guided, random_noise
-  investigate: false         # save intermediate noising steps for visualization
+  mode: image_guided         # choices: image_guided, random_noise
+  investigate: true         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/sampling_random_noise
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/investigate_image_guided
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

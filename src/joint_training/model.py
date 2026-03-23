@@ -133,8 +133,13 @@ class JointLitModel(LitModel):
     """
 
     def __init__(self, conf: TrainConfig, joint_cfg: dict, n_genes: int):
-        self.save_hyperparameters(ignore=["conf"])
+        # Save full hyperparameters (including conf) so checkpoints carry all required metadata
         super().__init__(conf)
+        self.save_hyperparameters({
+            "conf": conf,
+            "joint_cfg": joint_cfg,
+            "n_genes": n_genes,
+        })
         self.joint_cfg = joint_cfg
 
         # ── Genomic Encoder (VAE encoder only, no decoder) ──────────────────────────────────
