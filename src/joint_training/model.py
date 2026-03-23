@@ -259,19 +259,40 @@ class JointLitModel(LitModel):
 
     def train_dataloader(self):
         nw = self.joint_cfg.get("num_workers", 4)
-        return DataLoader(
-            self.train_data, batch_size=self.batch_size,
-            shuffle=True, num_workers=nw, pin_memory=True,
-            drop_last=True, persistent_workers=nw > 0,
-        )
+        prefetch_factor = self.joint_cfg.get("prefetch_factor", 2)
+
+        loader_kwargs = {
+            "dataset": self.train_data,
+            "batch_size": self.batch_size,
+            "shuffle": True,
+            "num_workers": nw,
+            "pin_memory": True,
+            "drop_last": True,
+            "persistent_workers": nw > 0,
+        }
+        if nw > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+
+        return DataLoader(**loader_kwargs)
 
     def val_dataloader(self):
-        nw = self.joint_cfg.get("num_workers", 4)
-        return DataLoader(
-            self.val_data, batch_size=self.batch_size,
-            shuffle=False, num_workers=nw, pin_memory=True,
-            drop_last=False, persistent_workers=nw > 0,
-        )
+        nw = self.joint_cfg.get("val_num_workers", self.joint_cfg.get("num_workers", 4))
+        val_batch_size = self.joint_cfg.get("val_batch_size", self.batch_size)
+        prefetch_factor = self.joint_cfg.get("val_prefetch_factor", self.joint_cfg.get("prefetch_factor", 2))
+
+        loader_kwargs = {
+            "dataset": self.val_data,
+            "batch_size": val_batch_size,
+            "shuffle": False,
+            "num_workers": nw,
+            "pin_memory": True,
+            "drop_last": False,
+            "persistent_workers": nw > 0,
+        }
+        if nw > 0:
+            loader_kwargs["prefetch_factor"] = prefetch_factor
+
+        return DataLoader(**loader_kwargs)
 
     def on_fit_start(self):
         """Move encoder and projection to correct device before training starts."""

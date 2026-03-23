@@ -19,7 +19,10 @@ try:
 except ImportError:  # pragma: no cover
     from src.joint_training.train import _count_genes  # type: ignore[import-not-found]
 
-from .model import CrossAttentionJointLitModel, build_cross_conf
+try:
+    from cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf
+except ImportError:  # pragma: no cover
+    from src.cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf  # type: ignore[import-not-found]
 
 
 def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:

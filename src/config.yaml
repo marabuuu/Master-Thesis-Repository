@@ -36,8 +36,8 @@ training:
 
 joint_training:
   # ── Data ──────────────────────────────────────────────────────────────
-  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
-  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  csv_path: /data/cat/ws/mala059b-rna2wsi/dataframes/brca_gene_expression.csv
+  tiles_zip_dir: /data/cat/ws/mala059b-rna2wsi/data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA       # non-numeric column to drop from gene data
   gene_list_path: null                    # optional: path to .txt with one gene per line
@@ -46,7 +46,7 @@ joint_training:
   test_fraction: 0.1                      # held out entirely for later evaluation
 
   # ── Output ────────────────────────────────────────────────────────────
-  out_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm
+  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260323_cross_attention_training
   latent_dir: null                        # where to save h5 latent features (default: out_dir/latents)
 
   # ── Genomic Encoder ──────────────────────────────────────────────────
@@ -84,6 +84,10 @@ joint_training:
   ema_decay: 0.9999
   accumulate_grad_batches: 1
   num_workers: 4
+  prefetch_factor: 2
+  val_batch_size: 4
+  val_num_workers: 6
+  val_prefetch_factor: 2
   fp16: false
   seed: 42
   gpus: [0]
@@ -97,8 +101,8 @@ joint_training:
 
   # ── Validation Frequency Tuning ───────────────────────────────────────
   # Reduce validation overhead for faster training with more epochs
-  val_check_interval: 1                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
-  limit_val_batches: 1.0                  # fraction of val set to use (1.0=full, 0.1=10%)
+  val_check_interval: 5                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
+  limit_val_batches: 0.1                  # fraction of val set to use (1.0=full, 0.1=10%)
 
   # ── Cross-Attention (new variant) ───────────────────────────────────
   cross_attention:

@@ -153,6 +153,18 @@ class CrossAttentionJointLitModel(JointLitModel):
 
         return {'loss': loss}
 
+    def on_train_batch_end(self, outputs, batch, batch_idx):
+        """Override EMA update to handle wrapped model.
+        
+        Since self.model is a CrossAttentionUNetWrapper, we need to pass
+        the base_unet to the EMA function to match keys in ema_model.
+        """
+        # Import here to avoid circular imports
+        from mopadi.train_diff_autoenc import ema
+        
+        # Pass base_unet (unwrapped) to EMA for proper key matching
+        ema(self.model.base_unet, self.ema_model, self.conf.ema_decay)
+
 
 def build_cross_conf(joint_cfg: dict):
     """Reuse build_conf from joint_training (helper for symmetry)."""
