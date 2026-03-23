@@ -107,6 +107,74 @@ def compute_metrics(img_original: np.ndarray, img_reconstructed: np.ndarray) -> 
     return {"ssim": float(ssim_val), "mse": float(mse), "psnr": float(psnr)}
 
 
+def create_investigation_strip(
+    investigate_dir: Path,
+    n_steps: int = 5,
+) -> None:
+    """Create a horizontal strip showing original | forward | noise | denoise | final.
+    
+    Loads saved intermediate frames and assembles them into a composite visualization.
+    """
+    from PIL import Image as PILImage
+    
+    try:
+        # Load images
+        original = PILImage.open(investigate_dir / "original.png").convert("RGB")
+        final_recon = PILImage.open(investigate_dir / "final_reconstruction.png").convert("RGB")
+        encoded_noise = PILImage.open(investigate_dir / "encoded_noise.png").convert("RGB")
+        
+        # Collect forward and denoise frames
+        forward_frames = sorted(investigate_dir.glob("forward_t*.png"))
+        denoise_frames = sorted(investigate_dir.glob("denoise_t*.png"), reverse=True)
+        
+        # Resize all to a consistent height for strip
+        target_height = 256
+        aspect_ratio = original.width / original.height
+        target_width = int(target_height * aspect_ratio)
+        
+        original_resized = original.resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+        final_resized = final_recon.resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+        noise_resized = encoded_noise.resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+        
+        # Build strip: original | forward steps | noise | denoise steps | final
+        strip_frames = [original_resized]
+        
+        # Add forward frames (sample of them)
+        if forward_frames:
+            forward_subset = forward_frames[::max(1, len(forward_frames) // 3)]
+            for fp in forward_subset[:3]:
+                img = PILImage.open(fp).convert("RGB").resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+                strip_frames.append(img)
+        
+        strip_frames.append(noise_resized)
+        
+        # Add denoise frames (sample of them)
+        if denoise_frames:
+            denoise_subset = denoise_frames[::max(1, len(denoise_frames) // 3)]
+            for dp in denoise_subset[:3]:
+                img = PILImage.open(dp).convert("RGB").resize((target_width, target_height), PILImage.Resampling.LANCZOS)
+                strip_frames.append(img)
+        
+        strip_frames.append(final_resized)
+        
+        # Create horizontal strip
+        total_width = sum(img.width for img in strip_frames) + (len(strip_frames) - 1) * 5
+        strip = PILImage.new("RGB", (total_width, target_height), color="white")
+        
+        x_offset = 0
+        for img in strip_frames:
+            strip.paste(img, (x_offset, 0))
+            x_offset += img.width + 5
+        
+        # Save strip
+        strip_path = investigate_dir / "investigation_strip.png"
+        strip.save(strip_path)
+        logger.info(f"  Saved investigation strip -> {strip_path.name}")
+        
+    except FileNotFoundError as e:
+        logger.warning(f"Could not create investigation strip: {e}")
+
+
 # ───────────────────────────────────────────────────────────────────────
 #  Data Loading
 # ───────────────────────────────────────────────────────────────────────
@@ -372,68 +440,96 @@ def _reconstruct_from_image_with_cond(
     torch.Tensor
         Reconstructed image tensor in [-1, 1].
     """
-    sampler = getattr(model, "sampler", None)
+    # Prefer eval sampler (matches mopadi encode_stochastic); fallback to training sampler
+    sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
     if sampler is None:
         raise RuntimeError("Model does not expose `sampler` - cannot run diffusion denoising")
 
     if seed is not None:
         torch.manual_seed(seed)
 
-    T = getattr(sampler, "num_timesteps", None)
-    if T is None:
-        T = len(getattr(sampler, "betas", []))
-    if not isinstance(T, int) or T <= 0:
-        raise RuntimeError("Could not determine diffusion timesteps from sampler")
+    # Get the full training sampler for encoding (T=1000 for thorough diffusion)
+    # This ensures the image is truly destroyed into noise, not just partially corrupted
+    full_sampler = getattr(model, "sampler", sampler)
+    
+    T_full = getattr(full_sampler, "num_timesteps", None)
+    if T_full is None:
+        T_full = len(getattr(full_sampler, "betas", []))
+    if not isinstance(T_full, int) or T_full <= 0:
+        raise RuntimeError("Could not determine diffusion timesteps from full sampler")
 
-    # Use a fixed noise tensor so we can reproduce intermediate frames
-    fixed_noise = torch.randn_like(img_tensor)
+    # Get eval sampler timesteps for decoding (T_eval=20 for fast sampling)
+    T_eval = getattr(sampler, "num_timesteps", None)
+    if T_eval is None:
+        T_eval = len(getattr(sampler, "betas", []))
+    if not isinstance(T_eval, int) or T_eval <= 0:
+        raise RuntimeError("Could not determine diffusion timesteps from eval sampler")
 
-    # Determine which timesteps to save (inclusive of 0 and T-1)
-    timesteps: list = []
+    # Use EMA UNet if available
+    unet_model = getattr(model, "ema_model", getattr(model, "model", model))
+    unet_model.eval()
+
+    # Forward diffusion (encode) using the eval sampler schedule to match the decode schedule (T_eval)
+    # - We reuse a single noise tensor `eps` across all timesteps so saved frames are comparable
+    # - x_T is sampled at the final eval diffusion timestep (T_eval - 1)
+    eps = torch.randn_like(img_tensor)
+    decode_eta = 0.0  # deterministic decode
+    logger.info(f"  Encoding tile to noise using forward q_sample (T_eval={T_eval}) to keep schedules symmetric...")
+    with torch.no_grad():
+        t_final = torch.full((img_tensor.shape[0],), T_eval - 1, device=device, dtype=torch.long)
+        x_T = sampler.q_sample(img_tensor, t_final, noise=eps)
+
+    # Save forward trajectory snapshots if requested
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
-        timesteps = sorted(set(np.linspace(0, T - 1, n_steps, dtype=int)))
+        def _to_uint8(img: torch.Tensor) -> np.ndarray:
+            # Visualization helper: min-max normalize to avoid channel bias / clipping artifacts
+            arr = img.detach().cpu()
+            arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
+            return (arr * 255).clamp(0, 255).to(torch.uint8).permute(1, 2, 0).numpy()
 
-        # Save forward encoding (image -> x_t) snapshots
-        for t in timesteps:
-            t_tensor = torch.tensor([int(t)], device=device)
-            x_t = sampler.q_sample(img_tensor, t_tensor, noise=fixed_noise)
-            save_path = save_dir / f"forward_t{int(t):04d}.png"
-            Image.fromarray(tensor_to_image(x_t.squeeze(0))).save(save_path)
-            logger.info(f"  Saved forward step t={t} -> {save_path.name}")
+        target_steps = set(np.linspace(0, T_eval - 1, n_steps, dtype=int))
+        logger.info(f"  [DEBUG] Target timesteps for saving (forward q_sample, eval schedule): {sorted(target_steps)}")
+        for t_int in sorted(target_steps):
+            t_tensor = torch.full((img_tensor.shape[0],), int(t_int), device=device, dtype=torch.long)
+            sample_t = sampler.q_sample(img_tensor, t_tensor, noise=eps)
+            save_path = save_dir / f"forward_t{t_int:04d}.png"
+            Image.fromarray(_to_uint8(sample_t.squeeze(0))).save(save_path)
+            logger.info(f"  Saved forward step t={t_int} -> {save_path.name}")
 
-        # Save the fixed noise used in the forward pass
-        noise_path = save_dir / "noise.png"
-        Image.fromarray(tensor_to_image(fixed_noise.squeeze(0))).save(noise_path)
-        logger.info(f"  Saved fixed noise -> {noise_path.name}")
+        # Save final encoded noise (already computed as x_T)
+        encoded_noise_path = save_dir / "encoded_noise.png"
+        Image.fromarray(_to_uint8(x_T.squeeze(0))).save(encoded_noise_path)
+        logger.info(f"  Saved final encoded noise -> {encoded_noise_path.name}")
 
-    # Encode image -> x_T (highest noise level)
-    t_final = T - 1
-    t_final_tensor = torch.tensor([int(t_final)], device=device)
-    x_T = sampler.q_sample(img_tensor, t_final_tensor, noise=fixed_noise)
-
-    # Denoising (reverse diffusion)
-    unet_model = getattr(model, "model", model)
-    prog = sampler.p_sample_loop_progressive(
+    # Denoising (reverse diffusion) with deterministic sampling (fast with eval sampler)
+    prog = sampler.ddim_sample_loop_progressive(
         model=unet_model,
         shape=img_tensor.shape,
         noise=x_T,
         model_kwargs={"cond": cond},
         device=device,
         progress=False,
+        eta=decode_eta,
     )
 
     final_reconstruction: torch.Tensor | None = None
-    save_timesteps = set(timesteps)
+    save_denoise_timesteps = set(np.linspace(0, T_eval - 1, n_steps, dtype=int)) if save_dir is not None else set()
 
+    logger.info(f"  [DEBUG] Save denoise timesteps (from T_eval={T_eval}): {sorted(save_denoise_timesteps)}")
+    
+    denoise_frame_count = 0
     for idx, out in enumerate(prog):
-        t = T - 1 - idx
-        if t in save_timesteps and save_dir is not None:
+        t = T_eval - 1 - idx
+        if t in save_denoise_timesteps:
             out_img = out["sample"].squeeze(0)
             save_path = cast(Path, save_dir) / f"denoise_t{int(t):04d}.png"
             Image.fromarray(tensor_to_image(out_img)).save(save_path)
             logger.info(f"  Saved denoise step t={t} -> {save_path.name}")
+            denoise_frame_count += 1
         final_reconstruction = out["sample"]
+    
+    logger.info(f"  [DEBUG] Total denoise frames saved: {denoise_frame_count} out of {idx + 1} iterations")
 
     if final_reconstruction is not None and save_dir is not None:
         final_path = cast(Path, save_dir) / "final_reconstruction.png"
@@ -492,6 +588,20 @@ def reconstruct_tile_image_guided(
 
     with torch.no_grad():
         cond = model.encode(genomic.unsqueeze(0))  # type: ignore[attr-defined]
+        # Debug conditioning statistics to ensure variability across tiles/patients
+        logger.info(
+            "  [DEBUG] cond stats: mean=%.4f std=%.4f min=%.4f max=%.4f first5=%s"
+            % (
+                cond.mean().item(),
+                cond.std().item(),
+                cond.min().item(),
+                cond.max().item(),
+                [float(x) for x in cond[0, :5].tolist()],
+            )
+        )
+        if os.getenv("ZERO_COND", "0") == "1":
+            cond = torch.zeros_like(cond)
+            logger.info("  [DEBUG] ZERO_COND=1 -> conditioning zeroed for ablation")
         recon_tensor = _reconstruct_from_image_with_cond(
             model,
             img_tensor,
@@ -501,6 +611,10 @@ def reconstruct_tile_image_guided(
             save_dir=investigate_dir if investigate else None,
             n_steps=n_steps,
         )
+
+    # Create investigation strip if frames were saved
+    if investigate and investigate_dir is not None:
+        create_investigation_strip(investigate_dir, n_steps=n_steps)
 
     recon_image = tensor_to_image(recon_tensor)
     metrics = compute_metrics(img_array, recon_image)
