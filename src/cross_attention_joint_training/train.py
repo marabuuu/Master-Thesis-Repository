@@ -65,11 +65,11 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     else:
         strategy = 'auto'
 
-    val_check_interval = int(joint_cfg.get("val_check_interval", 1))
+    check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))
     limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
     if verbose:
-        if val_check_interval > 1:
-            print(f"[CrossJoint] Validation every {val_check_interval} epochs")
+        if check_val_every_n_epoch > 1:
+            print(f"[CrossJoint] Validation every {check_val_every_n_epoch} epochs")
         if limit_val_batches < 1.0:
             print(f"[CrossJoint] Using {limit_val_batches*100:.0f}% of val set per check")
 
@@ -83,9 +83,9 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
         callbacks=[checkpoint, LearningRateMonitor()],
         logger=tb_logger,
         accumulate_grad_batches=int(conf.accum_batches),
-        val_check_interval=val_check_interval,
+        check_val_every_n_epoch=check_val_every_n_epoch,
         limit_val_batches=limit_val_batches,
-        num_sanity_val_steps=2,
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(model, ckpt_path=ckpt_path)
