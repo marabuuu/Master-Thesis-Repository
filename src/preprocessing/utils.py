@@ -15,6 +15,11 @@ import logging
 import h5py
 from typing import List, Optional, Tuple, cast
 
+# Utility helpers for preprocessing and H5/ROI handling.
+# Attribution: Parts of the ROI/tile utility logic are adapted from mopadi
+# data-prep utilities:
+# https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/utils.py
+
 
 def preprocess_log1p_minmax(df: pd.DataFrame) -> pd.DataFrame:
     """Apply log1p then per-gene min-max scaling to [0,1].
@@ -51,8 +56,7 @@ def inspect_variance(df: pd.DataFrame) -> dict:
         'sample_var_summary': sample_var.describe().to_dict()
     }
 
-# taken and adapted from mopadi repository to work with pre-extracted tiles in zip files
-# https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/utils.py
+# Adapted from mopadi for workflows with pre-extracted tiles in zip archives.
 
 def create_polygons(df):
     polygons = []

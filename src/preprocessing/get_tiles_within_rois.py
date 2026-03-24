@@ -16,9 +16,12 @@ Example usage from the command line::
 
 The script supports parallel processing via `--num-workers` and outputs a
 zip archive and optional plot for each processed slide.
+
+Attribution:
+    Adapted from mopadi data-preparation utility:
+    https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/get_tiles_within_rois.py
 """
-# taken and adapted from mopadi repository to work with pre-extracted tiles in zip files
-# https://github.com/KatherLab/mopadi/blob/main/src/mopadi/data_prep/get_tiles_within_rois.py
+# Adapted from mopadi for workflows with pre-extracted tiles in zip archives.
 import os
 import re
 from shapely.geometry import Polygon, MultiPolygon

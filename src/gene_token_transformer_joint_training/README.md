@@ -14,6 +14,17 @@ Gene-token transformer joint training combines:
 
 The architecture stays compatible with existing diffusion pipelines while replacing only the genomic encoder component.
 
+## External References and Credits
+
+- **mopadi** (https://github.com/KatherLab/mopadi):
+  this training variant reuses the local `joint_training` stack, which itself
+  builds on mopadi diffusion training components.
+- **Bulk-RNA-BERT** (https://github.com/multiomics-open-research/Bulk-RNA-Bert):
+  this module is architecturally inspired by gene-token transformer ideas from
+  Bulk-RNA-BERT-style modeling.
+- Current status for this folder: no direct code import from Bulk-RNA-BERT;
+  inspiration is conceptual/architectural.
+
 ## Architecture
 
 ### Data Flow

@@ -26,6 +26,11 @@ Usage
         --out-dir ./finetuned_genomic_v4 \
         --epochs 20 --batch-size 4 --lr 1e-5 \
         --proj-lr 3e-4 --proj-warmup 500 --proj-layers 4
+
+Attribution:
+    - Reuses mopadi training components via imports from
+        https://github.com/KatherLab/mopadi
+    - Reuses local shared helpers from `joint_training` to avoid duplication.
 """
 
 from __future__ import annotations
@@ -68,65 +73,12 @@ from mopadi.configs.config import TrainConfig
 from mopadi.configs.templates import tcga_brca_autoenc
 from mopadi.configs.choices import TrainMode
 
-
-# ======================================================================
-#  Projection Head
-# ======================================================================
-
-class ProjectionHead(nn.Module):
-    """MLP projection: genomic space (in_dim) → UNet cond space (out_dim).
-
-    Trained jointly with the diffusion UNet — the diffusion loss gradient
-    flows through this head, teaching it which genomic dimensions are
-    relevant for reconstructing histo-pathology tiles.
-    """
-
-    def __init__(
-        self,
-        in_dim: int = 512,
-        out_dim: int = 512,
-        hidden_dim: int = 512,
-        num_layers: int = 4,
-        dropout: float = 0.1,
-    ):
-        super().__init__()
-        self.in_dim = in_dim
-        self.out_dim = out_dim
-        self.num_layers = num_layers
-
-        layers: list[nn.Module] = []
-        dims = [in_dim] + [hidden_dim] * (num_layers - 1) + [out_dim]
-        for i in range(len(dims) - 1):
-            layers.append(nn.Linear(dims[i], dims[i + 1]))
-            if i < len(dims) - 2:                # skip after last linear
-                layers.append(nn.LayerNorm(dims[i + 1]))
-                layers.append(nn.GELU())
-                layers.append(nn.Dropout(dropout))
-        self.net = nn.Sequential(*layers)
-
-        n_params = sum(p.numel() for p in self.parameters())
-        print(f"[ProjectionHead] layers={num_layers}, "
-              f"dims={in_dim}→{hidden_dim}→{out_dim}, params={n_params:,}")
-
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
-
-
-# ======================================================================
-#  Patient-ID helper
-# ======================================================================
-
-def canonical_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX from various filename formats."""
-    name = Path(name).stem.upper()
-    for sep in ("_", "."):
-        name = name.replace(sep, "-")
-    while "--" in name:
-        name = name.replace("--", "-")
-    parts = name.split("-")
-    if len(parts) >= 3 and parts[0].startswith("TCGA"):
-        return "-".join(parts[:3])
-    return name
+try:
+    from joint_training.dataset import canonical_patient_id
+    from joint_training.model import ProjectionHead
+except ImportError:  # pragma: no cover
+    from src.joint_training.dataset import canonical_patient_id  # type: ignore[import-not-found]
+    from src.joint_training.model import ProjectionHead  # type: ignore[import-not-found]
 
 
 # ======================================================================

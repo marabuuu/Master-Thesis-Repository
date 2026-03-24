@@ -8,6 +8,10 @@ Subclasses mopadi's LitModel, adding only:
 
 Everything else (EMA, optimizer, scheduler, gradient clipping, checkpointing,
 sample visualization, DDP) is inherited from mopadi's LitModel.
+
+Attribution:
+    - mopadi repository: https://github.com/KatherLab/mopadi
+    - We reuse mopadi modules via imports (no vendored mopadi source in this file).
 """
 
 from __future__ import annotations
