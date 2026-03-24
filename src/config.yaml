@@ -46,7 +46,7 @@ joint_training:
   test_fraction: 0.1                      # held out entirely for later evaluation
 
   # ── Output ────────────────────────────────────────────────────────────
-  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260323_cross_attention_training
+  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_joint_training
   latent_dir: null                        # where to save h5 latent features (default: out_dir/latents)
 
   # ── Genomic Encoder ──────────────────────────────────────────────────
@@ -97,6 +97,7 @@ joint_training:
   total_samples: 200000000                # training duration in total samples seen
   steps_per_epoch: 5000                   # batches per PL epoch
   save_every_samples: 200000              # checkpoint frequency
+  save_top_k: 3                           # keep top-k periodic checkpoints + last.ckpt
   reconstruct_every_samples: 50000        # sample visualization frequency
 
   # ── Validation Frequency Tuning ───────────────────────────────────────
@@ -104,15 +105,20 @@ joint_training:
   val_check_interval: 5                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
   limit_val_batches: 0.1                  # fraction of val set to use (1.0=full, 0.1=10%)
 
-  # ── Cross-Attention (new variant) ───────────────────────────────────
+cross_attention_joint_training:
+  # Override-only section: values are merged on top of
+  # joint_training by src/cross_attention_joint_training/train.py.
+  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_cross_attention_training
+
   cross_attention:
     heads: 4
     dim_per_head: 64
     cond_dims: [512, 256, 128]
+
   # Dropouts to force conditioning reliance (training only)
-  xT_dropout_prob: 0.05          # replace x_start with pure noise for a fraction of the batch
-  cond_dropout_prob: 0.05        # zero full cond for a fraction of the batch
-  cond_feature_dropout: 0.05     # per-feature dropout on cond
+  xT_dropout_prob: 0.05
+  cond_dropout_prob: 0.05
+  cond_feature_dropout: 0.05
 
 extract_joint_latents:
   ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
@@ -210,6 +216,20 @@ gene_token_transformer_joint_training:
     cond_dim: 512
     freeze_transformer_steps: 0
     transformer_lr: 1e-4
+
+gene_token_cross_attention_joint_training:
+  # Override-only section: values are merged on top of
+  # gene_token_transformer_joint_training by the hybrid train entrypoint.
+  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_gene_token_cross_attention_training
+
+  cross_attention:
+    heads: 4
+    dim_per_head: 64
+    cond_dims: [512, 256, 128]
+
+  cond_dropout_prob: 0.05
+  cond_feature_dropout: 0.05
+  xT_dropout_prob: 0.05
 
 sampling:
   ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt

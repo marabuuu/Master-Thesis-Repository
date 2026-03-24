@@ -94,7 +94,10 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
             f"UNet: {n_unet:,}  Total: {n_encoder + n_proj + n_unet:,}"
         )
 
-        self.save_hyperparameters({"gene_token_transformer": self.gtt_cfg.__dict__})
+        self.save_hyperparameters({
+            "gene_token_transformer": self.gtt_cfg.__dict__,
+            "joint_variant": "gene_token_transformer_joint_training",
+        })
 
     def _tokenize_genomic(self, genomic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if genomic.ndim != 2:

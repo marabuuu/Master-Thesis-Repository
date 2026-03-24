@@ -1,13 +1,15 @@
 #!/usr/bin/env python
 # -*- coding: utf-8 -*-
-"""Gene-token transformer joint training entrypoint (Phase 1 baseline)."""
+"""Gene-token + cross-attention joint training entrypoint."""
 
 from __future__ import annotations
 
 import argparse
+import copy
 import os
-import yaml
+
 import pytorch_lightning as pl
+import yaml
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
@@ -17,27 +19,37 @@ except ImportError:  # pragma: no cover
     from src.joint_training.train import _count_genes  # type: ignore[import-not-found]
 
 try:
-    from gene_token_transformer_joint_training.model import (
-        GeneTokenTransformerJointLitModel,
-        build_gene_token_transformer_conf,
+    from gene_token_cross_attention_joint_training.model import (
+        GeneTokenCrossAttentionJointLitModel,
+        build_gene_token_cross_attention_conf,
     )
 except ImportError:  # pragma: no cover
-    from src.gene_token_transformer_joint_training.model import (  # type: ignore[import-not-found]
-        GeneTokenTransformerJointLitModel,
-        build_gene_token_transformer_conf,
+    from src.gene_token_cross_attention_joint_training.model import (  # type: ignore[import-not-found]
+        GeneTokenCrossAttentionJointLitModel,
+        build_gene_token_cross_attention_conf,
     )
 
 
-def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -> None:
+def _deep_update(base: dict, overrides: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_update(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
+
+
+def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     seed = joint_cfg.get("seed", 42)
     pl.seed_everything(seed)
 
-    conf = build_gene_token_transformer_conf(joint_cfg)
+    conf = build_gene_token_cross_attention_conf(joint_cfg)
     n_genes = _count_genes(joint_cfg)
     if verbose:
-        print(f"[GeneTokenJoint] n_genes = {n_genes}")
+        print(f"[GeneTokenCrossJoint] n_genes = {n_genes}")
 
-    model = GeneTokenTransformerJointLitModel(conf, joint_cfg, n_genes)
+    model = GeneTokenCrossAttentionJointLitModel(conf, joint_cfg, n_genes)
 
     gpus = joint_cfg.get("gpus", [0])
 
@@ -68,7 +80,7 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
     ckpt_path = os.path.join(conf.logdir, "last.ckpt")
     if os.path.exists(ckpt_path):
         if verbose:
-            print(f"[GeneTokenJoint] Resuming from {ckpt_path}")
+            print(f"[GeneTokenCrossJoint] Resuming from {ckpt_path}")
     else:
         ckpt_path = None
 
@@ -87,9 +99,9 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
     limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
     if verbose:
         if check_val_every_n_epoch > 1:
-            print(f"[GeneTokenJoint] Validation every {check_val_every_n_epoch} epochs")
+            print(f"[GeneTokenCrossJoint] Validation every {check_val_every_n_epoch} epochs")
         if limit_val_batches < 1.0:
-            print(f"[GeneTokenJoint] Using {limit_val_batches*100:.0f}% of val set per check")
+            print(f"[GeneTokenCrossJoint] Using {limit_val_batches*100:.0f}% of val set per check")
 
     trainer = pl.Trainer(
         max_epochs=int(joint_cfg.get("epochs", 100)),
@@ -109,22 +121,25 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
     trainer.fit(model, ckpt_path=ckpt_path)
 
     if verbose:
-        print(f"[GeneTokenJoint] Training complete. Checkpoints in {conf.logdir}")
+        print(f"[GeneTokenCrossJoint] Training complete. Checkpoints in {conf.logdir}")
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Gene-token transformer joint training")
+    parser = argparse.ArgumentParser(description="Gene-token + cross-attention joint training")
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
     args = parser.parse_args()
 
     with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
-    joint_cfg = full_cfg.get(
-        "gene_token_transformer_joint_training",
-        full_cfg.get("joint_training", full_cfg),
-    )
 
-    run_gene_token_transformer_training(joint_cfg)
+    base_cfg = full_cfg.get("gene_token_transformer_joint_training", full_cfg.get("joint_training", {}))
+    overrides = full_cfg.get("gene_token_cross_attention_joint_training", {})
+    joint_cfg = _deep_update(base_cfg, overrides)
+
+    if "out_dir" not in overrides:
+        joint_cfg["out_dir"] = f"{base_cfg.get('out_dir', 'experiments')}_cross"
+
+    run_gene_token_cross_attention_training(joint_cfg)
 
 
 if __name__ == "__main__":
