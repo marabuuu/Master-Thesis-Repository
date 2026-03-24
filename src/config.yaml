@@ -140,6 +140,77 @@ training_stats:
   cmap_categorical: batlowS   # Crameri colormap for categorical
   cmap_sequential: batlow     # Crameri colormap for sequential
 
+gene_token_transformer_joint_training:
+  # Data
+  csv_path: /data/cat/ws/mala059b-rna2wsi/dataframes/brca_gene_expression.csv
+  tiles_zip_dir: /data/cat/ws/mala059b-rna2wsi/data/BRCA-tumor-tiles-all
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA
+  gene_list_path: null
+  max_tiles_per_patient: null
+  val_fraction: 0.1
+  test_fraction: 0.1
+
+  # Output
+  out_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260323_gene_token_transformer_training
+
+  # Diffusion / UNet (full training)
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_num_res_blocks: 2
+  T: 1000
+  T_eval: 20
+  sample_size: 8
+  diffusion_ckpt: null
+
+  # Training
+  batch_size: 2
+  lr: 1e-4
+  unet_lr: 1e-5
+  encoder_lr: 1e-4
+  proj_lr: 1e-4
+  optimizer: adam
+  weight_decay: 0.0
+  warmup_steps: 500
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  accumulate_grad_batches: 1
+  num_workers: 4
+  prefetch_factor: 2
+  val_batch_size: 4
+  val_num_workers: 6
+  val_prefetch_factor: 2
+  fp16: false
+  seed: 42
+  gpus: [0]
+
+  # Schedule (full training)
+  epochs: 100
+  total_samples: 200000000
+  steps_per_epoch: 5000
+  save_every_samples: 200000
+  reconstruct_every_samples: 50000
+
+  # Validation
+  val_check_interval: 5
+  limit_val_batches: 0.1
+
+  # Gene-token transformer
+  gene_token_transformer:
+    gene_list_path: null
+    seq_len: 512
+    value_embedding: mlp
+    d_model: 128
+    n_heads: 4
+    n_layers: 2
+    ff_mult: 2
+    dropout: 0.1
+    pooling: mean
+    cond_dim: 512
+    freeze_transformer_steps: 0
+    transformer_lr: 1e-4
+
 sampling:
   ckpt: /mnt/bulk-saturn/maralampert/genhist/experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt
   proj_ckpt: null          # optional separate projection head checkpoint
