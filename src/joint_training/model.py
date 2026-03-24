@@ -143,6 +143,7 @@ class JointLitModel(LitModel):
             "conf": conf,
             "joint_cfg": joint_cfg,
             "n_genes": n_genes,
+            "joint_variant": "joint_training",
         })
         self.joint_cfg = joint_cfg
 

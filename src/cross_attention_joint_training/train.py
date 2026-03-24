@@ -8,6 +8,7 @@ Reuses joint_training pipeline, swaps model for CrossAttentionJointLitModel.
 from __future__ import annotations
 
 import argparse
+import copy
 import os
 import yaml
 import pytorch_lightning as pl
@@ -23,6 +24,16 @@ try:
     from cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf
 except ImportError:  # pragma: no cover
     from src.cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf  # type: ignore[import-not-found]
+
+
+def _deep_update(base: dict, overrides: dict) -> dict:
+    merged = copy.deepcopy(base)
+    for key, value in overrides.items():
+        if isinstance(value, dict) and isinstance(merged.get(key), dict):
+            merged[key] = _deep_update(merged[key], value)
+        else:
+            merged[key] = value
+    return merged
 
 
 def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
@@ -41,12 +52,26 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     if not os.path.exists(conf.logdir):
         os.makedirs(conf.logdir)
 
-    checkpoint = ModelCheckpoint(
-        dirpath=conf.logdir,
-        save_last=True,
-        save_top_k=1,
-        every_n_train_steps=int(conf.save_every_samples // conf.batch_size_effective),
-    )
+    save_top_k = int(joint_cfg.get("save_top_k", 3))
+    every_n_train_steps = max(1, int(conf.save_every_samples // conf.batch_size_effective))
+    if save_top_k > 0:
+        checkpoint = ModelCheckpoint(
+            dirpath=conf.logdir,
+            save_last=True,
+            save_top_k=save_top_k,
+            monitor="loss_step",
+            mode="min",
+            filename="epoch{epoch:03d}-step{step:08d}",
+            every_n_train_steps=every_n_train_steps,
+        )
+    else:
+        checkpoint = ModelCheckpoint(
+            dirpath=conf.logdir,
+            save_last=True,
+            save_top_k=save_top_k,
+            filename="epoch{epoch:03d}-step{step:08d}",
+            every_n_train_steps=every_n_train_steps,
+        )
 
     ckpt_path = os.path.join(conf.logdir, 'last.ckpt')
     if os.path.exists(ckpt_path):
@@ -101,7 +126,18 @@ def main():
 
     with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
-    joint_cfg = full_cfg.get("joint_training", full_cfg)
+
+    base_cfg = full_cfg.get("joint_training", {})
+    overrides = full_cfg.get("cross_attention_joint_training", {})
+    if isinstance(base_cfg, dict) and isinstance(overrides, dict):
+        joint_cfg = _deep_update(base_cfg, overrides)
+    elif isinstance(overrides, dict) and overrides:
+        joint_cfg = overrides
+    else:
+        joint_cfg = full_cfg.get("joint_training", full_cfg)
+
+    if "out_dir" not in overrides:
+        joint_cfg["out_dir"] = f"{base_cfg.get('out_dir', 'experiments')}_cross_attention"
 
     run_cross_attention_training(joint_cfg)
 

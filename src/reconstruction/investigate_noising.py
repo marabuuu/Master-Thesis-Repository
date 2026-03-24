@@ -66,11 +66,6 @@ def load_checkpoint_simple(
     """
     logger.info(f"Loading checkpoint from {checkpoint_path}")
     
-    try:
-        from src.joint_training.model import JointLitModel  # type: ignore[import-not-found]
-    except ImportError:
-        from ..joint_training.model import JointLitModel  # type: ignore[import-not-found]
-    
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if "hyper_parameters" not in ckpt:
@@ -80,13 +75,54 @@ def load_checkpoint_simple(
     conf = hp.get("conf")
     joint_cfg = hp.get("joint_cfg")
     n_genes = hp.get("n_genes")
+
+    if conf is None or joint_cfg is None or n_genes is None:
+        raise ValueError(
+            "Checkpoint missing one of required hyperparameters: conf, joint_cfg, n_genes"
+        )
+
+    variant = hp.get("joint_variant")
+    if not isinstance(variant, str) or not variant:
+        has_cross = "cross_cfg" in hp or (isinstance(joint_cfg, dict) and "cross_attention" in joint_cfg)
+        has_gene_token = "gene_token_transformer" in hp
+        if has_cross and has_gene_token:
+            variant = "gene_token_cross_attention_joint_training"
+        elif has_gene_token:
+            variant = "gene_token_transformer_joint_training"
+        elif has_cross:
+            variant = "cross_attention_joint_training"
+        else:
+            variant = "joint_training"
+
+    if variant == "joint_training":
+        try:
+            from src.joint_training.model import JointLitModel as ModelCls  # type: ignore[import-not-found]
+        except ImportError:
+            from ..joint_training.model import JointLitModel as ModelCls  # type: ignore[import-not-found]
+    elif variant == "cross_attention_joint_training":
+        try:
+            from src.cross_attention_joint_training.model import CrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+        except ImportError:
+            from ..cross_attention_joint_training.model import CrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+    elif variant == "gene_token_transformer_joint_training":
+        try:
+            from src.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel as ModelCls  # type: ignore[import-not-found]
+        except ImportError:
+            from ..gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel as ModelCls  # type: ignore[import-not-found]
+    elif variant == "gene_token_cross_attention_joint_training":
+        try:
+            from src.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+        except ImportError:
+            from ..gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+    else:
+        raise ValueError(f"Unsupported joint variant in checkpoint: {variant}")
     
-    model = JointLitModel(conf, joint_cfg, n_genes)
+    model = ModelCls(conf, joint_cfg, n_genes)
     model.load_state_dict(ckpt["state_dict"])
     model = model.to(device)
     model.eval()
     
-    logger.info("Model loaded successfully")
+    logger.info(f"Model loaded successfully (variant={variant})")
     return model, conf, n_genes
 
 

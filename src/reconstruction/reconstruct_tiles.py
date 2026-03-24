@@ -291,6 +291,69 @@ def load_tiles_for_patients(
 #  Model Loading
 # ───────────────────────────────────────────────────────────────────────
 
+def _detect_joint_variant(hp: dict, joint_cfg: dict) -> str:
+    """Infer which joint-training variant produced a checkpoint."""
+    variant = hp.get("joint_variant")
+    if isinstance(variant, str) and variant:
+        return variant
+
+    has_cross = "cross_cfg" in hp or "cross_attention" in joint_cfg
+    has_gene_token = "gene_token_transformer" in hp or any(
+        k in joint_cfg
+        for k in (
+            "gene_token_transformer",
+            "gene_token_transformer_joint_training",
+            "gene_token_d_model",
+            "gene_token_n_heads",
+            "gene_token_n_layers",
+        )
+    )
+
+    if has_cross and has_gene_token:
+        return "gene_token_cross_attention_joint_training"
+    if has_gene_token:
+        return "gene_token_transformer_joint_training"
+    if has_cross:
+        return "cross_attention_joint_training"
+    return "joint_training"
+
+
+def _resolve_joint_model_class(variant: str):
+    """Resolve Lightning model class for a given joint-training variant."""
+    if variant == "joint_training":
+        try:
+            from src.joint_training.model import JointLitModel  # type: ignore[import-not-found]
+        except ImportError:
+            from ..joint_training.model import JointLitModel  # type: ignore[import-not-found]
+        return JointLitModel
+
+    if variant == "cross_attention_joint_training":
+        try:
+            from src.cross_attention_joint_training.model import CrossAttentionJointLitModel  # type: ignore[import-not-found]
+        except ImportError:
+            from ..cross_attention_joint_training.model import CrossAttentionJointLitModel  # type: ignore[import-not-found]
+        return CrossAttentionJointLitModel
+
+    if variant == "gene_token_transformer_joint_training":
+        try:
+            from src.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
+        except ImportError:
+            from ..gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
+        return GeneTokenTransformerJointLitModel
+
+    if variant == "gene_token_cross_attention_joint_training":
+        try:
+            from src.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
+        except ImportError:
+            from ..gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
+        return GeneTokenCrossAttentionJointLitModel
+
+    raise ValueError(
+        f"Unsupported joint training variant '{variant}'. "
+        "Expected one of: joint_training, cross_attention_joint_training, "
+        "gene_token_transformer_joint_training, gene_token_cross_attention_joint_training"
+    )
+
 def load_checkpoint(
     checkpoint_path: str,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -364,26 +427,26 @@ def load_checkpoint(
             f"   Expected parameters: ['conf', 'joint_cfg', 'n_genes']"
         )
     
+    variant = _detect_joint_variant(hp, joint_cfg if isinstance(joint_cfg, dict) else {})
+
     logger.info("✅ Detected JOINT TRAINING checkpoint format")
     logger.info(f"   conf: {type(conf).__name__}")
     logger.info(f"   joint_cfg: {type(joint_cfg).__name__} with keys: {list(joint_cfg.keys()) if isinstance(joint_cfg, dict) else 'N/A'}")
     logger.info(f"   n_genes: {n_genes}")
+    logger.info(f"   variant: {variant}")
     
-    # Load JointLitModel
+    # Load the exact model class variant used during training
     try:
-        from src.joint_training.model import JointLitModel  # type: ignore[import-not-found]
-    except ImportError:
-        try:
-            from ..joint_training.model import JointLitModel  # type: ignore[import-not-found]
-        except ImportError as e:
-            raise ImportError(f"Could not import JointLitModel: {e}")
+        model_cls = _resolve_joint_model_class(variant)
+    except ImportError as e:
+        raise ImportError(f"Could not import model class for variant '{variant}': {e}")
     
     try:
-        logger.info("Creating JointLitModel...")
-        model = JointLitModel(conf, joint_cfg, n_genes)
-        logger.info("✅ JointLitModel created")
+        logger.info(f"Creating {model_cls.__name__}...")
+        model = model_cls(conf, joint_cfg, n_genes)
+        logger.info(f"✅ {model_cls.__name__} created")
     except Exception as e:
-        raise ValueError(f"Failed to create JointLitModel: {e}")
+        raise ValueError(f"Failed to create {model_cls.__name__}: {e}")
     
     try:
         logger.info("Loading state dict...")
@@ -414,6 +477,8 @@ def _reconstruct_from_image_with_cond(
     seed: Optional[int] = None,
     save_dir: Optional[Path] = None,
     n_steps: int = 5,
+    inversion_steps: int = 250,
+    decode_steps: Optional[int] = None,
 ) -> torch.Tensor:
     """Encode a tile into noise and then decode it using the diffusion sampler.
 
@@ -440,62 +505,81 @@ def _reconstruct_from_image_with_cond(
     torch.Tensor
         Reconstructed image tensor in [-1, 1].
     """
-    # Prefer eval sampler (matches mopadi encode_stochastic); fallback to training sampler
-    sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
-    if sampler is None:
-        raise RuntimeError("Model does not expose `sampler` - cannot run diffusion denoising")
+    def _make_sampler(steps: Optional[int], fallback_to_eval: bool = True):
+        if steps is None:
+            sampler_obj = getattr(model, "eval_sampler", None) if fallback_to_eval else None
+            sampler_obj = sampler_obj or getattr(model, "sampler", None)
+            if sampler_obj is None:
+                raise RuntimeError("Model does not expose a diffusion sampler")
+            return sampler_obj
+
+        conf_obj = getattr(model, "conf", None)
+        if conf_obj is not None and hasattr(conf_obj, "_make_diffusion_conf"):
+            return conf_obj._make_diffusion_conf(T=int(steps)).make_sampler()  # type: ignore[attr-defined]
+
+        sampler_obj = getattr(model, "sampler", None)
+        if sampler_obj is None:
+            raise RuntimeError("Could not construct sampler for custom steps")
+        return sampler_obj
 
     if seed is not None:
         torch.manual_seed(seed)
 
-    # Get the full training sampler for encoding (T=1000 for thorough diffusion)
-    # This ensures the image is truly destroyed into noise, not just partially corrupted
-    full_sampler = getattr(model, "sampler", sampler)
-    
-    T_full = getattr(full_sampler, "num_timesteps", None)
-    if T_full is None:
-        T_full = len(getattr(full_sampler, "betas", []))
-    if not isinstance(T_full, int) or T_full <= 0:
-        raise RuntimeError("Could not determine diffusion timesteps from full sampler")
+    inversion_sampler = _make_sampler(inversion_steps, fallback_to_eval=False)
+    decode_sampler = _make_sampler(decode_steps if decode_steps is not None else inversion_steps)
 
-    # Get eval sampler timesteps for decoding (T_eval=20 for fast sampling)
-    T_eval = getattr(sampler, "num_timesteps", None)
-    if T_eval is None:
-        T_eval = len(getattr(sampler, "betas", []))
-    if not isinstance(T_eval, int) or T_eval <= 0:
-        raise RuntimeError("Could not determine diffusion timesteps from eval sampler")
+    T_inv = getattr(inversion_sampler, "num_timesteps", None)
+    if T_inv is None:
+        T_inv = len(getattr(inversion_sampler, "betas", []))
+    if not isinstance(T_inv, int) or T_inv <= 0:
+        raise RuntimeError("Could not determine inversion timesteps from sampler")
+
+    T_dec = getattr(decode_sampler, "num_timesteps", None)
+    if T_dec is None:
+        T_dec = len(getattr(decode_sampler, "betas", []))
+    if not isinstance(T_dec, int) or T_dec <= 0:
+        raise RuntimeError("Could not determine decode timesteps from sampler")
 
     # Use EMA UNet if available
     unet_model = getattr(model, "ema_model", getattr(model, "model", model))
     unet_model.eval()
 
-    # Forward diffusion (encode) using the eval sampler schedule to match the decode schedule (T_eval)
-    # - We reuse a single noise tensor `eps` across all timesteps so saved frames are comparable
-    # - x_T is sampled at the final eval diffusion timestep (T_eval - 1)
-    eps = torch.randn_like(img_tensor)
     decode_eta = 0.0  # deterministic decode
-    logger.info(f"  Encoding tile to noise using forward q_sample (T_eval={T_eval}) to keep schedules symmetric...")
+    logger.info(
+        f"  Encoding tile to noise using DDIM reverse inversion "
+        f"(T_inv={T_inv}, T_dec={T_dec}, eta={decode_eta})..."
+    )
     with torch.no_grad():
-        t_final = torch.full((img_tensor.shape[0],), T_eval - 1, device=device, dtype=torch.long)
-        x_T = sampler.q_sample(img_tensor, t_final, noise=eps)
+        inversion_out = inversion_sampler.ddim_reverse_sample_loop(
+            model=unet_model,
+            x=img_tensor,
+            clip_denoised=True,
+            model_kwargs={"cond": cond},
+            eta=0.0,
+            device=device,
+        )
+        x_T = inversion_out["sample"]
 
     # Save forward trajectory snapshots if requested
     if save_dir is not None:
         save_dir.mkdir(parents=True, exist_ok=True)
         def _to_uint8(img: torch.Tensor) -> np.ndarray:
-            # Visualization helper: min-max normalize to avoid channel bias / clipping artifacts
-            arr = img.detach().cpu()
-            arr = (arr - arr.min()) / (arr.max() - arr.min() + 1e-8)
-            return (arr * 255).clamp(0, 255).to(torch.uint8).permute(1, 2, 0).numpy()
+            # Keep fixed scaling in diffusion image range [-1, 1] to avoid amplifying
+            # weak residual structure through per-image min-max normalization.
+            arr = img.detach().cpu().clamp(-1, 1)
+            arr = ((arr + 1) / 2 * 255).clamp(0, 255).to(torch.uint8)
+            return arr.permute(1, 2, 0).numpy()
 
-        target_steps = set(np.linspace(0, T_eval - 1, n_steps, dtype=int))
-        logger.info(f"  [DEBUG] Target timesteps for saving (forward q_sample, eval schedule): {sorted(target_steps)}")
-        for t_int in sorted(target_steps):
-            t_tensor = torch.full((img_tensor.shape[0],), int(t_int), device=device, dtype=torch.long)
-            sample_t = sampler.q_sample(img_tensor, t_tensor, noise=eps)
-            save_path = save_dir / f"forward_t{t_int:04d}.png"
-            Image.fromarray(_to_uint8(sample_t.squeeze(0))).save(save_path)
-            logger.info(f"  Saved forward step t={t_int} -> {save_path.name}")
+        sample_t = inversion_out.get("sample_t", [])
+        target_indices = sorted(set(np.linspace(0, max(0, len(sample_t) - 1), n_steps, dtype=int)))
+        logger.info(
+            f"  [DEBUG] Target inversion indices for saving (DDIM reverse): {target_indices}"
+        )
+        for idx in target_indices:
+            xt = sample_t[idx]
+            save_path = save_dir / f"forward_t{idx:04d}.png"
+            Image.fromarray(_to_uint8(xt.squeeze(0))).save(save_path)
+            logger.info(f"  Saved forward inversion step idx={idx} -> {save_path.name}")
 
         # Save final encoded noise (already computed as x_T)
         encoded_noise_path = save_dir / "encoded_noise.png"
@@ -503,7 +587,7 @@ def _reconstruct_from_image_with_cond(
         logger.info(f"  Saved final encoded noise -> {encoded_noise_path.name}")
 
     # Denoising (reverse diffusion) with deterministic sampling (fast with eval sampler)
-    prog = sampler.ddim_sample_loop_progressive(
+    prog = decode_sampler.ddim_sample_loop_progressive(
         model=unet_model,
         shape=img_tensor.shape,
         noise=x_T,
@@ -514,13 +598,15 @@ def _reconstruct_from_image_with_cond(
     )
 
     final_reconstruction: torch.Tensor | None = None
-    save_denoise_timesteps = set(np.linspace(0, T_eval - 1, n_steps, dtype=int)) if save_dir is not None else set()
+    save_denoise_timesteps = set(np.linspace(0, T_dec - 1, n_steps, dtype=int)) if save_dir is not None else set()
 
-    logger.info(f"  [DEBUG] Save denoise timesteps (from T_eval={T_eval}): {sorted(save_denoise_timesteps)}")
+    logger.info(f"  [DEBUG] Save denoise timesteps (from T_dec={T_dec}): {sorted(save_denoise_timesteps)}")
     
     denoise_frame_count = 0
+    total_iter = 0
     for idx, out in enumerate(prog):
-        t = T_eval - 1 - idx
+        total_iter = idx + 1
+        t = T_dec - 1 - idx
         if t in save_denoise_timesteps:
             out_img = out["sample"].squeeze(0)
             save_path = cast(Path, save_dir) / f"denoise_t{int(t):04d}.png"
@@ -529,7 +615,7 @@ def _reconstruct_from_image_with_cond(
             denoise_frame_count += 1
         final_reconstruction = out["sample"]
     
-    logger.info(f"  [DEBUG] Total denoise frames saved: {denoise_frame_count} out of {idx + 1} iterations")
+    logger.info(f"  [DEBUG] Total denoise frames saved: {denoise_frame_count} out of {total_iter} iterations")
 
     if final_reconstruction is not None and save_dir is not None:
         final_path = cast(Path, save_dir) / "final_reconstruction.png"
@@ -550,6 +636,8 @@ def reconstruct_tile_image_guided(
     investigate: bool = False,
     investigate_dir: Optional[Path] = None,
     n_steps: int = 5,
+    inversion_steps: int = 250,
+    decode_steps: Optional[int] = None,
 ) -> Tuple[torch.Tensor, np.ndarray, Dict]:
     """Reconstruct a tile using diffusion encoding/decoding + genomic conditioning.
 
@@ -610,6 +698,8 @@ def reconstruct_tile_image_guided(
             seed=seed,
             save_dir=investigate_dir if investigate else None,
             n_steps=n_steps,
+            inversion_steps=inversion_steps,
+            decode_steps=decode_steps,
         )
 
     # Create investigation strip if frames were saved
@@ -807,12 +897,10 @@ def investigate_noising_steps(
         # Encode genomics (conditioning vector)
         cond = model.encode(genomic.unsqueeze(0))  # type: ignore[attr-defined]
 
-        # Forward (noising) process
-        sampler = getattr(model, "sampler", None)
+        sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
         if sampler is None:
-            raise RuntimeError("Model does not expose a `sampler` for diffusion operations")
+            raise RuntimeError("Model does not expose a diffusion sampler")
 
-        # Determine total timesteps from sampler
         T = getattr(sampler, "num_timesteps", None)
         if T is None:
             betas = getattr(sampler, "betas", None)
@@ -821,49 +909,56 @@ def investigate_noising_steps(
         if T <= 0:
             raise RuntimeError("Could not determine diffusion timesteps from sampler")
 
-        # Fixed noise used for forward noising (keep consistent across steps)
-        img_size = cast(int, getattr(model.conf, "img_size", 512))  # type: ignore[attr-defined]
-        fixed_noise = torch.randn(1, 3, int(img_size), int(img_size), device=device)  # type: ignore[call-arg]
-        noise_save_path = output_dir / "noise.png"
-        Image.fromarray(tensor_to_image(fixed_noise.squeeze(0))).save(noise_save_path)
-        logger.info(f"  Saved fixed noise -> {noise_save_path.name}")
-
-        # Choose timesteps to capture (0..T-1)
-        forward_timesteps = np.linspace(0, T - 1, n_steps, dtype=int)
-        forward_timesteps = sorted(set(forward_timesteps))
+        unet_model = getattr(model, "ema_model", getattr(model, "model", model))
+        unet_model.eval()
 
         x_T: torch.Tensor
+        denoise_timesteps: set[int]
+
         if mode == "image_guided":
-            # Save forward noising steps from the original tile
-            for i, t in enumerate(forward_timesteps):
-                t_tensor = torch.tensor([int(t)], device=device)
-                x_t = sampler.q_sample(img_tensor, t_tensor, noise=fixed_noise)
-                save_path = output_dir / f"forward_t{int(t):04d}.png"
-                Image.fromarray(tensor_to_image(x_t.squeeze(0))).save(save_path)
-                logger.info(f"  Saved forward step t={t} -> {save_path.name}")
+            logger.info("  Running DDIM reverse inversion for investigation")
+            inversion_out = sampler.ddim_reverse_sample_loop(
+                model=unet_model,
+                x=img_tensor,
+                clip_denoised=True,
+                model_kwargs={"cond": cond},
+                eta=0.0,
+                device=device,
+            )
+            x_T = inversion_out["sample"]
 
-            # Use x_T from the tile (encode to full noise level)
-            t_final = T - 1
-            t_final_tensor = torch.tensor([int(t_final)], device=device)
-            x_T = sampler.q_sample(img_tensor, t_final_tensor, noise=fixed_noise)
+            sample_t = inversion_out.get("sample_t", [])
+            forward_indices = sorted(set(np.linspace(0, max(0, len(sample_t) - 1), n_steps, dtype=int)))
 
-            denoise_timesteps = set(forward_timesteps)
-            denoise_timesteps = {int(t) for t in denoise_timesteps}
+            for idx in forward_indices:
+                xt = sample_t[idx]
+                save_path = output_dir / f"forward_t{idx:04d}.png"
+                Image.fromarray(tensor_to_image(xt.squeeze(0))).save(save_path)
+                logger.info(f"  Saved forward inversion idx={idx} -> {save_path.name}")
+
+            noise_save_path = output_dir / "noise.png"
+            Image.fromarray(tensor_to_image(x_T.squeeze(0))).save(noise_save_path)
+            logger.info(f"  Saved encoded noise -> {noise_save_path.name}")
+
+            denoise_timesteps = {int(t) for t in np.linspace(0, T - 1, n_steps, dtype=int)}
             denoise_timesteps.add(0)
         else:
-            # Random noise mode: start from pure noise, no tile encoding.
-            x_T = fixed_noise
-            denoise_timesteps = set()  # we will sample regularly
+            img_size = cast(int, getattr(model.conf, "img_size", 512))  # type: ignore[attr-defined]
+            x_T = torch.randn(1, 3, int(img_size), int(img_size), device=device)  # type: ignore[call-arg]
+            noise_save_path = output_dir / "noise.png"
+            Image.fromarray(tensor_to_image(x_T.squeeze(0))).save(noise_save_path)
+            logger.info(f"  Saved random noise -> {noise_save_path.name}")
+            denoise_timesteps = set()
 
-        logger.info("\nStarting reverse denoising (sampling) ...")
-        unet_model = getattr(model, "model", model)
-        prog = sampler.p_sample_loop_progressive(
+        logger.info("\nStarting DDIM reverse denoising (sampling) ...")
+        prog = sampler.ddim_sample_loop_progressive(
             model=unet_model,
             shape=x_T.shape,
             noise=x_T,
             model_kwargs={"cond": cond},
             device=device,
             progress=False,
+            eta=0.0,
         )
 
         final_reconstruction = None
@@ -907,6 +1002,8 @@ def main(
     mode: str = "image_guided",
     seed: Optional[int] = None,
     device: Optional[str] = None,
+    inversion_steps: int = 250,
+    decode_steps: Optional[int] = None,
 ) -> None:
     """
     Main reconstruction pipeline.
@@ -1081,6 +1178,8 @@ def main(
                             investigate=investigate,
                             investigate_dir=inv_dir,
                             n_steps=5,
+                            inversion_steps=inversion_steps,
+                            decode_steps=decode_steps,
                         )
                     elif mode == "random_noise":
                         recon_tensor, recon_image = reconstruct_tile_random_noise(
@@ -1215,6 +1314,14 @@ EXAMPLES:
         "--device", type=str, default=None,
         help="Device (e.g., cuda:0, cpu)",
     )
+    parser.add_argument(
+        "--inversion-steps", type=int, default=250,
+        help="Number of DDIM reverse inversion steps for image-guided mode (MoPaDi-style).",
+    )
+    parser.add_argument(
+        "--decode-steps", type=int, default=None,
+        help="Optional number of DDIM decode steps. Defaults to --inversion-steps.",
+    )
     
     args = parser.parse_args()
     
@@ -1243,4 +1350,6 @@ EXAMPLES:
         mode=args.mode,
         seed=args.seed,
         device=args.device,
+        inversion_steps=args.inversion_steps,
+        decode_steps=args.decode_steps,
     )

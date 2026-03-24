@@ -103,7 +103,10 @@ class CrossAttentionJointLitModel(JointLitModel):
         # Replace UNet with cross-attn wrapper (keep sampler interface intact)
         self.model = CrossAttentionUNetWrapper(self.model, cond_dims=cond_dims, heads=heads, dim_head=dim_head)
         # Save extended hparams
-        self.save_hyperparameters({"cross_cfg": self.cross_cfg})
+        self.save_hyperparameters({
+            "cross_cfg": self.cross_cfg,
+            "joint_variant": "cross_attention_joint_training",
+        })
 
     def training_step(self, batch, batch_idx):
         with autocast(device_type='cuda', enabled=self.conf.fp16):

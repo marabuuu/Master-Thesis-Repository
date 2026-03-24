@@ -68,12 +68,26 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
     if not os.path.exists(conf.logdir):
         os.makedirs(conf.logdir)
 
-    checkpoint = ModelCheckpoint(
-        dirpath=conf.logdir,
-        save_last=True,
-        save_top_k=1,
-        every_n_train_steps=int(conf.save_every_samples // conf.batch_size_effective),
-    )
+    save_top_k = int(joint_cfg.get("save_top_k", 3))
+    every_n_train_steps = max(1, int(conf.save_every_samples // conf.batch_size_effective))
+    if save_top_k > 0:
+        checkpoint = ModelCheckpoint(
+            dirpath=conf.logdir,
+            save_last=True,
+            save_top_k=save_top_k,
+            monitor="loss_step",
+            mode="min",
+            filename="epoch{epoch:03d}-step{step:08d}",
+            every_n_train_steps=every_n_train_steps,
+        )
+    else:
+        checkpoint = ModelCheckpoint(
+            dirpath=conf.logdir,
+            save_last=True,
+            save_top_k=save_top_k,
+            filename="epoch{epoch:03d}-step{step:08d}",
+            every_n_train_steps=every_n_train_steps,
+        )
 
     # Resume from existing checkpoint
     ckpt_path = os.path.join(conf.logdir, 'last.ckpt')
@@ -94,12 +108,12 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
         strategy = 'auto'
 
     # Validation frequency tuning for faster training
-    val_check_interval = int(joint_cfg.get("val_check_interval", 1))  # epochs between validation
+    check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))  # epochs between validation
     limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))  # fraction of val set to use
     
     if verbose:
-        if val_check_interval > 1:
-            print(f"[Joint] Validation every {val_check_interval} epochs (reduced frequency)")
+        if check_val_every_n_epoch > 1:
+            print(f"[Joint] Validation every {check_val_every_n_epoch} epochs (reduced frequency)")
         if limit_val_batches < 1.0:
             print(f"[Joint] Using {limit_val_batches*100:.0f}% of validation set per check")
 
@@ -113,9 +127,9 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
         callbacks=[checkpoint, LearningRateMonitor()],
         logger=tb_logger,
         accumulate_grad_batches=int(conf.accum_batches),
-        val_check_interval=val_check_interval,
+        check_val_every_n_epoch=check_val_every_n_epoch,
         limit_val_batches=limit_val_batches,
-        num_sanity_val_steps=2,  # quick sanity check before training
+        num_sanity_val_steps=0,
     )
 
     trainer.fit(model, ckpt_path=ckpt_path)
