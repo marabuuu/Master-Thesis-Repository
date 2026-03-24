@@ -307,11 +307,11 @@ class JointLitModel(LitModel):
     # ──────────────────────────────────────────────────────────────────
 
     def encode_genomic(self, genomic):
-        """RNA-seq → encoder → projection → conditioning vector."""
-        # Ensure encoder is on the correct device
-        if next(self.encoder.parameters()).device != self.device:
-            self.encoder = self.encoder.to(self.device)
+        """RNA-seq → encoder → projection → conditioning vector.
         
+        Note: encoder and projection are already on device (moved in on_fit_start).
+        No device checks here to avoid overhead in hot path.
+        """
         mean, log_var = self.encoder(genomic)
         # Use reparameterization trick (stochastic latent)
         z = mean + torch.exp(0.5 * log_var) * torch.randn_like(log_var)
@@ -372,16 +372,12 @@ class JointLitModel(LitModel):
         return {'val_loss': loss}
 
     def on_train_batch_start(self, batch, batch_idx):
-        """Ensure encoder and projection are on correct device at the start of each batch."""
-        try:
-            encoder_device = next(self.encoder.parameters()).device
-            if encoder_device != self.device:
-                self.encoder = self.encoder.to(self.device)
-            proj_device = next(self.projection.parameters()).device
-            if proj_device != self.device:
-                self.projection = self.projection.to(self.device)
-        except (StopIteration, AttributeError):
-            pass  # Module may not have parameters if not yet initialized
+        """Called at the start of each training batch.
+        
+        Note: Device assignment is handled once in on_fit_start().
+        Removed redundant device checks (were a performance bottleneck).
+        """
+        pass
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """EMA update + sample visualization (inherited patterns from mopadi)."""
@@ -419,17 +415,22 @@ class JointLitModel(LitModel):
         else:
             optim = torch.optim.Adam(param_groups, weight_decay=conf.weight_decay)
 
-        # Mopadi's scheduler pattern: warmup + cosine
-        total_steps = max(1, int(conf.total_samples // conf.batch_size_effective))
-        if int(conf.warmup) > 0:
+        # Scheduler based on actual training steps (not total_samples)
+        # Calculate from: epochs * steps_per_epoch = actual optimizer steps
+        epochs = int(jcfg.get("epochs", conf.max_epochs if hasattr(conf, 'max_epochs') else 100))
+        steps_per_epoch = int(conf.steps_per_epoch)
+        total_steps = max(1, epochs * steps_per_epoch)
+        warmup_steps = int(conf.warmup)
+        
+        if warmup_steps > 0:
             warmup = LambdaLR(
-                optim, lr_lambda=lambda s: min(s + 1, int(conf.warmup)) / int(conf.warmup)
+                optim, lr_lambda=lambda s: min(s + 1, warmup_steps) / warmup_steps
             )
             cosine = CosineAnnealingLR(
-                optim, T_max=max(1, total_steps - int(conf.warmup)), eta_min=1e-6
+                optim, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
             )
             sched = SequentialLR(
-                optim, schedulers=[warmup, cosine], milestones=[int(conf.warmup)]
+                optim, schedulers=[warmup, cosine], milestones=[warmup_steps]
             )
         else:
             sched = CosineAnnealingLR(optim, T_max=total_steps, eta_min=1e-6)
@@ -440,7 +441,6 @@ class JointLitModel(LitModel):
     #  Inference helpers
     # ──────────────────────────────────────────────────────────────────
 
-    @torch.no_grad()
     @torch.no_grad()
     def encode(self, genomic: torch.Tensor) -> torch.Tensor:
         """Encode gene expression → diffusion conditioning (deterministic)."""
