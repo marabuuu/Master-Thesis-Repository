@@ -16,10 +16,77 @@ from pathlib import Path
 from typing import Dict, Any
 
 
-def load_config(config_path: str) -> Dict[str, Any]:
-    """Load configuration from YAML file."""
+def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
+    """
+    Recursively resolve relative paths in config relative to repo_root.
+    
+    Converts paths like "./data/..." or "experiments/..." to absolute paths
+    based on the repository root. Leaves absolute paths unchanged.
+    
+    Parameters
+    ----------
+    config_dict : Dict[str, Any]
+        Configuration dictionary (may contain nested dicts and lists)
+    repo_root : Path
+        Repository root directory to use as base for relative paths
+    
+    Returns
+    -------
+    Dict[str, Any]
+        Configuration with resolved paths
+    """
+    if isinstance(config_dict, dict):
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                resolve_config_paths(value, repo_root)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        resolve_config_paths(item, repo_root)
+            elif isinstance(value, str):
+                # Detect if this looks like a path:
+                # - starts with ./ or ../
+                # - contains path separators and common dir names, or is a relative path
+                # - is NOT already absolute
+                if not value.startswith('/') and (
+                    value.startswith('./') or 
+                    value.startswith('../') or
+                    any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
+                ):
+                    resolved = (repo_root / value).resolve()
+                    config_dict[key] = str(resolved)
+    
+    return config_dict
+
+
+def load_config(config_path: str, repo_root: Path | None = None) -> Dict[str, Any]:
+    """
+    Load configuration from YAML file and resolve relative paths.
+    
+    Parameters
+    ----------
+    config_path : str
+        Path to config.yaml file
+    repo_root : Path, optional
+        Repository root for resolving relative paths. If None, inferred from config_path.
+    
+    Returns
+    -------
+    Dict[str, Any]
+        Configuration with resolved paths
+    """
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
+    
+    if repo_root is None:
+        # Infer repo root from config path: if config is "src/config.yaml", repo is parent
+        config_path_obj = Path(config_path).resolve()
+        repo_root = config_path_obj.parent if config_path_obj.name == "config.yaml" else config_path_obj
+        if not (repo_root / "run_pipeline.py").exists():
+            # Try parent if not found
+            repo_root = repo_root.parent
+    
+    resolve_config_paths(config, repo_root)
     return config
 
 
@@ -167,7 +234,11 @@ Examples:
     args = parser.parse_args()
     
     try:
-        config = load_config(args.config)
+        # Determine repo root: directory containing this run_pipeline.py script
+        repo_root = Path(__file__).resolve().parent
+        
+        # Load config and resolve all relative paths
+        config = load_config(args.config, repo_root=repo_root)
         run_stage(config, args.stage, args.config, verbose=not args.quiet)
     except Exception as e:
         print(f"[ERROR] {e}", file=sys.stderr)
