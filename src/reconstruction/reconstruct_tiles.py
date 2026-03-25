@@ -185,6 +185,8 @@ def load_gene_expression(
     csv_path: str,
     patient_ids: Optional[List[str]] = None,
     patient_col: str = "Patient_ID",
+    label_col: Optional[str] = None,
+    gene_list_path: Optional[str] = None,
 ) -> Tuple[Dict[str, np.ndarray], List[str]]:
     """
     Load gene expression from CSV.
@@ -196,29 +198,58 @@ def load_gene_expression(
     logger.info(f"Loading gene expression from {csv_path}")
     df = pd.read_csv(csv_path)
     
-    # Extract gene columns (everything except metadata columns)
+    if patient_col not in df.columns:
+        raise KeyError(f"Patient column '{patient_col}' not found in {csv_path}")
+
+    # Match joint_training dataset preprocessing exactly:
+    # 1) drop label col (if configured)
+    # 2) numeric coercion + NaN handling
+    # 3) optional gene subset
+    # 4) conditional log1p
+    # 5) z-score normalization
+    work = df.copy()
+    if label_col and label_col in work.columns:
+        work = work.drop(columns=[label_col])
+
     metadata_cols = {patient_col, "label", "Label", "SubType", "subtype"}
-    gene_cols = [c for c in df.columns if c not in metadata_cols]
-    logger.info(f"Found {len(gene_cols)} gene columns")
-    
-    # Filter patients
-    if patient_ids is not None:
-        patient_ids_canonical = {pid.upper() for pid in patient_ids}
-        df_filtered = []
-        for _, row in df.iterrows():
-            pid = str(row[patient_col])
-            pid_canonical = extract_patient_id(pid)
-            if pid_canonical in patient_ids_canonical:
-                df_filtered.append(row)
-        df = pd.DataFrame(df_filtered)
-        logger.info(f"Filtered to {len(df)} patients")
-    
-    # Create dict
-    gene_data = {}
-    for _, row in df.iterrows():
+    gene_cols = [c for c in work.columns if c not in metadata_cols]
+    gene_df = work[gene_cols].apply(pd.to_numeric, errors="coerce")
+    gene_df = gene_df.dropna(axis=1, how="all")
+    gene_df = gene_df.fillna(0.0)
+
+    if gene_list_path and Path(gene_list_path).exists():
+        with open(gene_list_path) as f:
+            selected_genes = [line.strip() for line in f if line.strip()]
+        available = [g for g in selected_genes if g in gene_df.columns]
+        if available:
+            gene_df = gene_df[available]
+            logger.info(f"Using {len(available)} genes from gene list: {gene_list_path}")
+
+    gene_cols = list(gene_df.columns)
+    logger.info(f"Found {len(gene_cols)} gene columns after preprocessing")
+
+    values = gene_df.values.astype(np.float64)
+    positive = values[values > 0]
+    if positive.size > 0 and float(np.median(positive)) > 2.0:
+        values = np.log1p(values)
+
+    means = values.mean(axis=0)
+    stds = values.std(axis=0)
+    stds[stds < 1e-8] = 1.0
+    values = (values - means) / stds
+
+    # Filter patients after normalization stats are computed on full table.
+    patient_ids_canonical = {pid.upper() for pid in patient_ids} if patient_ids is not None else None
+
+    gene_data: Dict[str, np.ndarray] = {}
+    for row_idx, (_, row) in enumerate(df.iterrows()):
         pid = extract_patient_id(str(row[patient_col]))
-        genes = row[gene_cols].values.astype(np.float32)
-        gene_data[pid] = genes
+        if patient_ids_canonical is not None and pid not in patient_ids_canonical:
+            continue
+        gene_data[pid] = values[row_idx].astype(np.float32)
+
+    if patient_ids_canonical is not None:
+        logger.info(f"Filtered to {len(gene_data)} patients")
     
     logger.info(f"Loaded gene expression for {len(gene_data)} patients")
     return gene_data, gene_cols
@@ -766,11 +797,30 @@ def _reconstruct_from_noise_with_cond(
     device: torch.device,
 ) -> torch.Tensor:
     """Decode from noise using the diffusion sampler (same as training)."""
-    sampler = getattr(model, "sampler", None)
+    sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
     if sampler is None:
         raise RuntimeError("Model does not expose `sampler` for diffusion decoding")
 
-    unet_model = getattr(model, "model", model)
+    unet_model = getattr(model, "ema_model", getattr(model, "model", model))
+    unet_model.eval()
+
+    if hasattr(sampler, "ddim_sample_loop_progressive"):
+        prog = sampler.ddim_sample_loop_progressive(
+            model=unet_model,
+            shape=noise.shape,
+            noise=noise,
+            model_kwargs={"cond": cond},
+            device=device,
+            progress=False,
+            eta=0.0,
+        )
+        final_reconstruction: torch.Tensor | None = None
+        for out in prog:
+            final_reconstruction = out["sample"]
+        if final_reconstruction is None:
+            raise RuntimeError("No reconstruction produced from DDIM sampling loop")
+        return final_reconstruction
+
     out = sampler.p_sample_loop(
         model=unet_model,
         shape=noise.shape,
@@ -1043,6 +1093,7 @@ def main(
     tiles_dir: str | Path,
     save_dir: str,
     patients: Optional[List[str] | str] = None,
+    conditioning_patients: Optional[List[str] | str] = None,
     patient_splits_path: Optional[str] = None,
     n_tiles_per_patient: int = 20,
     investigate: bool = False,
@@ -1070,6 +1121,9 @@ def main(
     patients : list of str, str, or None, optional
         Specific patient IDs to process, a split name ("train", "val", "test"),
         or None to use all from CSV.
+    conditioning_patients : list of str, str, or None, optional
+        Patient IDs (or split name) to use for genomic conditioning.
+        If None, each tile patient is conditioned on its own RNA profile (default).
     patient_splits_path : str, optional
         Path to patient_splits.json (required if patients is a split name).
     n_tiles_per_patient : int
@@ -1131,7 +1185,7 @@ def main(
     if patient_splits_path is None:
         patient_splits_path = rec_cfg.get("patient_splits_path")  # Try config also
     
-    # Handle split name ("train", "val", "test")
+    # Handle split name ("train", "val", "test") for tile source patients
     patient_ids_list: List[str]
     if isinstance(patients, str) and patients in ("train", "val", "test"):
         split_name = patients
@@ -1163,19 +1217,61 @@ def main(
     else:
         patient_ids_list = [extract_patient_id(p) for p in patients]
         logger.info(f"Using {len(patient_ids_list)} specified patients")
+
+    # Optional cross-patient conditioning IDs
+    conditioning_ids_list: Optional[List[str]]
+    if conditioning_patients is None:
+        conditioning_ids_list = None
+    elif isinstance(conditioning_patients, str) and conditioning_patients in ("train", "val", "test"):
+        split_name = conditioning_patients
+        if patient_splits_path is None:
+            raise ValueError(
+                f"conditioning_patients='{split_name}' requires 'patient_splits_path' in config or as argument"
+            )
+        if not Path(patient_splits_path).exists():
+            raise FileNotFoundError(f"patient_splits.json not found: {patient_splits_path}")
+
+        with open(patient_splits_path) as f:
+            splits = json.load(f)
+        if split_name not in splits:
+            raise ValueError(
+                f"Conditioning split '{split_name}' not found in {patient_splits_path}. "
+                f"Available: {list(splits.keys())}"
+            )
+        split_data = splits[split_name]
+        split_patients = split_data.get("patients", split_data) if isinstance(split_data, dict) else split_data
+        conditioning_ids_list = cast(List[str], split_patients if isinstance(split_patients, list) else [])
+        conditioning_ids_list = [extract_patient_id(p) for p in conditioning_ids_list]
+        logger.info(f"Using {len(conditioning_ids_list)} conditioning patients from '{split_name}' split")
+    elif isinstance(conditioning_patients, list):
+        conditioning_ids_list = [extract_patient_id(p) for p in conditioning_patients]
+        logger.info(f"Using {len(conditioning_ids_list)} specified conditioning patients")
+    else:
+        raise ValueError(
+            "conditioning_patients must be None, a patient ID list, or one of: train/val/test"
+        )
+
+    if conditioning_ids_list is not None and len(conditioning_ids_list) == 0:
+        raise ValueError("conditioning_patients resolved to an empty list")
     
     # Load gene expressions
+    gene_patient_ids = set(patient_ids_list)
+    if conditioning_ids_list is not None:
+        gene_patient_ids.update(conditioning_ids_list)
+
     gene_data, gene_names = load_gene_expression(
         gene_csv_path,
-        patient_ids_list,
-        patient_col=joint_cfg.get("patient_col", "Patient_ID"),
+        sorted(gene_patient_ids),
+        patient_col=joint_cfg_ckpt.get("patient_col", "Patient_ID"),
+        label_col=joint_cfg_ckpt.get("label_col"),
+        gene_list_path=joint_cfg_ckpt.get("gene_list_path"),
     )
     
     # Load tiles
     tiles_dir_path = Path(tiles_dir)
     patient_tiles = load_tiles_for_patients(
         tiles_dir_path,
-        list(gene_data.keys()),
+        patient_ids_list,
         n_tiles_per_patient,
     )
     
@@ -1183,101 +1279,119 @@ def main(
     results = []
     
     for patient_id, tiles_list in patient_tiles.items():
-        if patient_id not in gene_data:
-            logger.warning(f"No gene data for {patient_id}, skipping")
+        logger.info(f"\nProcessing tile patient {patient_id} ({len(tiles_list)} tiles)")
+
+        cond_ids_for_tiles = conditioning_ids_list if conditioning_ids_list is not None else [patient_id]
+        cond_ids_for_tiles = [pid for pid in cond_ids_for_tiles if pid in gene_data]
+        if len(cond_ids_for_tiles) == 0:
+            logger.warning(f"No matching gene data for conditioning patients (tile patient={patient_id}), skipping")
             continue
-        
-        logger.info(f"\nProcessing {patient_id} ({len(tiles_list)} tiles)")
-        
-        # Convert gene expression to tensor
-        genes_np = gene_data[patient_id]
-        genomic_tensor = torch.from_numpy(genes_np).to(device_obj, dtype=torch.float32)
+        if conditioning_ids_list is not None:
+            logger.info(f"Conditioning each tile with {len(cond_ids_for_tiles)} RNA profile(s)")
         
         orig_zip_path = orig_dir / f"{patient_id}.zip"
-        recon_zip_path = recon_dir / f"{patient_id}.zip"
-        
-        with zipfile.ZipFile(orig_zip_path, 'w') as zf_orig, zipfile.ZipFile(recon_zip_path, 'w') as zf_recon:
-            # Per-tile reconstruction
-            for tile_path, tile_name in tiles_list:
-                # Deterministic seed for reproducible runs (and consistent
-                # investigation output). This is stable across Python processes.
-                if seed is not None:
-                    tile_seed = int(
-                        hashlib.sha256(f"{seed}_{patient_id}_{tile_name}".encode()).hexdigest(),
-                        16,
-                    ) % (2**32)
+
+        with zipfile.ZipFile(orig_zip_path, 'w') as zf_orig:
+            for cond_idx, cond_patient_id in enumerate(cond_ids_for_tiles):
+                genes_np = gene_data[cond_patient_id]
+                genomic_tensor = torch.from_numpy(genes_np).to(device_obj, dtype=torch.float32)
+
+                if conditioning_ids_list is None:
+                    recon_zip_path = recon_dir / f"{patient_id}.zip"
                 else:
-                    tile_seed = None
+                    recon_zip_path = recon_dir / f"{patient_id}__cond_{cond_patient_id}.zip"
 
-                # Prepare investigation directory (if requested)
-                inv_dir = None
-                if investigate:
-                    inv_dir = save_dir_path / "investigation" / f"{patient_id}_{Path(tile_name).stem}"
+                logger.info(f"  Conditioning on RNA patient {cond_patient_id} -> {recon_zip_path.name}")
 
-                try:
-                    if mode == "image_guided":
-                        recon_tensor, recon_image, metrics = reconstruct_tile_image_guided(
-                            model,
-                            tile_path,
-                            genomic_tensor,
-                            device_obj,
-                            seed=tile_seed,
-                            investigate=investigate,
-                            investigate_dir=inv_dir,
-                            n_steps=5,
-                            inversion_steps=inversion_steps,
-                            decode_steps=decode_steps,
-                        )
-                    elif mode == "random_noise":
-                        recon_tensor, recon_image = reconstruct_tile_random_noise(
-                            model,
-                            genomic_tensor,
-                            device_obj,
-                            seed=tile_seed,
-                            investigate=investigate,
-                            investigate_dir=inv_dir,
-                            n_steps=5,
-                        )
-                        metrics = {}  # No ground truth for comparison
-                    else:
-                        raise ValueError(f"Unknown mode: {mode}")
+                with zipfile.ZipFile(recon_zip_path, 'w') as zf_recon:
+                    for tile_path, tile_name in tiles_list:
+                        # Deterministic seed for reproducible runs (and consistent
+                        # investigation output). This is stable across Python processes.
+                        if seed is not None:
+                            tile_seed = int(
+                                hashlib.sha256(
+                                    f"{seed}_{patient_id}_{cond_patient_id}_{tile_name}".encode()
+                                ).hexdigest(),
+                                16,
+                            ) % (2**32)
+                        else:
+                            tile_seed = None
 
-                    # Save reconstructed image to ZIP
-                    recon_pil = Image.fromarray(recon_image)
-                    recon_bytes = io.BytesIO()
-                    recon_pil.save(recon_bytes, format="PNG")
-                    zf_recon.writestr(f"{patient_id}_{tile_name}", recon_bytes.getvalue())
+                        inv_dir = None
+                        if investigate:
+                            inv_dir = (
+                                save_dir_path
+                                / "investigation"
+                                / f"{patient_id}__cond_{cond_patient_id}_{Path(tile_name).stem}"
+                            )
 
-                    # Save original image to ZIP
-                    if isinstance(tile_path, str) and "::" in tile_path:
-                        zip_path, member_name = tile_path.split("::", 1)
-                        with zipfile.ZipFile(zip_path, "r") as zf_inner:
-                            with zf_inner.open(member_name) as fInner:
-                                orig_pil = Image.open(fInner).convert("RGB")
-                    else:
-                        orig_pil = Image.open(tile_path).convert("RGB")
-                        
-                    orig_bytes = io.BytesIO()
-                    orig_pil.save(orig_bytes, format="PNG")
-                    zf_orig.writestr(f"{patient_id}_{tile_name}", orig_bytes.getvalue())
+                        try:
+                            if mode == "image_guided":
+                                recon_tensor, recon_image, metrics = reconstruct_tile_image_guided(
+                                    model,
+                                    tile_path,
+                                    genomic_tensor,
+                                    device_obj,
+                                    seed=tile_seed,
+                                    investigate=investigate,
+                                    investigate_dir=inv_dir,
+                                    n_steps=5,
+                                    inversion_steps=inversion_steps,
+                                    decode_steps=decode_steps,
+                                )
+                            elif mode == "random_noise":
+                                recon_tensor, recon_image = reconstruct_tile_random_noise(
+                                    model,
+                                    genomic_tensor,
+                                    device_obj,
+                                    seed=tile_seed,
+                                    investigate=investigate,
+                                    investigate_dir=inv_dir,
+                                    n_steps=5,
+                                )
+                                metrics = {}  # No ground truth for comparison
+                            else:
+                                raise ValueError(f"Unknown mode: {mode}")
 
-                    # Record result
-                    result_row = {
-                        "patient_id": patient_id,
-                        "tile_name": tile_name,
-                        "status": "success",
-                        **metrics,
-                    }
-                    results.append(result_row)
-                    logger.debug(f"  ✓ {tile_name}")
-                    
-                except Exception as e:
-                    logger.error(f"  ✗ {tile_name}: {e}")
-                    results.append({
-                        "patient_id": patient_id,
-                        "tile_name": tile_name,
-                        "status": f"error: {str(e)}",
-                    })
+                            # Save reconstructed image to ZIP
+                            recon_pil = Image.fromarray(recon_image)
+                            recon_bytes = io.BytesIO()
+                            recon_pil.save(recon_bytes, format="PNG")
+                            zf_recon.writestr(f"{patient_id}_{tile_name}", recon_bytes.getvalue())
+
+                            # Save original image once (first conditioning pass only)
+                            if cond_idx == 0:
+                                if isinstance(tile_path, str) and "::" in tile_path:
+                                    zip_path, member_name = tile_path.split("::", 1)
+                                    with zipfile.ZipFile(zip_path, "r") as zf_inner:
+                                        with zf_inner.open(member_name) as fInner:
+                                            orig_pil = Image.open(fInner).convert("RGB")
+                                else:
+                                    orig_pil = Image.open(tile_path).convert("RGB")
+
+                                orig_bytes = io.BytesIO()
+                                orig_pil.save(orig_bytes, format="PNG")
+                                zf_orig.writestr(f"{patient_id}_{tile_name}", orig_bytes.getvalue())
+
+                            # Record result
+                            result_row = {
+                                "patient_id": patient_id,
+                                "conditioning_patient_id": cond_patient_id,
+                                "tile_name": tile_name,
+                                "status": "success",
+                                **metrics,
+                            }
+                            results.append(result_row)
+                            logger.debug(f"  ✓ {tile_name} (cond={cond_patient_id})")
+
+                        except Exception as e:
+                            logger.error(f"  ✗ {tile_name} (cond={cond_patient_id}): {e}")
+                            results.append({
+                                "patient_id": patient_id,
+                                "conditioning_patient_id": cond_patient_id,
+                                "tile_name": tile_name,
+                                "status": f"error: {str(e)}",
+                            })
     
     # Save results CSV
     results_df = pd.DataFrame(results)
@@ -1328,6 +1442,13 @@ EXAMPLES:
     parser.add_argument(
         "--patients", type=str, nargs="+", default=None,
         help="Specific patient IDs to process (e.g., TCGA-XX-XX TCGA-YY-YY)",
+    )
+    parser.add_argument(
+        "--conditioning-patients", type=str, nargs="+", default=None,
+        help=(
+            "Optional patient IDs used for genomic conditioning. "
+            "If omitted, each tile patient uses its own RNA profile."
+        ),
     )
     parser.add_argument(
         "--gene-csv", type=str, default=None,
@@ -1392,6 +1513,7 @@ EXAMPLES:
         tiles_dir=tiles_dir,
         save_dir=args.save_dir,
         patients=args.patients,
+        conditioning_patients=args.conditioning_patients,
         n_tiles_per_patient=args.n_tiles_per_patient,
         investigate=args.investigate,
         mode=args.mode,
