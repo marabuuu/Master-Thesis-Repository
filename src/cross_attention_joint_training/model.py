@@ -9,7 +9,7 @@ Cross-attention variant of joint_training.
 
 from __future__ import annotations
 
-from typing import List, Optional
+from typing import List, Optional, cast
 
 import torch
 import torch.nn as nn
@@ -20,6 +20,8 @@ try:
     from joint_training.model import JointLitModel, build_conf
 except ImportError:  # pragma: no cover
     from src.joint_training.model import JointLitModel, build_conf  # type: ignore[import-not-found]
+
+JointLitModelBase = cast(type, JointLitModel)
 
 
 class CrossAttentionBlock(nn.Module):
@@ -83,7 +85,7 @@ class CrossAttentionUNetWrapper(nn.Module):
         return self._make_cond_multi(cond)
 
 
-class CrossAttentionJointLitModel(JointLitModel):
+class CrossAttentionJointLitModel(JointLitModelBase):
     """Joint model with cross-attn UNet and conditioning/noise dropouts."""
 
     def __init__(self, conf, joint_cfg: dict, n_genes: int):
@@ -128,17 +130,23 @@ class CrossAttentionJointLitModel(JointLitModel):
 
             cond_multi = self.model.make_cond_multi(cond)
 
-            # x_T dropout: replace some x_start with pure noise
+            # x_T dropout (curriculum): send a subset to highest timestep.
+            #
+            # Rationale:
+            # Replacing x_start with pure random noise and then applying q_sample
+            # again can create "double-noise" inputs with weak learning signal.
+            # Instead, keep x_start=real image and force t=T-1 for dropped samples,
+            # which approximates the intended hard denoising regime while keeping
+            # the diffusion objective well-formed.
             x_start = imgs
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             p_x = self.cross_cfg.get("xT_dropout_prob", 0.0)
             if p_x > 0:
                 mask_x = torch.rand(imgs.shape[0], device=imgs.device) < p_x
                 if mask_x.any():
-                    noise = torch.randn_like(imgs)
-                    x_start = x_start.clone()
-                    x_start[mask_x] = noise[mask_x]
+                    t = t.clone()
+                    t[mask_x] = int(self.conf.T - 1)
 
-            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             losses = self.sampler.training_losses(
                 model=self.model,
                 x_start=x_start,

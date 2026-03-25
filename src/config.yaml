@@ -108,7 +108,12 @@ joint_training:
 cross_attention_joint_training:
   # Override-only section: values are merged on top of
   # joint_training by src/cross_attention_joint_training/train.py.
-  out_dir: ./experiments/20260324_cross_attention_training
+  out_dir: ./experiments/20260325_cross_attention_training
+
+  # LR ratio tuning: keep UNet slower than conditioning path
+  unet_lr: 5e-6
+  encoder_lr: 1e-4
+  proj_lr: 3e-4
 
   cross_attention:
     heads: 4
