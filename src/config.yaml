@@ -344,14 +344,14 @@ segmentation:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/joint/last.ckpt
+  checkpoint_path: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_cross_attention_training/joint/last.ckpt
   
   # ── Data Input ────────────────────────────────────────────────────────
-  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression.csv
-  tiles_zip_dir: /mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-all
+  csv_path: /data/cat/ws/mala059b-rna2wsi/dataframes/brca_gene_expression.csv
+  tiles_zip_dir: /data/cat/ws/mala059b-rna2wsi/data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
   patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]  # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_splits_path: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
@@ -359,7 +359,7 @@ reconstruction:
   investigate: true         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260320_joint_training_encoder_only_slurm/investigate_image_guided
+  output_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260324_cross_attention_training/investigate_image_guided
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

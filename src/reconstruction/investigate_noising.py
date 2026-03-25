@@ -20,6 +20,9 @@ Usage:
 from __future__ import annotations
 
 import logging
+import os
+import sys
+import time
 from pathlib import Path
 from typing import Optional, Tuple
 
@@ -30,6 +33,36 @@ from PIL import Image
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 logger = logging.getLogger(__name__)
+
+
+def _ensure_mopadi_import_path() -> None:
+    """Ensure local mopadi source is importable for checkpoint unpickling."""
+    env_path = os.getenv("MOPADI_SRC")
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        Path(env_path) if env_path else None,
+        repo_root / "mopadi" / "src",
+        repo_root.parent / "mopadi" / "src",
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate = candidate.resolve()
+        if (candidate / "mopadi").exists():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+                logger.info(f"Added mopadi import path: {candidate_str}")
+            break
+
+
+def _sanitize_joint_cfg_for_inference(joint_cfg: dict) -> dict:
+    """Disable constructor-side preload ckpts for inference-only checkpoint loading."""
+    cfg = dict(joint_cfg)
+    cfg["diffusion_ckpt"] = None
+    cfg["encoder_ckpt"] = None
+    return cfg
 
 
 def extract_patient_id(name: str) -> str:
@@ -65,7 +98,8 @@ def load_checkpoint_simple(
         (model, config, n_genes)
     """
     logger.info(f"Loading checkpoint from {checkpoint_path}")
-    
+
+    _ensure_mopadi_import_path()
     ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     
     if "hyper_parameters" not in ckpt:
@@ -117,8 +151,13 @@ def load_checkpoint_simple(
     else:
         raise ValueError(f"Unsupported joint variant in checkpoint: {variant}")
     
-    model = ModelCls(conf, joint_cfg, n_genes)
+    safe_joint_cfg = _sanitize_joint_cfg_for_inference(joint_cfg)
+    t0 = time.time()
+    model = ModelCls(conf, safe_joint_cfg, n_genes)
+    logger.info(f"Model init finished in {time.time() - t0:.1f}s")
+    t1 = time.time()
     model.load_state_dict(ckpt["state_dict"])
+    logger.info(f"State dict load finished in {time.time() - t1:.1f}s")
     model = model.to(device)
     model.eval()
     

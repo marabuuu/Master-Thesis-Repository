@@ -31,6 +31,8 @@ import hashlib
 import json
 import logging
 import os
+import sys
+import time
 import zipfile
 import io
 from pathlib import Path
@@ -291,6 +293,31 @@ def load_tiles_for_patients(
 #  Model Loading
 # ───────────────────────────────────────────────────────────────────────
 
+def _ensure_mopadi_import_path() -> None:
+    """Ensure local mopadi source is importable for checkpoint unpickling.
+
+    Some checkpoints store objects under ``mopadi.configs`` in hyperparameters.
+    When loading outside SLURM, ``PYTHONPATH`` may miss the local mopadi source.
+    """
+    env_path = os.getenv("MOPADI_SRC")
+    repo_root = Path(__file__).resolve().parents[2]
+    candidates = [
+        Path(env_path) if env_path else None,
+        repo_root / "mopadi" / "src",
+        repo_root.parent / "mopadi" / "src",
+    ]
+
+    for candidate in candidates:
+        if candidate is None:
+            continue
+        candidate = candidate.resolve()
+        if (candidate / "mopadi").exists():
+            candidate_str = str(candidate)
+            if candidate_str not in sys.path:
+                sys.path.insert(0, candidate_str)
+                logger.info(f"Added mopadi import path: {candidate_str}")
+            break
+
 def _detect_joint_variant(hp: dict, joint_cfg: dict) -> str:
     """Infer which joint-training variant produced a checkpoint."""
     variant = hp.get("joint_variant")
@@ -354,6 +381,19 @@ def _resolve_joint_model_class(variant: str):
         "gene_token_transformer_joint_training, gene_token_cross_attention_joint_training"
     )
 
+
+def _sanitize_joint_cfg_for_inference(joint_cfg: dict) -> dict:
+    """Return a copy of joint_cfg with constructor-only preload ckpts disabled.
+
+    During reconstruction we load the full state dict from the target checkpoint,
+    so constructor-side optional preload checkpoints are unnecessary and can
+    stall if paths point to slow/unavailable network mounts.
+    """
+    cfg = dict(joint_cfg)
+    cfg["diffusion_ckpt"] = None
+    cfg["encoder_ckpt"] = None
+    return cfg
+
 def load_checkpoint(
     checkpoint_path: str,
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu"),
@@ -379,6 +419,7 @@ def load_checkpoint(
     
     # Load state dict
     try:
+        _ensure_mopadi_import_path()
         ckpt = torch.load(checkpoint_path, map_location=device, weights_only=False)
     except Exception as e:
         raise ValueError(f"Failed to load checkpoint file: {e}")
@@ -440,17 +481,23 @@ def load_checkpoint(
         model_cls = _resolve_joint_model_class(variant)
     except ImportError as e:
         raise ImportError(f"Could not import model class for variant '{variant}': {e}")
+
+    safe_joint_cfg = _sanitize_joint_cfg_for_inference(joint_cfg)
     
     try:
         logger.info(f"Creating {model_cls.__name__}...")
-        model = model_cls(conf, joint_cfg, n_genes)
+        t0 = time.time()
+        model = model_cls(conf, safe_joint_cfg, n_genes)
+        logger.info(f"Model init finished in {time.time() - t0:.1f}s")
         logger.info(f"✅ {model_cls.__name__} created")
     except Exception as e:
         raise ValueError(f"Failed to create {model_cls.__name__}: {e}")
     
     try:
         logger.info("Loading state dict...")
+        t1 = time.time()
         model.load_state_dict(ckpt["state_dict"])
+        logger.info(f"State dict load finished in {time.time() - t1:.1f}s")
         logger.info("✅ State dict loaded")
     except Exception as e:
         raise ValueError(f"Failed to load state dict into JointLitModel: {e}")
