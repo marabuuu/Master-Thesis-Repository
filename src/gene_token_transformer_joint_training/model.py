@@ -119,6 +119,12 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
         cond = self.cond_projection(pooled)
         return cond
 
+    @torch.no_grad()
+    def encode(self, genomic: torch.Tensor) -> torch.Tensor:
+        """Encode gene expression → diffusion conditioning (deterministic)."""
+        self.eval()
+        return self.encode_genomic(genomic)
+
 
 def build_gene_token_transformer_conf(joint_cfg: dict):
     """Reuse baseline joint config builder for diffusion/training defaults."""

@@ -35,6 +35,20 @@ def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[s
     Dict[str, Any]
         Configuration with resolved paths
     """
+    def _resolve_path(value: str) -> str:
+        repo_candidate = (repo_root / value).resolve()
+        normalized = value[2:] if value.startswith("./") else value
+
+        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
+        # are siblings of the repository root.
+        # of the repository root. Use parent fallback when needed.
+        if normalized.startswith(("data/", "dataframes/", "experiments/")):
+            parent_candidate = (repo_root.parent / normalized).resolve()
+            if parent_candidate.exists() or not repo_candidate.exists():
+                return str(parent_candidate)
+
+        return str(repo_candidate)
+
     if isinstance(config_dict, dict):
         for key, value in config_dict.items():
             if isinstance(value, dict):
@@ -53,8 +67,7 @@ def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[s
                     value.startswith('../') or
                     any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
                 ):
-                    resolved = (repo_root / value).resolve()
-                    config_dict[key] = str(resolved)
+                    config_dict[key] = _resolve_path(value)
     
     return config_dict
 

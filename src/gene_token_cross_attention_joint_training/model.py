@@ -76,15 +76,14 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             cond_multi = self.model.make_cond_multi(cond)
 
             x_start = imgs
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             p_x = self.cross_cfg.get("xT_dropout_prob", 0.0)
             if p_x > 0:
                 mask_x = torch.rand(imgs.shape[0], device=imgs.device) < p_x
                 if mask_x.any():
-                    noise = torch.randn_like(imgs)
-                    x_start = x_start.clone()
-                    x_start[mask_x] = noise[mask_x]
+                    t = t.clone()
+                    t[mask_x] = int(self.conf.T - 1)
 
-            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             losses = self.sampler.training_losses(
                 model=self.model,
                 x_start=x_start,
@@ -124,6 +123,13 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
 
         if self.is_last_accum(batch_idx):
             ema(self.model.base_unet, self.ema_model, self.conf.ema_decay)
+
+            with torch.no_grad():
+                genomic = batch["genomic"].to(self.device, dtype=torch.float32)
+                cond = self.encode_genomic(genomic)
+
+            self.log_sample(x_start=batch["img"], cond=cond)
+            self.evaluate_scores()
 
 
 def build_gene_token_cross_attention_conf(joint_cfg: dict):

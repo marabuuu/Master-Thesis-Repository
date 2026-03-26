@@ -7,6 +7,7 @@ from __future__ import annotations
 import argparse
 import copy
 import os
+from pathlib import Path
 
 import pytorch_lightning as pl
 import yaml
@@ -40,6 +41,38 @@ def _deep_update(base: dict, overrides: dict) -> dict:
     return merged
 
 
+def _resolve_config_paths(config_dict: dict, repo_root: Path) -> dict:
+    """Recursively resolve relative paths in config against repo_root."""
+    def _resolve_path(value: str) -> str:
+        repo_candidate = (repo_root / value).resolve()
+        normalized = value[2:] if value.startswith("./") else value
+
+        if normalized.startswith(("data/", "dataframes/", "experiments/")):
+            parent_candidate = (repo_root.parent / normalized).resolve()
+            if parent_candidate.exists() or not repo_candidate.exists():
+                return str(parent_candidate)
+
+        return str(repo_candidate)
+
+    if isinstance(config_dict, dict):
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                _resolve_config_paths(value, repo_root)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _resolve_config_paths(item, repo_root)
+            elif isinstance(value, str):
+                if not value.startswith('/') and (
+                    value.startswith('./')
+                    or value.startswith('../')
+                    or any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
+                ):
+                    config_dict[key] = _resolve_path(value)
+
+    return config_dict
+
+
 def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     seed = joint_cfg.get("seed", 42)
     pl.seed_everything(seed)
@@ -65,7 +98,8 @@ def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = Tru
             save_top_k=save_top_k,
             monitor="loss_step",
             mode="min",
-            filename="epoch{epoch:03d}-step{step:08d}",
+            filename="{epoch:03d}-{step:08d}",
+            auto_insert_metric_name=False,
             every_n_train_steps=every_n_train_steps,
         )
     else:
@@ -73,7 +107,8 @@ def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = Tru
             dirpath=conf.logdir,
             save_last=True,
             save_top_k=save_top_k,
-            filename="epoch{epoch:03d}-step{step:08d}",
+            filename="{epoch:03d}-{step:08d}",
+            auto_insert_metric_name=False,
             every_n_train_steps=every_n_train_steps,
         )
 
@@ -131,6 +166,9 @@ def main() -> None:
 
     with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    full_cfg = _resolve_config_paths(full_cfg, repo_root)
 
     base_cfg = full_cfg.get("gene_token_transformer_joint_training", full_cfg.get("joint_training", {}))
     overrides = full_cfg.get("gene_token_cross_attention_joint_training", {})
