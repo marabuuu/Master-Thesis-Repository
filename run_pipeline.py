@@ -186,6 +186,14 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         if "segmentation" not in config:
             raise ValueError("No 'segmentation' section in config.yaml")
         run_segmentation(config["segmentation"], verbose=verbose)
+
+    elif stage == "subtype_classifier":
+        from src.classifier import run_subtype_classifier
+        if "subtype_classifier" not in config:
+            raise ValueError("No 'subtype_classifier' section in config.yaml")
+        cfg = dict(config["subtype_classifier"])
+        cfg.setdefault("config_path", config_path)
+        run_subtype_classifier(cfg, verbose=verbose)
     
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
@@ -202,7 +210,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, training_stats, sampling, reconstruction, segmentation, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
         )
 
 
@@ -234,7 +242,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "training_stats", "sampling", "reconstruction", "segmentation", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

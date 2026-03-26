@@ -364,27 +364,50 @@ segmentation:
     save_detailed_report: true         # save per-channel and summary JSON
     save_visualizations: false         # (requires persim + matplotlib)
 
+# ─── Subtype Classifier on Virchow2 Features ───────────────────────────
+
+subtype_classifier:
+  mode: both   # train | evaluate | both
+  # Virchow2 H5 feature directory (one .h5/.hdf5 per patient)
+  features_dir: ./experiments/virchow2_features
+  # Use the same patient splits as the diffusion run
+  patient_splits_path: ./experiments/20260326_cross_attention_genomic_counterfactual/patient_splits.json
+  # Optional override (defaults to encoding.csv_path in config)
+  # label_csv_path: ./dataframes/brca_gene_expression_with_subtypes.csv
+  # Optional cap for balanced tile counts per patient
+  max_tiles_per_patient: null
+  seed: 42
+  output_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/subtype_classifier
+  train:
+    solver: liblinear
+    C: 1.0
+    max_iter: 2000
+    class_weight: balanced
+  evaluate:
+    # null -> auto-uses <output_dir>/train/subtype_linear_model.joblib
+    model_path: null
+
 # ─── Tile Reconstruction from Genomic Features ──────────────────────────
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: /data/cat/ws/mala059b-rna2wsi/Master-Thesis-Repository/experiments/20260325_cross_attention_training/joint/last.ckpt
+  checkpoint_path: ./experiments/20260325_cross_attention_training/joint/last.ckpt
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ./dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
   patient_ids: [TCGA-A2-A04T]   # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  conditioning_patients: [TCGA-A1-A0SJ]
-  patient_splits_path: /data/cat/ws/mala059b-rna2wsi/Master-Thesis-Repository/experiments/20260325_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
+  #conditioning_patients: [TCGA-A1-A0SJ]
+  patient_splits_path: ./experiments/20260325_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
-  n_tiles_per_patient: 2    # number of tiles to sample per patient
+  n_tiles_per_patient: 4    # number of tiles to sample per patient
   mode: image_guided        # choices: image_guided, random_noise
   investigate: true         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260325_cross_attention_training/investigate_conditioning_image_guided
+  output_dir: ./experiments/20260325_cross_attention_training/investigate_image_guided
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu
