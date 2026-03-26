@@ -108,12 +108,13 @@ joint_training:
 cross_attention_joint_training:
   # Override-only section: values are merged on top of
   # joint_training by src/cross_attention_joint_training/train.py.
-  out_dir: ./experiments/20260325_cross_attention_training
+  out_dir: ./experiments/20260326_cross_attention_genomic_counterfactual
 
   # LR ratio tuning: keep UNet slower than conditioning path
   unet_lr: 5e-6
   encoder_lr: 1e-4
   proj_lr: 3e-4
+  accumulate_grad_batches: 4   # effective batch: 2 x 4 = 8
 
   cross_attention:
     heads: 4
@@ -122,8 +123,14 @@ cross_attention_joint_training:
 
   # Dropouts to force conditioning reliance (training only)
   xT_dropout_prob: 0.3
-  cond_dropout_prob: 0.15
+  cond_dropout_prob: 0.05
   cond_feature_dropout: 0.05
+
+  # Counterfactual conditioning objective
+  counterfactual_loss_weight: 0.2
+  counterfactual_margin: 0.03
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
 
 extract_joint_latents:
   ckpt: ./experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
@@ -225,7 +232,13 @@ gene_token_transformer_joint_training:
 gene_token_cross_attention_joint_training:
   # Override-only section: values are merged on top of
   # gene_token_transformer_joint_training by the hybrid train entrypoint.
-  out_dir: ./experiments/20260324_gene_token_cross_attention_training
+  out_dir: ./experiments/20260325_gene_token_cross_attention_training
+
+  # LR ratio tuning: keep UNet slower than conditioning path
+  unet_lr: 5e-6
+  encoder_lr: 1e-4
+  proj_lr: 3e-4
+  accumulate_grad_batches: 4   # effective batch: 2 x 4 = 8
 
   cross_attention:
     heads: 4
@@ -234,7 +247,13 @@ gene_token_cross_attention_joint_training:
 
   cond_dropout_prob: 0.05
   cond_feature_dropout: 0.05
-  xT_dropout_prob: 0.05
+  xT_dropout_prob: 0.3
+
+  # Counterfactual conditioning objective
+  counterfactual_loss_weight: 0.2
+  counterfactual_margin: 0.03
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
 
 sampling:
   ckpt: ./experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt
@@ -349,22 +368,23 @@ segmentation:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260324_cross_attention_training/joint/last.ckpt
+  checkpoint_path: /data/cat/ws/mala059b-rna2wsi/Master-Thesis-Repository/experiments/20260325_cross_attention_training/joint/last.ckpt
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ./dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04T]  # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  patient_splits_path: ./experiments/20260324_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_ids: [TCGA-A2-A04T]   # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  conditioning_patients: [TCGA-A1-A0SJ]
+  patient_splits_path: /data/cat/ws/mala059b-rna2wsi/Master-Thesis-Repository/experiments/20260325_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: random_noise         # choices: image_guided, random_noise
+  mode: image_guided        # choices: image_guided, random_noise
   investigate: true         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260324_cross_attention_training/investigate_random_noise
+  output_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260325_cross_attention_training/investigate_conditioning_image_guided
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

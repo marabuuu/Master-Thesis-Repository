@@ -21,6 +21,13 @@ except ImportError:  # pragma: no cover
     from src.cross_attention_joint_training.model import CrossAttentionUNetWrapper  # type: ignore[import-not-found]
 
 
+def _build_swapped_indices(batch_size: int, device: torch.device):
+    if batch_size < 2:
+        return None
+    shift = int(torch.randint(1, batch_size, (1,), device=device).item())
+    return torch.roll(torch.arange(batch_size, device=device), shifts=shift)
+
+
 class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  # type: ignore[misc]
     """Hybrid model: gene-token transformer encoder + cross-attention UNet wrapper."""
 
@@ -45,6 +52,10 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             "xT_dropout_prob": float(joint_cfg.get("xT_dropout_prob", 0.05)),
             "cond_dropout_prob": float(joint_cfg.get("cond_dropout_prob", 0.05)),
             "cond_feature_dropout": float(joint_cfg.get("cond_feature_dropout", 0.05)),
+            "counterfactual_loss_weight": float(joint_cfg.get("counterfactual_loss_weight", 0.0)),
+            "counterfactual_margin": float(joint_cfg.get("counterfactual_margin", 0.02)),
+            "counterfactual_monitor_every_n_steps": int(joint_cfg.get("counterfactual_monitor_every_n_steps", 200)),
+            "counterfactual_zero_threshold": float(joint_cfg.get("counterfactual_zero_threshold", 1e-4)),
         }
 
         self.model = CrossAttentionUNetWrapper(
@@ -91,7 +102,31 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                 t=t,
                 model_kwargs={"cond": cond, "cond_multi": cond_multi},
             )
-            loss = losses["loss"].mean()
+            main_loss_per_sample = losses["loss"]
+            main_loss = main_loss_per_sample.mean()
+
+            cf_weight = float(self.cross_cfg.get("counterfactual_loss_weight", 0.0))
+            cf_margin_loss = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
+            swap_gap = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
+            swap_idx = _build_swapped_indices(cond.shape[0], cond.device)
+            if cf_weight > 0.0 and swap_idx is not None:
+                cond_swapped = cond[swap_idx]
+                cond_multi_swapped = self.model.make_cond_multi(cond_swapped)
+                losses_swapped = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=x_start,
+                    cond=cond_swapped,
+                    t=t,
+                    model_kwargs={"cond": cond_swapped, "cond_multi": cond_multi_swapped},
+                )
+                swapped_loss_per_sample = losses_swapped["loss"]
+                margin = float(self.cross_cfg.get("counterfactual_margin", 0.02))
+                cf_margin_loss = F.relu(
+                    margin + main_loss_per_sample.detach() - swapped_loss_per_sample
+                ).mean()
+                swap_gap = (swapped_loss_per_sample.detach() - main_loss_per_sample.detach()).mean()
+
+            loss = main_loss + cf_weight * cf_margin_loss
 
         self.log(
             "loss_epoch",
@@ -111,6 +146,55 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             sync_dist=True,
             batch_size=len(imgs),
         )
+        self.log(
+            "loss_main_step",
+            main_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+            batch_size=len(imgs),
+        )
+        self.log(
+            "loss_cf_margin_step",
+            cf_margin_loss,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+            batch_size=len(imgs),
+        )
+        self.log(
+            "cf_swap_gap_step",
+            swap_gap,
+            on_step=True,
+            on_epoch=False,
+            prog_bar=False,
+            sync_dist=True,
+            batch_size=len(imgs),
+        )
+
+        monitor_every = int(self.cross_cfg.get("counterfactual_monitor_every_n_steps", 200))
+        zero_threshold = float(self.cross_cfg.get("counterfactual_zero_threshold", 1e-4))
+        if (
+            self.global_rank == 0
+            and monitor_every > 0
+            and self.global_step % monitor_every == 0
+            and self.cross_cfg.get("counterfactual_loss_weight", 0.0) > 0.0
+        ):
+            cf_margin_value = float(cf_margin_loss.detach().item())
+            message = (
+                f"[CF-TUNING] step={self.global_step} total={float(loss.detach().item()):.6f} "
+                f"main={float(main_loss.detach().item()):.6f} cf_margin={cf_margin_value:.6f} "
+                f"swap_gap={float(swap_gap.detach().item()):.6f} "
+                f"weight={float(self.cross_cfg.get('counterfactual_loss_weight', 0.0)):.3f} "
+                f"margin={float(self.cross_cfg.get('counterfactual_margin', 0.0)):.3f}"
+            )
+            if cf_margin_value <= zero_threshold:
+                message += " | hint: loss_cf_margin_step≈0 -> try margin=0.05 or weight=0.3"
+            else:
+                message += " | hint: if training/image quality becomes unstable, lower weight to 0.1"
+            print(message)
 
         if self.global_rank == 0 and hasattr(self, "logger") and hasattr(self.logger, "experiment"):
             self.logger.experiment.add_scalar("loss", loss.item(), self.num_samples)  # type: ignore[union-attr]
