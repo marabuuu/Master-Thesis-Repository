@@ -39,6 +39,25 @@ except ImportError:
     )
 
 
+def _resolve_config_relative_path(path_value: str, config_path: str) -> str:
+    path = Path(path_value)
+    if path.is_absolute():
+        return str(path)
+
+    config_dir = Path(config_path).resolve().parent
+    repo_root = config_dir.parent if config_dir.name == "src" else config_dir
+    repo_candidate = (repo_root / path).resolve()
+    normalized = path_value[2:] if str(path_value).startswith("./") else str(path_value)
+
+    # In this workspace, data/dataframes/experiments often live next to the repo root.
+    if normalized.startswith(("data/", "dataframes/", "experiments/")):
+        parent_candidate = (repo_root.parent / normalized).resolve()
+        if parent_candidate.exists() or not repo_candidate.exists():
+            return str(parent_candidate)
+
+    return str(repo_candidate)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Evaluate Basal vs LumA linear classifier on Virchow2 H5 tile features")
     parser.add_argument("--config", type=str, required=True)
@@ -148,6 +167,15 @@ def main(args: dict | argparse.Namespace | None = None) -> None:
     elif isinstance(args, dict):
         args = argparse.Namespace(**args)
 
+    # When called programmatically from run_pipeline, optional CLI args may be
+    # omitted from the dict. Normalize them to parser-equivalent defaults.
+    if not hasattr(args, "label_csv_path"):
+        args.label_csv_path = None
+    if not hasattr(args, "max_tiles_per_patient"):
+        args.max_tiles_per_patient = None
+    if not hasattr(args, "seed"):
+        args.seed = 42
+
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -155,6 +183,7 @@ def main(args: dict | argparse.Namespace | None = None) -> None:
 
     cfg = load_yaml(args.config)
     label_csv_path, patient_col, subtype_col = infer_label_csv_and_columns(cfg, args.label_csv_path)
+    label_csv_path = _resolve_config_relative_path(label_csv_path, args.config)
     splits = load_patient_splits(args.patient_splits_path)
     subtype_df = load_subtype_table(label_csv_path, patient_col, subtype_col)
 
