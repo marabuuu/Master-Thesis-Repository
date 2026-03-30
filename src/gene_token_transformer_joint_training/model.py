@@ -113,7 +113,7 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
         attention_mask = torch.ones((batch_size, seq_len), device=genomic.device, dtype=torch.bool)
         return gene_ids, gene_values, attention_mask
 
-    def encode_genomic(self, genomic):
+    def encode_genomic(self, genomic, deterministic: bool = False):
         gene_ids, gene_values, attention_mask = self._tokenize_genomic(genomic)
         pooled = self.gene_token_encoder(gene_ids, gene_values, attention_mask)
         cond = self.cond_projection(pooled)

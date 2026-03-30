@@ -367,7 +367,7 @@ segmentation:
 # ─── Subtype Classifier on Virchow2 Features ───────────────────────────
 
 subtype_classifier:
-  mode: train   # train | evaluate | both
+  mode: evaluate   # train | evaluate | both
   # Virchow2 H5 feature directory (one .h5/.hdf5 per patient)
   features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
   # Use the same patient splits as the diffusion run
@@ -385,7 +385,7 @@ subtype_classifier:
     class_weight: balanced
   evaluate:
     # null -> auto-uses <output_dir>/train/subtype_linear_model.joblib
-    model_path: null
+    model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
 
 # ─── Tile Reconstruction from Genomic Features ──────────────────────────
 

@@ -13,9 +13,11 @@ from sklearn.metrics import (
     average_precision_score,
     balanced_accuracy_score,
     confusion_matrix,
+    precision_recall_curve,
     f1_score,
     precision_score,
     recall_score,
+    roc_curve,
     roc_auc_score,
 )
 
@@ -161,6 +163,71 @@ def evaluate_split(
     }
 
 
+def save_prediction_plots(
+    y_true: np.ndarray,
+    p_pos: np.ndarray,
+    threshold: float,
+    split_name: str,
+    output_dir: Path,
+) -> None:
+    try:
+        import matplotlib.pyplot as plt
+    except ImportError:
+        print("[SubtypeClassifier][WARN] matplotlib not available, skipping plots")
+        return
+
+    y_pred = (p_pos >= threshold).astype(np.int64)
+    fig, axes = plt.subplots(1, 3, figsize=(16, 4.5))
+
+    # ROC curve
+    ax = axes[0]
+    if len(np.unique(y_true)) > 1:
+        fpr, tpr, _ = roc_curve(y_true, p_pos)
+        auc = roc_auc_score(y_true, p_pos)
+        ax.plot(fpr, tpr, label=f"AUC={auc:.3f}", color="#1f77b4", lw=2)
+    ax.plot([0, 1], [0, 1], linestyle="--", color="gray", lw=1)
+    ax.set_title(f"{split_name.upper()} ROC")
+    ax.set_xlabel("False Positive Rate")
+    ax.set_ylabel("True Positive Rate")
+    ax.legend(loc="lower right")
+
+    # Precision-recall curve
+    ax = axes[1]
+    if len(np.unique(y_true)) > 1:
+        precision, recall, _ = precision_recall_curve(y_true, p_pos)
+        pr_auc = average_precision_score(y_true, p_pos)
+        ax.plot(recall, precision, label=f"AP={pr_auc:.3f}", color="#d62728", lw=2)
+    ax.set_title(f"{split_name.upper()} Precision-Recall")
+    ax.set_xlabel("Recall")
+    ax.set_ylabel("Precision")
+    ax.legend(loc="lower left")
+
+    # Confusion matrix
+    ax = axes[2]
+    cm = confusion_matrix(y_true, y_pred, labels=[0, 1], normalize="true")
+    im = ax.imshow(cm, cmap="Blues", vmin=0.0, vmax=1.0)
+    ax.set_title(f"{split_name.upper()} Confusion (normalized)")
+    ax.set_xticks([0, 1])
+    ax.set_yticks([0, 1])
+    ax.set_xticklabels(["LumA", "Basal"])
+    ax.set_yticklabels(["LumA", "Basal"])
+    ax.set_xlabel("Predicted")
+    ax.set_ylabel("True")
+    for i in range(cm.shape[0]):
+        for j in range(cm.shape[1]):
+            ax.text(j, i, f"{cm[i, j]:.2f}", ha="center", va="center", color="black")
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+
+    fig.suptitle(f"Subtype Classifier Evaluation - {split_name.upper()} (threshold={threshold:.2f})")
+    fig.tight_layout()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    out_path = output_dir / f"{split_name}_prediction_quality.png"
+    fig.savefig(out_path, dpi=200, bbox_inches="tight")
+    plt.close(fig)
+    print(f"[SubtypeClassifier] Saved plot: {out_path}")
+
+
 def main(args: dict | argparse.Namespace | None = None) -> None:
     if args is None:
         args = parse_args()
@@ -196,9 +263,18 @@ def main(args: dict | argparse.Namespace | None = None) -> None:
     )
 
     results: Dict[str, object] = {}
+    scaler = artifact["scaler"]
+    clf = artifact["classifier"]
+    threshold = float(artifact.get("threshold", 0.5))
+    plots_dir = out_dir / "plots"
+
     for split_name in ("val", "test"):
         x, y, meta = split_to_arrays(df, split_name)
         results[split_name] = evaluate_split(artifact, x, y, meta)
+
+        x_scaled = scaler.transform(x)
+        p_pos = clf.predict_proba(x_scaled)[:, 1]
+        save_prediction_plots(y, p_pos, threshold, split_name, plots_dir)
 
     with open(out_dir / "evaluation_metrics.json", "w") as f:
         json.dump(results, f, indent=2)

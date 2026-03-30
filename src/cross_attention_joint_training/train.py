@@ -87,6 +87,9 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     if not os.path.exists(conf.logdir):
         os.makedirs(conf.logdir)
 
+    check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))
+    limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
+
     save_top_k = int(joint_cfg.get("save_top_k", 3))
     every_n_train_steps = max(1, int(conf.save_every_samples // conf.batch_size_effective))
     if save_top_k > 0:
@@ -94,10 +97,10 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
             dirpath=conf.logdir,
             save_last=True,
             save_top_k=save_top_k,
-            monitor="loss_step",
+            monitor="val_loss",
             mode="min",
             filename="epoch{epoch:03d}-step{step:08d}",
-            every_n_train_steps=every_n_train_steps,
+            every_n_epochs=max(1, check_val_every_n_epoch),
         )
     else:
         checkpoint = ModelCheckpoint(
@@ -125,8 +128,6 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     else:
         strategy = 'auto'
 
-    check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))
-    limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
     if verbose:
         if check_val_every_n_epoch > 1:
             print(f"[CrossJoint] Validation every {check_val_every_n_epoch} epochs")

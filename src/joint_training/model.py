@@ -202,11 +202,11 @@ class JointLitModel(LitModel):
 
         try:
             from joint_training.dataset import (
-                GenomicTileDataset, patient_split, save_split, load_split,
+                GenomicTileDataset, patient_split, save_split, load_split, canonical_patient_id,
             )
         except ImportError:
             from src.joint_training.dataset import (  # type: ignore[import-not-found]
-                GenomicTileDataset, patient_split, save_split, load_split,
+                GenomicTileDataset, patient_split, save_split, load_split, canonical_patient_id,
             )
 
         cfg = self.joint_cfg
@@ -250,13 +250,33 @@ class JointLitModel(LitModel):
                 saved = save_split(splits, self.conf.base_dir)
                 print(f"[Joint] Patient split saved to {saved}")
 
+        # Guardrail: enforce disjoint patient-level splits after canonicalization.
+        split_sets = {
+            name: {canonical_patient_id(pid) for pid in pts}
+            for name, pts in splits.items()
+        }
+        overlap_train_val = split_sets.get("train", set()) & split_sets.get("val", set())
+        overlap_train_test = split_sets.get("train", set()) & split_sets.get("test", set())
+        overlap_val_test = split_sets.get("val", set()) & split_sets.get("test", set())
+        if overlap_train_val or overlap_train_test or overlap_val_test:
+            raise ValueError(
+                "Patient split integrity violation: at least one canonical patient ID appears in multiple splits"
+            )
+
         if self.global_rank == 0:
             print(f"[Joint] Patients — train: {len(splits['train'])}, "
                   f"val: {len(splits['val'])}, test: {len(splits['test'])}")
 
         # Create separate datasets for train and val (test is held out)
         self.train_data = GenomicTileDataset(**ds_kwargs, patient_ids=splits["train"])  # type: ignore[arg-type]
-        self.val_data = GenomicTileDataset(**ds_kwargs, patient_ids=splits["val"])  # type: ignore[arg-type]
+        norm_means, norm_stds, apply_log1p = self.train_data.get_normalization_state()
+        self.val_data = GenomicTileDataset(  # type: ignore[arg-type]
+            **ds_kwargs,
+            patient_ids=splits["val"],
+            norm_means=norm_means,
+            norm_stds=norm_stds,
+            apply_log1p=apply_log1p,
+        )
 
         if self.global_rank == 0:
             print(f"[Joint] Train tiles: {len(self.train_data)}, "
@@ -311,15 +331,18 @@ class JointLitModel(LitModel):
     #  Training (overrides mopadi's training_step)
     # ──────────────────────────────────────────────────────────────────
 
-    def encode_genomic(self, genomic):
+    def encode_genomic(self, genomic, deterministic: bool = False):
         """RNA-seq → encoder → projection → conditioning vector.
         
         Note: encoder and projection are already on device (moved in on_fit_start).
         No device checks here to avoid overhead in hot path.
         """
         mean, log_var = self.encoder(genomic)
-        # Use reparameterization trick (stochastic latent)
-        z = mean + torch.exp(0.5 * log_var) * torch.randn_like(log_var)
+        if deterministic:
+            z = mean
+        else:
+            # Use reparameterization trick (stochastic latent)
+            z = mean + torch.exp(0.5 * log_var) * torch.randn_like(log_var)
         cond = self.projection(z)
         return cond
 
@@ -333,7 +356,9 @@ class JointLitModel(LitModel):
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
             # Encoder → conditioning vector
-            cond = self.encode_genomic(genomic)
+            # Deterministic validation reduces metric noise and improves
+            # checkpoint comparability across epochs.
+            cond = self.encode_genomic(genomic, deterministic=True)
 
             # Diffusion loss (same as mopadi's sampler)
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
@@ -512,6 +537,9 @@ class JointLitModel(LitModel):
                     patient_col=cfg.get("patient_col", "Patient_ID"),
                     label_col=cfg.get("label_col"),
                     patient_ids=splits["test"],
+                    norm_means=self.train_data.get_normalization_state()[0] if hasattr(self, "train_data") else None,
+                    norm_stds=self.train_data.get_normalization_state()[1] if hasattr(self, "train_data") else None,
+                    apply_log1p=self.train_data.get_normalization_state()[2] if hasattr(self, "train_data") else None,
                 )
                 datasets.append(("test", test_ds))
 
