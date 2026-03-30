@@ -187,6 +187,9 @@ def load_gene_expression(
     patient_col: str = "Patient_ID",
     label_col: Optional[str] = None,
     gene_list_path: Optional[str] = None,
+    norm_means: Optional[np.ndarray] = None,
+    norm_stds: Optional[np.ndarray] = None,
+    apply_log1p: Optional[bool] = None,
 ) -> Tuple[Dict[str, np.ndarray], List[str]]:
     """
     Load gene expression from CSV.
@@ -229,13 +232,32 @@ def load_gene_expression(
     logger.info(f"Found {len(gene_cols)} gene columns after preprocessing")
 
     values = gene_df.values.astype(np.float64)
-    positive = values[values > 0]
-    if positive.size > 0 and float(np.median(positive)) > 2.0:
-        values = np.log1p(values)
 
-    means = values.mean(axis=0)
-    stds = values.std(axis=0)
-    stds[stds < 1e-8] = 1.0
+    # Apply log1p using the training decision when provided, otherwise infer.
+    if apply_log1p is not None:
+        if apply_log1p:
+            values = np.log1p(values)
+    else:
+        positive = values[values > 0]
+        if positive.size > 0 and float(np.median(positive)) > 2.0:
+            values = np.log1p(values)
+
+    # Use training-fitted normalization stats when available to avoid distribution
+    # shift between the training set and the inference set.
+    if norm_means is not None and norm_stds is not None:
+        means = np.asarray(norm_means, dtype=np.float64)
+        stds = np.asarray(norm_stds, dtype=np.float64).copy()
+        stds[stds < 1e-8] = 1.0
+        logger.info("Using training-fitted normalization statistics for gene expression")
+    else:
+        means = values.mean(axis=0)
+        stds = values.std(axis=0)
+        stds[stds < 1e-8] = 1.0
+        logger.warning(
+            "No training normalization stats provided — computing from inference set. "
+            "This may introduce a distribution shift vs. training. "
+            "Pass norm_means/norm_stds from getattr(model, '_norm_stats', None)."
+        )
     values = (values - means) / stds
 
     # Filter patients after normalization stats are computed on full table.
@@ -535,7 +557,32 @@ def load_checkpoint(
     
     model = model.to(device)
     model.eval()
-    
+
+    # Load training normalization stats so callers can pass them to
+    # load_gene_expression() and avoid distribution shift at inference time.
+    # Stats are saved by JointLitModel.setup() into <out_dir>/normalization_stats.json.
+    model._norm_stats = None  # type: ignore[attr-defined]
+    if isinstance(joint_cfg, dict):
+        out_dir = joint_cfg.get("out_dir", "")
+        if out_dir:
+            norm_stats_path = Path(out_dir) / "normalization_stats.json"
+            if norm_stats_path.exists():
+                with open(norm_stats_path) as _nf:
+                    _ns = json.load(_nf)
+                model._norm_stats = {  # type: ignore[attr-defined]
+                    "means": np.array(_ns["means"], dtype=np.float64),
+                    "stds": np.array(_ns["stds"], dtype=np.float64),
+                    "apply_log1p": bool(_ns["apply_log1p"]),
+                }
+                logger.info(f"Loaded normalization stats from {norm_stats_path}")
+            else:
+                logger.warning(
+                    f"normalization_stats.json not found in {out_dir}. "
+                    "Gene expression will be normalised from the inference CSV — "
+                    "potential distribution shift vs. training. "
+                    "Run at least one training epoch to generate the stats file."
+                )
+
     logger.info("=" * 80)
     logger.info("✅ JOINT TRAINING CHECKPOINT LOADED SUCCESSFULLY")
     logger.info("=" * 80)
@@ -882,7 +929,7 @@ def reconstruct_tile_random_noise(
             # Determine timesteps to save
             save_timesteps = set(np.linspace(0, T - 1, n_steps, dtype=int))
 
-            unet_model = getattr(model, "model", model)
+            unet_model = getattr(model, "ema_model", getattr(model, "model", model))
             prog = sampler.p_sample_loop_progressive(
                 model=unet_model,
                 shape=noise.shape,
@@ -909,8 +956,44 @@ def reconstruct_tile_random_noise(
 
             recon_tensor: torch.Tensor = final_reconstruction if final_reconstruction is not None else torch.empty(0)
         else:
-            recon_tensor = _reconstruct_from_noise_with_cond(model, cond, noise, device)
+            # For consistency with the investigate=True path, prefer the same
+            # sampler and UNet (non-EMA) when available. This avoids divergent
+            # outputs between the two code paths that can produce colour casts.
+            sampler = getattr(model, "sampler", None) or getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
+            unet_model = getattr(model, "ema_model", getattr(model, "model", model))
+            logger.debug(f"Sampling using sampler={type(sampler).__name__ if sampler is not None else None} unet={type(unet_model).__name__}")
 
+            if sampler is not None and hasattr(sampler, "ddim_sample_loop_progressive"):
+                prog = sampler.p_sample_loop_progressive(
+                    model=unet_model,
+                    shape=noise.shape,
+                    noise=noise,
+                    model_kwargs={"cond": cond},
+                    device=device,
+                    progress=False,
+                )
+                final_reconstruction = None
+                for out in prog:
+                    final_reconstruction = out["sample"]
+                if final_reconstruction is None:
+                    raise RuntimeError("No reconstruction produced from progressive sampler")
+                recon_tensor = final_reconstruction
+            else:
+                # Fallback to existing helper which may use eval_sampler/ema_model
+                recon_tensor = _reconstruct_from_noise_with_cond(model, cond, noise, device)
+
+    # Debug: log tensor stats before conversion
+    if isinstance(recon_tensor, torch.Tensor):
+        arr = recon_tensor.detach().cpu().numpy()
+        logger.info(f"[DEBUG] recon_tensor shape: {arr.shape} dtype: {arr.dtype} min: {arr.min():.4f} max: {arr.max():.4f} mean: {arr.mean():.4f}")
+        if arr.ndim == 3 and arr.shape[0] == 3:
+            ch_means = arr.mean(axis=(1,2))
+            logger.info(f"[DEBUG] recon_tensor per-channel means: R={ch_means[0]:.4f} G={ch_means[1]:.4f} B={ch_means[2]:.4f}")
+        elif arr.ndim == 4 and arr.shape[1] == 3:
+            ch_means = arr.mean(axis=(0,2,3))
+            logger.info(f"[DEBUG] recon_tensor per-channel means: R={ch_means[0]:.4f} G={ch_means[1]:.4f} B={ch_means[2]:.4f}")
+        else:
+            logger.info(f"[DEBUG] recon_tensor not 3-channel, shape: {arr.shape}")
     recon_image = tensor_to_image(recon_tensor)
     return recon_tensor, recon_image
 
@@ -1093,6 +1176,9 @@ def main(
     tiles_dir: str | Path,
     save_dir: str,
     patients: Optional[List[str] | str] = None,
+    split: Optional[str] = None,
+    subtypes: Optional[List[str]] = None,
+    subtype_col: Optional[str] = None,
     conditioning_patients: Optional[List[str] | str] = None,
     patient_splits_path: Optional[str] = None,
     n_tiles_per_patient: int = 20,
@@ -1217,6 +1303,60 @@ def main(
     else:
         patient_ids_list = [extract_patient_id(p) for p in patients]
         logger.info(f"Using {len(patient_ids_list)} specified patients")
+
+    # If explicit split argument provided via CLI, it takes precedence
+    if split is not None:
+        # normalize to expected keywords
+        if split not in ("train", "val", "test"):
+            raise ValueError("--split must be one of: train, val, test")
+        patients = split
+        # reuse existing split handling by re-entering the split branch
+        if patient_splits_path is None:
+            patient_splits_path = rec_cfg.get("patient_splits_path")
+        if patient_splits_path is None:
+            raise ValueError(
+                f"patient_splits_path is required when using --split {split}"
+            )
+        if not Path(patient_splits_path).exists():
+            raise FileNotFoundError(f"patient_splits.json not found: {patient_splits_path}")
+        with open(patient_splits_path) as f:
+            splits = json.load(f)
+        split_data = splits.get(split)
+        split_patients = split_data.get("patients", split_data) if isinstance(split_data, dict) else split_data
+        patient_ids_list = cast(List[str], split_patients if isinstance(split_patients, list) else [])
+        logger.info(f"Using {len(patient_ids_list)} patients from '--split {split}'")
+
+    # Apply subtype filtering if requested
+    if subtypes:
+        # Resolve subtype column name from arguments or config
+        subtype_col_resolved = (
+            subtype_col
+            or rec_cfg.get("subtype_col")
+            or joint_cfg.get("label_col")
+            or (joint_cfg_ckpt.get("label_col") if joint_cfg_ckpt else None)
+            or "Majority_Subtype_mRNA"
+        )
+        logger.info(f"Filtering patients by subtypes {subtypes} using column '{subtype_col_resolved}'")
+        df_raw = pd.read_csv(gene_csv_path)
+        if subtype_col_resolved not in df_raw.columns:
+            raise KeyError(f"Subtype column '{subtype_col_resolved}' not found in {gene_csv_path}")
+
+        # Build set of patient IDs matching requested subtypes (case-insensitive)
+        wanted = {s.upper() for s in subtypes}
+        matching = set()
+        pid_col = joint_cfg_ckpt.get("patient_col") if joint_cfg_ckpt else "Patient_ID"
+        for _, row in df_raw.iterrows():
+            raw_pid = row.get(pid_col, row.get("Patient_ID", ""))
+            pid = extract_patient_id(str(raw_pid))
+            val = row.get(subtype_col_resolved)
+            if pd.isna(val):
+                continue
+            if str(val).upper() in wanted:
+                matching.add(pid)
+
+        before = len(patient_ids_list)
+        patient_ids_list = [p for p in patient_ids_list if p in matching]
+        logger.info(f"Filtered patients by subtype: {before} -> {len(patient_ids_list)}")
 
     # Optional cross-patient conditioning IDs
     conditioning_ids_list: Optional[List[str]]
@@ -1444,6 +1584,21 @@ EXAMPLES:
         help="Specific patient IDs to process (e.g., TCGA-XX-XX TCGA-YY-YY)",
     )
     parser.add_argument(
+        "--split", type=str, choices=["train", "val", "test"], default=None,
+        help="Optional split name to select patients from (train/val/test)",
+    )
+    parser.add_argument(
+        "--subtypes", type=str, nargs="+", default=None,
+        help=(
+            "Optional list of subtype group names to filter patients by (matches column in gene CSV), "
+            "e.g. --subtypes LumA Basal"
+        ),
+    )
+    parser.add_argument(
+        "--subtype-col", type=str, default=None,
+        help="Column name in gene CSV that contains subtype labels (default inferred from config)",
+    )
+    parser.add_argument(
         "--conditioning-patients", type=str, nargs="+", default=None,
         help=(
             "Optional patient IDs used for genomic conditioning. "
@@ -1513,6 +1668,9 @@ EXAMPLES:
         tiles_dir=tiles_dir,
         save_dir=args.save_dir,
         patients=args.patients,
+        split=args.split,
+        subtypes=args.subtypes,
+        subtype_col=args.subtype_col,
         conditioning_patients=args.conditioning_patients,
         n_tiles_per_patient=args.n_tiles_per_patient,
         investigate=args.investigate,

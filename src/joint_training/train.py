@@ -21,13 +21,17 @@ import pandas as pd
 import torch
 import yaml
 import pytorch_lightning as pl
-from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 try:
     from joint_training.model import JointLitModel, build_conf
 except ImportError:
     from src.joint_training.model import JointLitModel, build_conf  # type: ignore[import-not-found]
+
+try:
+    from utils.logging_utils import build_robust_loggers
+except ImportError:
+    from src.utils.logging_utils import build_robust_loggers  # type: ignore[import-not-found]
 
 
 def _count_genes(joint_cfg: dict) -> int:
@@ -100,9 +104,7 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
     else:
         ckpt_path = None
 
-    tb_logger = pl_loggers.TensorBoardLogger(
-        save_dir=conf.logdir, name=None, version='',
-    )
+    active_loggers = build_robust_loggers(conf.logdir, joint_cfg, verbose=verbose)
 
     if len(gpus) > 1:
         from pytorch_lightning.strategies import DDPStrategy
@@ -126,7 +128,7 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
         strategy=strategy,
         precision="16-mixed" if conf.fp16 else 32,
         callbacks=[checkpoint, LearningRateMonitor()],
-        logger=tb_logger,
+        logger=active_loggers,
         accumulate_grad_batches=int(conf.accum_batches),
         check_val_every_n_epoch=check_val_every_n_epoch,
         limit_val_batches=limit_val_batches,
@@ -170,9 +172,35 @@ def extract_latents(joint_cfg: dict, ckpt_path: str | None = None,
     if verbose:
         print(f"[Joint] Loading checkpoint: {ckpt_path}")
 
-    model = JointLitModel.load_from_checkpoint(
-        ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes,
-    )
+    model = None
+    # Cross-attention checkpoints may include extra parameters; try loading with cross model first.
+    try:
+        from cross_attention_joint_training.model import CrossAttentionJointLitModel  # type: ignore[import-not-found]
+    except ImportError:
+        try:
+            from src.cross_attention_joint_training.model import CrossAttentionJointLitModel  # type: ignore[import-not-found]
+        except ImportError:
+            CrossAttentionJointLitModel = None  # type: ignore[assignment]
+
+    if CrossAttentionJointLitModel is not None:
+        try:
+            model = CrossAttentionJointLitModel.load_from_checkpoint(
+                ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+            )
+            if verbose:
+                print("[Joint] Loaded as CrossAttentionJointLitModel")
+        except Exception as ex:
+            if verbose:
+                print(f"[Joint] CrossAttention load failed, falling back to JointLitModel: {ex}")
+            model = None
+
+    if model is None:
+        model = JointLitModel.load_from_checkpoint(
+            ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+        )
+        if verbose:
+            print("[Joint] Loaded as JointLitModel (strict=False)")
+
     model.eval()
     model.setup()  # build datasets so we know which patients are in each split
 

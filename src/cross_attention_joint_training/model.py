@@ -3,108 +3,184 @@
 """
 Cross-attention variant of joint_training.
 - Reuses JointLitModel from joint_training
-- Wraps UNet with lightweight multi-level cross-attention to genomic cond
-- Adds x_T and cond dropout hooks to force conditioning reliance
+- Wraps UNet with a patchified single-scale cross-attention module
+- Input image is tokenised via a learned Conv2d patchifier (semantically
+  richer than raw RGB pixel values); spatial tokens attend to the genomic
+  conditioning vector as a single K/V token.
+- The cross-attention output is a zero-initialised residual added to the
+  UNet input, so training starts from the identity and the attention path
+  is learned gradually.
+- Adds cond/x_T dropout hooks and an optional counterfactual loss to force
+  conditioning reliance.
+
+Design notes (multi-scale → single-scale change)
+-------------------------------------------------
+The previous implementation applied cross-attention at multiple spatial
+scales of the raw RGB input (1×, ½×, ¼× resolution via avg-pool).
+Downsampling the RGB image before attention is problematic because:
+  1. RGB pixel values are not semantic features; attention computed from
+     3-channel queries has little discriminative power regardless of scale.
+  2. Downsampling + bilinear upsampling introduces unnecessary smoothing
+     without adding semantic multi-scale structure.
+  3. The "multiple scales" corresponded to scales of the *input image*, not
+     to different depths in the UNet, so the intended multi-level conditioning
+     was not achieved.
+
+The new design uses a single Conv2d patchifier (patch_size × patch_size,
+stride = patch_size) to convert the input into spatially meaningful tokens
+before cross-attention.  This is equivalent to a shallow ViT patch embedding.
+Since K and V are a single genomic token, attention complexity is O(N) in the
+number of patches — so even small patch sizes (e.g. 8) are feasible.
 """
 
 from __future__ import annotations
 
-from typing import List, Optional, cast
+import copy
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
+from typing import cast
 
 try:
     from joint_training.model import JointLitModel, build_conf
 except ImportError:  # pragma: no cover
     from src.joint_training.model import JointLitModel, build_conf  # type: ignore[import-not-found]
 
+try:
+    from mopadi.configs.choices import OptimizerType
+except ImportError:  # pragma: no cover
+    from configs.choices import OptimizerType  # type: ignore[import-not-found]
+
 JointLitModelBase = cast(type, JointLitModel)
 
 
-def _build_swapped_indices(batch_size: int, device: torch.device) -> Optional[torch.Tensor]:
+def _build_swapped_indices(batch_size: int, device: torch.device):
     if batch_size < 2:
         return None
     shift = int(torch.randint(1, batch_size, (1,), device=device).item())
     return torch.roll(torch.arange(batch_size, device=device), shifts=shift)
 
 
-class CrossAttentionBlock(nn.Module):
-    """Cross-attention from image tokens to a single cond token."""
+class CrossAttentionUNetWrapper(nn.Module):
+    """Wraps the base UNet with a single-scale patchified genomic cross-attention.
 
-    def __init__(self, cond_dim: int, heads: int, dim_head: int):
+    The input image is split into non-overlapping patches via a learned Conv2d
+    patchifier, giving semantically richer tokens than raw RGB pixel values.
+    These spatial tokens attend to the genomic conditioning vector (used as a
+    single key-value token) via MultiheadAttention.  The attended output is
+    projected back to image-space patches and added as a zero-initialised
+    residual to the UNet input before forwarding through the base UNet.
+
+    Parameters
+    ----------
+    base_unet:
+        The mopadi UNet model to wrap.
+    cond_dim:
+        Dimension of the genomic conditioning vector (output of projection head).
+    patch_size:
+        Side length of non-overlapping patches.  Must evenly divide the image
+        height and width.  Smaller → more patches, finer spatial resolution,
+        more memory.  Default 16 gives 32×32 = 1 024 patches for 512×512 images.
+    heads:
+        Number of attention heads.
+    dim_head:
+        Dimension per attention head; embed_dim = heads × dim_head.
+    """
+
+    def __init__(
+        self,
+        base_unet: nn.Module,
+        cond_dim: int,
+        patch_size: int = 16,
+        heads: int = 4,
+        dim_head: int = 64,
+    ):
         super().__init__()
+        self.base_unet = base_unet
+        self.patch_size = patch_size
         embed_dim = heads * dim_head
-        self.q_proj = nn.LazyLinear(embed_dim)
+        self.embed_dim = embed_dim
+
+        # Learned patchifier: (B, 3, H, W) → (B, embed_dim, H/ps, W/ps)
+        self.patch_proj = nn.Conv2d(3, embed_dim, kernel_size=patch_size, stride=patch_size)
+        # Project genomic conditioning to K and V (single token per sample)
         self.k_proj = nn.Linear(cond_dim, embed_dim)
         self.v_proj = nn.Linear(cond_dim, embed_dim)
         self.attn = nn.MultiheadAttention(embed_dim, heads, batch_first=True)
-        # Project back to RGB channels (input x has 3 channels)
-        self.out_proj = nn.Linear(embed_dim, 3)
+        # Decode attended tokens back to image patches.
+        # Zero-init so the wrapper starts as a pure identity.
+        self.out_proj = nn.Linear(embed_dim, patch_size * patch_size * 3)
+        nn.init.zeros_(self.out_proj.weight)
+        nn.init.zeros_(self.out_proj.bias)
 
-    def forward(self, x: torch.Tensor, cond: torch.Tensor) -> torch.Tensor:
-        # x: (B, C, H, W), cond: (B, cond_dim)
-        b, c, h, w = x.shape
-        tokens = x.permute(0, 2, 3, 1).reshape(b, h * w, c)
-        q = self.q_proj(tokens)
-        k = self.k_proj(cond).unsqueeze(1)  # (B, 1, E)
+    def wrapper_parameters(self):
+        """Yield only the cross-attention wrapper parameters (not base_unet).
+
+        Use this to build a dedicated optimizer param group so that wrapper
+        layers (which start zero-initialized) can be trained at a higher LR
+        than the pre-trained base UNet.
+        """
+        yield from self.patch_proj.parameters()
+        yield from self.k_proj.parameters()
+        yield from self.v_proj.parameters()
+        yield from self.attn.parameters()
+        yield from self.out_proj.parameters()
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, *, cond: torch.Tensor, **kwargs):
+        b, _c, h, w = x.shape
+        ps = self.patch_size
+        if h % ps != 0 or w % ps != 0:
+            raise ValueError(
+                f"Image size ({h}×{w}) is not divisible by patch_size={ps}. "
+                f"Set patch_size to a divisor of img_size in the cross_attention config."
+            )
+        # Patchify: (B, 3, H, W) → (B, embed_dim, H/ps, W/ps) → (B, N, embed_dim)
+        patches = self.patch_proj(x)
+        ph, pw = patches.shape[2], patches.shape[3]
+        tokens = patches.permute(0, 2, 3, 1).reshape(b, ph * pw, self.embed_dim)
+        # Cross-attention: image tokens (Q) attend to genomic cond (K, V — single token)
+        k = self.k_proj(cond).unsqueeze(1)  # (B, 1, embed_dim)
         v = self.v_proj(cond).unsqueeze(1)
-        attn_out, _ = self.attn(q, k, v)
-        tokens_out = self.out_proj(attn_out)  # (B, HW, 3)
-        out = tokens_out.reshape(b, h, w, 3).permute(0, 3, 1, 2)
-        return out
-
-
-class CrossAttentionUNetWrapper(nn.Module):
-    """Wraps base UNet, injecting cross-attn residuals at multiple scales."""
-
-    def __init__(self, base_unet: nn.Module, cond_dims: List[int], heads: int, dim_head: int):
-        super().__init__()
-        self.base_unet = base_unet
-        self.cond_heads = nn.ModuleList([nn.Sequential(
-            nn.Linear(cond_dims[0], d),
-            nn.GELU(),
-            nn.Linear(d, d),
-        ) for d in cond_dims])
-        self.attn_blocks = nn.ModuleList([CrossAttentionBlock(d, heads, dim_head) for d in cond_dims])
-        self.scales = [1, 2, 4][: len(cond_dims)]
-
-    def _make_cond_multi(self, cond: torch.Tensor) -> List[torch.Tensor]:
-        return [proj(cond) for proj in self.cond_heads]
-
-    def forward(self, x: torch.Tensor, t: torch.Tensor, *, cond: torch.Tensor, cond_multi: Optional[List[torch.Tensor]] = None, **kwargs):
-        cond_list = cond_multi or self._make_cond_multi(cond)
-        h = x
-        for scale, attn, cvec in zip(self.scales, self.attn_blocks, cond_list):
-            if scale > 1:
-                h_down = F.avg_pool2d(h, kernel_size=scale, stride=scale)
-            else:
-                h_down = h
-            delta = attn(h_down, cvec)
-            if scale > 1:
-                delta = F.interpolate(delta, size=h.shape[2:], mode="bilinear", align_corners=False)
-            h = h + delta
-        return self.base_unet(x=h, t=t, cond=cond, **kwargs)
-
-    def make_cond_multi(self, cond: torch.Tensor) -> List[torch.Tensor]:
-        return self._make_cond_multi(cond)
+        attn_out, _ = self.attn(tokens, k, v)  # (B, N, embed_dim)
+        # Decode to image-space residual
+        delta_flat = self.out_proj(attn_out)  # (B, N, ps*ps*3)
+        delta = (
+            delta_flat.reshape(b, ph, pw, ps, ps, 3)
+            .permute(0, 5, 1, 3, 2, 4)
+            .reshape(b, 3, h, w)
+        )
+        x_mod = x + delta
+        # Pass modified input and original cond to the base UNet (AdaGN path unchanged)
+        return self.base_unet(x=x_mod, t=t, cond=cond, **kwargs)
 
 
 class CrossAttentionJointLitModel(JointLitModelBase):
-    """Joint model with cross-attn UNet and conditioning/noise dropouts."""
+    """Joint model with patchified cross-attn UNet and conditioning/noise dropouts.
+
+    Inherits encoder, projection, dataset, and optimizer from JointLitModel.
+    Overrides:
+      - ``__init__``: wraps UNet with CrossAttentionUNetWrapper and re-initialises
+        EMA to track the full wrapped model.
+      - ``training_step``: adds cond dropout, feature dropout, x_T dropout, and
+        an optional counterfactual margin loss.
+      - ``on_train_batch_end``: runs EMA update on the full wrapped model.
+    """
 
     def __init__(self, conf, joint_cfg: dict, n_genes: int):
         cross_cfg = joint_cfg.get("cross_attention", {})
         heads = int(cross_cfg.get("heads", 4))
         dim_head = int(cross_cfg.get("dim_per_head", 64))
-        cond_dims = cross_cfg.get("cond_dims", [512, 256, 128])
+        patch_size = int(cross_cfg.get("patch_size", 16))
         super().__init__(conf, joint_cfg, n_genes)
+        cond_dim = int(joint_cfg.get("cond_dim", conf.feat_dim))
+
         self.cross_cfg = {
             "heads": heads,
             "dim_head": dim_head,
-            "cond_dims": cond_dims,
+            "patch_size": patch_size,
             "xT_dropout_prob": float(joint_cfg.get("xT_dropout_prob", 0.05)),
             "cond_dropout_prob": float(joint_cfg.get("cond_dropout_prob", 0.05)),
             "cond_feature_dropout": float(joint_cfg.get("cond_feature_dropout", 0.05)),
@@ -113,42 +189,86 @@ class CrossAttentionJointLitModel(JointLitModelBase):
             "counterfactual_monitor_every_n_steps": int(joint_cfg.get("counterfactual_monitor_every_n_steps", 200)),
             "counterfactual_zero_threshold": float(joint_cfg.get("counterfactual_zero_threshold", 1e-4)),
         }
-        # Replace UNet with cross-attn wrapper (keep sampler interface intact)
-        self.model = CrossAttentionUNetWrapper(self.model, cond_dims=cond_dims, heads=heads, dim_head=dim_head)
-        # Save extended hparams
+
+        # Wrap base UNet with patchified cross-attention
+        self.model = CrossAttentionUNetWrapper(
+            self.model, cond_dim=cond_dim, patch_size=patch_size, heads=heads, dim_head=dim_head
+        )
+        # Re-initialise EMA to track the FULL wrapped model (cross-attn layers included).
+        # The EMA model initialised in mopadi's LitModel.__init__ only tracked the base
+        # UNet; replacing it here ensures cross-attention weights are also smoothed by EMA
+        # and available at inference time.
+        self.ema_model = copy.deepcopy(self.model)
+        self.ema_model.requires_grad_(False)
+        self.ema_model.eval()
+
         self.save_hyperparameters({
             "cross_cfg": self.cross_cfg,
             "joint_variant": "cross_attention_joint_training",
         })
+
+    def configure_optimizers(self):
+        """Override to give the cross-attention wrapper layers their own LR group.
+
+        The wrapper layers (patch_proj, k_proj, v_proj, attn, out_proj) start
+        zero-initialized or from scratch and need a higher LR than the base UNet.
+        ``cross_attn_lr`` in joint_cfg controls this; it defaults to ``encoder_lr``.
+        """
+        conf = self.conf
+        jcfg = self.joint_cfg
+        lr = float(conf.lr)
+        cross_attn_lr = float(jcfg.get("cross_attn_lr", jcfg.get("encoder_lr", lr)))
+
+        param_groups = [
+            {"params": list(self.model.base_unet.parameters()), "lr": float(jcfg.get("unet_lr", lr))},
+            {"params": list(self.model.wrapper_parameters()), "lr": cross_attn_lr},
+            {"params": list(self.encoder.parameters()), "lr": float(jcfg.get("encoder_lr", lr))},
+            {"params": list(self.projection.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
+        ]
+
+        if conf.optimizer == OptimizerType.adamw:
+            optim = torch.optim.AdamW(
+                param_groups, betas=(0.9, 0.99), eps=1e-6,
+                weight_decay=conf.weight_decay,
+            )
+        else:
+            optim = torch.optim.Adam(param_groups, weight_decay=conf.weight_decay)
+
+        epochs = int(jcfg.get("epochs", getattr(conf, "max_epochs", 100)))
+        total_steps = max(1, epochs * int(conf.steps_per_epoch))
+        warmup_steps = int(conf.warmup)
+
+        if warmup_steps > 0:
+            warmup = LambdaLR(optim, lr_lambda=lambda s: min(s + 1, warmup_steps) / warmup_steps)
+            cosine = CosineAnnealingLR(optim, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6)
+            sched = SequentialLR(optim, schedulers=[warmup, cosine], milestones=[warmup_steps])
+        else:
+            sched = CosineAnnealingLR(optim, T_max=total_steps, eta_min=1e-6)
+
+        return {"optimizer": optim, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
 
     def training_step(self, batch, batch_idx):
         with autocast(device_type='cuda', enabled=self.conf.fp16):
             imgs = batch['img'].to(self.device)
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
+            # Stochastic encoding (reparameterisation trick) during training acts
+            # as an additional regulariser on the genomic latent space.
             cond = self.encode_genomic(genomic)
 
-            # Conditioning dropout
+            # ── Conditioning dropout ──────────────────────────────────────
             p_cond = self.cross_cfg.get("cond_dropout_prob", 0.0)
             if p_cond > 0:
                 mask = torch.rand(cond.shape[0], device=cond.device) < p_cond
                 if mask.any():
                     cond = cond.clone()
                     cond[mask] = 0
+
             p_feat = self.cross_cfg.get("cond_feature_dropout", 0.0)
             if p_feat > 0:
                 cond = F.dropout(cond, p=p_feat, training=self.training)
 
-            cond_multi = self.model.make_cond_multi(cond)
-
-            # x_T dropout (curriculum): send a subset to highest timestep.
-            #
-            # Rationale:
-            # Replacing x_start with pure random noise and then applying q_sample
-            # again can create "double-noise" inputs with weak learning signal.
-            # Instead, keep x_start=real image and force t=T-1 for dropped samples,
-            # which approximates the intended hard denoising regime while keeping
-            # the diffusion objective well-formed.
+            # ── x_T dropout (curriculum) ──────────────────────────────────
             x_start = imgs
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
             p_x = self.cross_cfg.get("xT_dropout_prob", 0.0)
@@ -163,24 +283,24 @@ class CrossAttentionJointLitModel(JointLitModelBase):
                 x_start=x_start,
                 cond=cond,
                 t=t,
-                model_kwargs={"cond": cond, "cond_multi": cond_multi},
+                model_kwargs={"cond": cond},
             )
             main_loss_per_sample = losses['loss']
             main_loss = main_loss_per_sample.mean()
 
+            # ── Counterfactual margin loss ────────────────────────────────
             cf_weight = float(self.cross_cfg.get("counterfactual_loss_weight", 0.0))
             cf_margin_loss = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
             swap_gap = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
             swap_idx = _build_swapped_indices(cond.shape[0], cond.device)
             if cf_weight > 0.0 and swap_idx is not None:
                 cond_swapped = cond[swap_idx]
-                cond_multi_swapped = self.model.make_cond_multi(cond_swapped)
                 losses_swapped = self.sampler.training_losses(
                     model=self.model,
                     x_start=x_start,
                     cond=cond_swapped,
                     t=t,
-                    model_kwargs={"cond": cond_swapped, "cond_multi": cond_multi_swapped},
+                    model_kwargs={"cond": cond_swapped},
                 )
                 swapped_loss_per_sample = losses_swapped['loss']
                 margin = float(self.cross_cfg.get("counterfactual_margin", 0.02))
@@ -225,16 +345,19 @@ class CrossAttentionJointLitModel(JointLitModelBase):
         return {'loss': loss}
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
-        """Override EMA update to handle wrapped model.
-        
-        Since self.model is a CrossAttentionUNetWrapper, we need to pass
-        the base_unet to the EMA function to match keys in ema_model.
-        """
-        # Import here to avoid circular imports
+        """EMA update for the full wrapped model (cross-attn layers included)."""
         from mopadi.train_diff_autoenc import ema
-        
-        # Pass base_unet (unwrapped) to EMA for proper key matching
-        ema(self.model.base_unet, self.ema_model, self.conf.ema_decay)
+
+        if self.is_last_accum(batch_idx):
+            # EMA tracks the full CrossAttentionUNetWrapper, not just base_unet.
+            ema(self.model, self.ema_model, self.conf.ema_decay)
+
+            with torch.no_grad():
+                genomic = batch['genomic'].to(self.device, dtype=torch.float32)
+                cond = self.encode_genomic(genomic)
+
+            self.log_sample(x_start=batch['img'], cond=cond)
+            self.evaluate_scores()
 
 
 def build_cross_conf(joint_cfg: dict):

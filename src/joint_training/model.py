@@ -17,6 +17,14 @@ Attribution:
 from __future__ import annotations
 
 import os
+import sys
+from pathlib import Path
+
+# Add sibling mopadi/src to path if present (for non-installed mopadi copy).
+project_root = Path(__file__).resolve().parents[2]
+mopadi_src = (project_root.parent / "mopadi" / "src").resolve()
+if mopadi_src.exists() and str(mopadi_src) not in sys.path:
+    sys.path.insert(0, str(mopadi_src))
 
 import numpy as np
 import torch
@@ -270,6 +278,22 @@ class JointLitModel(LitModel):
         # Create separate datasets for train and val (test is held out)
         self.train_data = GenomicTileDataset(**ds_kwargs, patient_ids=splits["train"])  # type: ignore[arg-type]
         norm_means, norm_stds, apply_log1p = self.train_data.get_normalization_state()
+
+        # Persist normalization stats so reconstruction can use training-fitted
+        # statistics rather than recomputing them from the (possibly smaller)
+        # inference set, which would introduce a distribution shift.
+        if self.global_rank == 0:
+            import json
+            norm_stats_path = os.path.join(self.conf.base_dir, "normalization_stats.json")
+            if not os.path.exists(norm_stats_path):
+                with open(norm_stats_path, "w") as _nf:
+                    json.dump({
+                        "means": norm_means.tolist(),
+                        "stds": norm_stds.tolist(),
+                        "apply_log1p": bool(apply_log1p),
+                    }, _nf)
+                print(f"[Joint] Normalization stats saved to {norm_stats_path}")
+
         self.val_data = GenomicTileDataset(  # type: ignore[arg-type]
             **ds_kwargs,
             patient_ids=splits["val"],
@@ -355,10 +379,8 @@ class JointLitModel(LitModel):
             imgs = batch['img'].to(self.device)
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
-            # Encoder → conditioning vector
-            # Deterministic validation reduces metric noise and improves
-            # checkpoint comparability across epochs.
-            cond = self.encode_genomic(genomic, deterministic=True)
+            # Encoder → conditioning vector (stochastic during training)
+            cond = self.encode_genomic(genomic)
 
             # Diffusion loss (same as mopadi's sampler)
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
@@ -385,8 +407,10 @@ class JointLitModel(LitModel):
             imgs = batch['img'].to(self.device)
             genomic = batch['genomic'].to(self.device, dtype=torch.float32)
 
-            # Encoder → conditioning vector
-            cond = self.encode_genomic(genomic)
+            # Deterministic encoding: val_loss is used by ModelCheckpoint for
+            # best-checkpoint selection, so removing the reparameterisation
+            # noise is important for a stable and reproducible metric.
+            cond = self.encode_genomic(genomic, deterministic=True)
 
             # Diffusion loss
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)

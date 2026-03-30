@@ -156,7 +156,10 @@ def find_matching_zips(
     common_pids = set(original_by_pid.keys()) & set(recon_by_pid.keys())
     
     if patient_ids:
-        target_pids = set(p.upper() for p in patient_ids)
+        # Normalize provided patient identifiers to the same canonical form
+        # used for indexing the zip files so callers can pass either
+        # full SVS-derived names or short TCGA prefixes.
+        target_pids = set(canonical_patient_id(str(p)) for p in patient_ids)
         common_pids = common_pids & target_pids
     
     for pid in sorted(common_pids):

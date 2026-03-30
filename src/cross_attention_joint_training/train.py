@@ -13,7 +13,6 @@ import os
 from pathlib import Path
 import yaml
 import pytorch_lightning as pl
-from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 try:
@@ -25,6 +24,11 @@ try:
     from cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf
 except ImportError:  # pragma: no cover
     from src.cross_attention_joint_training.model import CrossAttentionJointLitModel, build_cross_conf  # type: ignore[import-not-found]
+
+try:
+    from utils.logging_utils import build_robust_loggers
+except ImportError:  # pragma: no cover
+    from src.utils.logging_utils import build_robust_loggers  # type: ignore[import-not-found]
 
 
 def _deep_update(base: dict, overrides: dict) -> dict:
@@ -118,9 +122,7 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     else:
         ckpt_path = None
 
-    tb_logger = pl_loggers.TensorBoardLogger(
-        save_dir=conf.logdir, name=None, version='',
-    )
+    active_loggers = build_robust_loggers(conf.logdir, joint_cfg, verbose=verbose)
 
     if len(gpus) > 1:
         from pytorch_lightning.strategies import DDPStrategy
@@ -142,7 +144,7 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
         strategy=strategy,
         precision="16-mixed" if conf.fp16 else 32,
         callbacks=[checkpoint, LearningRateMonitor()],
-        logger=tb_logger,
+        logger=active_loggers,
         accumulate_grad_batches=int(conf.accum_batches),
         check_val_every_n_epoch=check_val_every_n_epoch,
         limit_val_batches=limit_val_batches,

@@ -112,6 +112,7 @@ cross_attention_joint_training:
 
   # LR ratio tuning: keep UNet slower than conditioning path
   unet_lr: 5e-6
+  cross_attn_lr: 1e-4    # patch_proj / k_proj / v_proj / attn / out_proj (zero-init, need higher LR)
   encoder_lr: 1e-4
   proj_lr: 3e-4
   accumulate_grad_batches: 4   # effective batch: 2 x 4 = 8
@@ -119,7 +120,7 @@ cross_attention_joint_training:
   cross_attention:
     heads: 4
     dim_per_head: 64
-    cond_dims: [512, 256, 128]
+    patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
 
   # Dropouts to force conditioning reliance (training only)
   xT_dropout_prob: 0.3
@@ -133,21 +134,21 @@ cross_attention_joint_training:
   counterfactual_zero_threshold: 1e-4
 
 extract_joint_latents:
-  ckpt: ./experiments/20260316_joint_training/joint/epoch=99-step=500000.ckpt
-  out_dir: ./experiments/20260316_joint_training/encoding_latents
+  ckpt: ./experiments/20260325_gene_token_cross_attention_training/joint/last.ckpt
+  out_dir: ./experiments/20260325_gene_token_cross_attention_training/joint_latents
   split: all                              # train, val, test, or all
 
 visualize_latents:
-  latent_dir: ./experiments/20260316_joint_training/encoding_latents
-  csv_path: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
-  patient_splits_path: ./experiments/20260316_joint_training/patient_splits.json
-  output_dir: ./experiments/20260316_joint_training/latent_plots
+  latent_dir: ./experiments/20260325_gene_token_cross_attention_training/joint_latents  # Note: absolute path for remote mount compatibility
+  csv_path: ./dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
+  patient_splits_path: ./experiments/20260325_gene_token_cross_attention_training/patient_splits.json  # optional: required if using split-specific latent_dir
+  output_dir: ./experiments/20260325_gene_token_cross_attention_training/latent_plots
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
 training_stats:
-  logdir: ./experiments/20260320_joint_training_encoder_only_slurm/joint
-  output_dir: ./experiments/20260320_joint_training_encoder_only_slurm/training_stats
+  logdir: ./experiments/20260325_gene_token_cross_attention_training/joint
+  output_dir: ./experiments/20260325_gene_token_cross_attention_training/training_stats
   plots:
     - loss_curves          # epoch-level train & val loss
     - batch_trajectory     # per-step loss across all epochs
@@ -236,6 +237,7 @@ gene_token_cross_attention_joint_training:
 
   # LR ratio tuning: keep UNet slower than conditioning path
   unet_lr: 5e-6
+  cross_attn_lr: 1e-4    # patch_proj / k_proj / v_proj / attn / out_proj (zero-init, need higher LR)
   encoder_lr: 1e-4
   proj_lr: 3e-4
   accumulate_grad_batches: 4   # effective batch: 2 x 4 = 8
@@ -243,7 +245,7 @@ gene_token_cross_attention_joint_training:
   cross_attention:
     heads: 4
     dim_per_head: 64
-    cond_dims: [512, 256, 128]
+    patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
 
   cond_dropout_prob: 0.05
   cond_feature_dropout: 0.05
@@ -277,12 +279,12 @@ sampling:
 
 evaluation:
   # Directories for reconstruction quality assessment
-  original_zip_dir: ./experiments/20260316_joint_training/sampling_random_noise/original_samples
-  reconstructed_zip_dir: ./experiments/20260316_joint_training/sampling_random_noise/reconstructed_samples
+  original_zip_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise/original_samples
+  reconstructed_zip_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise/reconstructed_samples
   
   # Output locations
-  output_dir: ./experiments/20260316_joint_training/evaluation_random_noise
-  plot_dir: ./experiments/20260316_joint_training/evaluation_random_noise/plots
+  output_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/evaluation_random_noise  # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/evaluation_random_noise/plots
   
   # Patient filtering: optional list of specific TCGA patient IDs to evaluate
   # Leave as null to evaluate all matching patients
@@ -391,23 +393,23 @@ subtype_classifier:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260325_cross_attention_training/joint/last.ckpt
+  checkpoint_path: ./experiments/20260326_cross_attention_genomic_counterfactual/joint/last.ckpt  # Note: absolute path for remote mount compatibility
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ./dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
-  patient_ids: [TCGA-A2-A04T]   # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
   #conditioning_patients: [TCGA-A1-A0SJ]
-  patient_splits_path: ./experiments/20260325_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_splits_path: ./experiments/20260326_cross_attention_genomic_counterfactual/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
-  n_tiles_per_patient: 4    # number of tiles to sample per patient
-  mode: image_guided        # choices: image_guided, random_noise
-  investigate: true         # save intermediate noising steps for visualization
+  n_tiles_per_patient: 2    # number of tiles to sample per patient
+  mode: random_noise        # choices: image_guided, random_noise
+  investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260325_cross_attention_training/investigate_image_guided
+  output_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

@@ -15,6 +15,13 @@ import yaml
 from pathlib import Path
 from typing import Dict, Any
 
+# Ensure the local mopadi package is on sys.path when running from repo root.
+# This avoids `No module named 'mopadi.configs'` when mopadi is available as sibling package.
+repo_root = Path(__file__).resolve().parent
+mopadi_src = (repo_root.parent / "mopadi" / "src").resolve()
+if mopadi_src.exists() and str(mopadi_src) not in sys.path:
+    sys.path.insert(0, str(mopadi_src))
+
 
 def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
     """
