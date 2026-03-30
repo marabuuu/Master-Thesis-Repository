@@ -16,6 +16,7 @@ from __future__ import annotations
 import argparse
 import os
 import sys
+from pathlib import Path
 
 import pandas as pd
 import torch
@@ -32,6 +33,39 @@ try:
     from utils.logging_utils import build_robust_loggers
 except ImportError:
     from src.utils.logging_utils import build_robust_loggers  # type: ignore[import-not-found]
+
+
+def _resolve_config_paths(config_dict: dict, repo_root: Path) -> dict:
+    """Recursively resolve relative paths in config against repo_root."""
+    def _resolve_path(value: str) -> str:
+        repo_candidate = (repo_root / value).resolve()
+        normalized = value[2:] if value.startswith("./") else value
+
+        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
+        # live next to the repo root. Use parent fallback when repo-local target is absent.
+        if normalized.startswith(("data/", "dataframes/", "experiments/")):
+            parent_candidate = (repo_root.parent / normalized).resolve()
+            if parent_candidate.exists() or not repo_candidate.exists():
+                return str(parent_candidate)
+
+        return str(repo_candidate)
+
+    if isinstance(config_dict, dict):
+        for key, value in config_dict.items():
+            if isinstance(value, dict):
+                _resolve_config_paths(value, repo_root)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _resolve_config_paths(item, repo_root)
+            elif isinstance(value, str):
+                if not value.startswith('/') and (
+                    value.startswith('./')
+                    or value.startswith('../')
+                    or any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
+                ):
+                    config_dict[key] = _resolve_path(value)
+    return config_dict
 
 
 def _count_genes(joint_cfg: dict) -> int:
@@ -225,6 +259,10 @@ def main():
 
     with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    full_cfg = _resolve_config_paths(full_cfg, repo_root)
+
     joint_cfg = full_cfg.get("joint_training", full_cfg)
 
     if args.extract_latents:

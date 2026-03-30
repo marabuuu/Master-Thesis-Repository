@@ -1,8 +1,11 @@
 from __future__ import annotations
 
+import os
+
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
 
 from .config import GeneTokenTransformerConfig, parse_gene_token_transformer_config
 
@@ -10,6 +13,11 @@ try:
     from joint_training.model import JointLitModel, build_conf
 except ImportError:  # pragma: no cover
     from src.joint_training.model import JointLitModel, build_conf  # type: ignore[import-not-found]
+
+try:
+    from mopadi.configs.choices import OptimizerType
+except ImportError:
+    from src.mopadi.configs.choices import OptimizerType  # type: ignore[import-not-found]
 
 
 class GeneTokenTransformerEncoder(nn.Module):
@@ -81,8 +89,15 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
             nn.Linear(self.gtt_cfg.d_model, int(joint_cfg.get("cond_dim", conf.feat_dim))),
         )
 
-        self.encoder = self.gene_token_encoder
-        self.projection = self.cond_projection
+        # Remove the ProbabilisticEncoder and ProjectionHead created by
+        # super().__init__() — they are unused in this variant.  Deleting them
+        # from the module registry prevents duplicate state-dict keys and keeps
+        # checkpoint files clean.  on_fit_start and configure_optimizers are
+        # overridden below to reference gene_token_encoder / cond_projection
+        # directly, so the base-class references to self.encoder / self.projection
+        # are never reached.
+        del self.encoder
+        del self.projection
 
         self._cached_gene_ids: torch.Tensor | None = None
 
@@ -98,6 +113,61 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
             "gene_token_transformer": self.gtt_cfg.__dict__,
             "joint_variant": "gene_token_transformer_joint_training",
         })
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Device placement (override: base references self.encoder/projection)
+    # ──────────────────────────────────────────────────────────────────
+
+    def on_fit_start(self):
+        self.gene_token_encoder = self.gene_token_encoder.to(self.device)
+        self.cond_projection = self.cond_projection.to(self.device)
+        if self.global_rank == 0:
+            print(f"[GeneTokenJoint] Moved gene_token_encoder and cond_projection to device: {self.device}")
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Optimizer (override: base references self.encoder/projection)
+    # ──────────────────────────────────────────────────────────────────
+
+    def configure_optimizers(self):
+        conf = self.conf
+        jcfg = self.joint_cfg
+        lr = float(conf.lr)
+
+        param_groups = [
+            {"params": list(self.model.parameters()), "lr": float(jcfg.get("unet_lr", lr))},
+            {"params": list(self.gene_token_encoder.parameters()), "lr": float(jcfg.get("encoder_lr", lr))},
+            {"params": list(self.cond_projection.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
+        ]
+
+        if conf.optimizer == OptimizerType.adamw:
+            optim = torch.optim.AdamW(
+                param_groups, betas=(0.9, 0.99), eps=1e-6,
+                weight_decay=conf.weight_decay,
+            )
+        else:
+            optim = torch.optim.Adam(param_groups, weight_decay=conf.weight_decay)
+
+        epochs = int(jcfg.get("epochs", conf.max_epochs if hasattr(conf, "max_epochs") else 100))
+        steps_per_epoch = int(conf.steps_per_epoch)
+        total_steps = max(1, epochs * steps_per_epoch)
+        warmup_steps = int(conf.warmup)
+
+        if warmup_steps > 0:
+            warmup = LambdaLR(
+                optim, lr_lambda=lambda s: min(s + 1, warmup_steps) / warmup_steps
+            )
+            cosine = CosineAnnealingLR(
+                optim, T_max=max(1, total_steps - warmup_steps), eta_min=1e-6
+            )
+            sched = SequentialLR(optim, schedulers=[warmup, cosine], milestones=[warmup_steps])
+        else:
+            sched = CosineAnnealingLR(optim, T_max=total_steps, eta_min=1e-6)
+
+        return {"optimizer": optim, "lr_scheduler": {"scheduler": sched, "interval": "step"}}
+
+    # ──────────────────────────────────────────────────────────────────
+    #  Encoding
+    # ──────────────────────────────────────────────────────────────────
 
     def _tokenize_genomic(self, genomic: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         if genomic.ndim != 2:
@@ -124,6 +194,79 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
         """Encode gene expression → diffusion conditioning (deterministic)."""
         self.eval()
         return self.encode_genomic(genomic)
+
+    @torch.no_grad()
+    def save_latent_features(self, out_dir: str, split: str = "all") -> str:
+        """Override base implementation for gene-token encoder API.
+
+        The base class assumes a VAE encoder returning ``(mu, log_var)``.
+        ``GeneTokenTransformerEncoder`` instead takes ``(gene_ids, gene_values,
+        attention_mask)`` and returns a single pooled tensor, so we must
+        tokenise the input before calling it.
+        """
+        import h5py
+        import numpy as np
+
+        os.makedirs(out_dir, exist_ok=True)
+        self.eval()
+
+        datasets = []
+        if split in ("train", "all") and hasattr(self, "train_data"):
+            datasets.append(("train", self.train_data))
+        if split in ("val", "all") and hasattr(self, "val_data"):
+            datasets.append(("val", self.val_data))
+        if split == "test":
+            try:
+                from joint_training.dataset import GenomicTileDataset, load_split
+            except ImportError:
+                from src.joint_training.dataset import GenomicTileDataset, load_split  # type: ignore[import-not-found]
+            split_path = os.path.join(self.conf.base_dir, "patient_splits.json")
+            if os.path.exists(split_path):
+                splits = load_split(split_path)
+                cfg = self.joint_cfg
+                _nm, _ns, _ali = (
+                    self.train_data.get_normalization_state()
+                    if hasattr(self, "train_data") else (None, None, None)
+                )
+                test_ds = GenomicTileDataset(
+                    csv_path=cfg["csv_path"],
+                    tiles_zip_dir=cfg["tiles_zip_dir"],
+                    img_size=self.conf.img_size,
+                    patient_col=cfg.get("patient_col", "Patient_ID"),
+                    label_col=cfg.get("label_col"),
+                    patient_ids=splits["test"],
+                    norm_means=_nm,
+                    norm_stds=_ns,
+                    apply_log1p=_ali,
+                )
+                datasets.append(("test", test_ds))
+
+        seen_patients: set[str] = set()
+        saved = 0
+
+        for split_name, ds in datasets:
+            raw_ds = ds.dataset if hasattr(ds, "dataset") else ds
+            for pid, genomic_vec in raw_ds._genomic.items():
+                if pid in seen_patients:
+                    continue
+                if hasattr(raw_ds, "patient_ids") and pid not in raw_ds.patient_ids:
+                    continue
+                seen_patients.add(pid)
+
+                g = genomic_vec.unsqueeze(0).to(self.device)
+                gene_ids, gene_values, attention_mask = self._tokenize_genomic(g)
+                # pooled: (1, d_model) — transformer output before cond_projection
+                z = self.gene_token_encoder(gene_ids, gene_values, attention_mask)
+
+                h5_path = os.path.join(out_dir, f"{pid}.h5")
+                with h5py.File(h5_path, "w") as f:
+                    f.create_dataset("feats", data=z.cpu().numpy().astype(np.float32))
+                    f.attrs["patient_id"] = pid
+                    f.attrs["split"] = split_name
+                saved += 1
+
+        print(f"[GeneTokenJoint] Saved latent features for {saved} patients to {out_dir}")
+        return out_dir
 
 
 def build_gene_token_transformer_conf(joint_cfg: dict):

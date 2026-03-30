@@ -106,8 +106,8 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
         param_groups = [
             {"params": list(self.model.base_unet.parameters()), "lr": float(jcfg.get("unet_lr", lr))},
             {"params": list(self.model.wrapper_parameters()), "lr": cross_attn_lr},
-            {"params": list(self.encoder.parameters()), "lr": float(jcfg.get("encoder_lr", lr))},
-            {"params": list(self.projection.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
+            {"params": list(self.gene_token_encoder.parameters()), "lr": float(jcfg.get("encoder_lr", lr))},
+            {"params": list(self.cond_projection.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
         ]
 
         if conf.optimizer == OptimizerType.adamw:

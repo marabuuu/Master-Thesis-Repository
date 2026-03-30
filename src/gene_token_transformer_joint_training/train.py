@@ -11,10 +11,12 @@ import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
+from pathlib import Path
+
 try:
-    from joint_training.train import _count_genes
+    from joint_training.train import _count_genes, _resolve_config_paths
 except ImportError:  # pragma: no cover
-    from src.joint_training.train import _count_genes  # type: ignore[import-not-found]
+    from src.joint_training.train import _count_genes, _resolve_config_paths  # type: ignore[import-not-found]
 
 try:
     from gene_token_transformer_joint_training.model import (
@@ -120,6 +122,10 @@ def main() -> None:
 
     with open(args.config) as f:
         full_cfg = yaml.safe_load(f)
+
+    repo_root = Path(__file__).resolve().parents[2]
+    full_cfg = _resolve_config_paths(full_cfg, repo_root)
+
     joint_cfg = full_cfg.get(
         "gene_token_transformer_joint_training",
         full_cfg.get("joint_training", full_cfg),

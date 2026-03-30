@@ -554,6 +554,10 @@ class JointLitModel(LitModel):
             if os.path.exists(split_path):
                 splits = load_split(split_path)
                 cfg = self.joint_cfg
+                _nm, _ns, _ali = (
+                    self.train_data.get_normalization_state()
+                    if hasattr(self, "train_data") else (None, None, None)
+                )
                 test_ds = GenomicTileDataset(
                     csv_path=cfg["csv_path"],
                     tiles_zip_dir=cfg["tiles_zip_dir"],
@@ -561,9 +565,9 @@ class JointLitModel(LitModel):
                     patient_col=cfg.get("patient_col", "Patient_ID"),
                     label_col=cfg.get("label_col"),
                     patient_ids=splits["test"],
-                    norm_means=self.train_data.get_normalization_state()[0] if hasattr(self, "train_data") else None,
-                    norm_stds=self.train_data.get_normalization_state()[1] if hasattr(self, "train_data") else None,
-                    apply_log1p=self.train_data.get_normalization_state()[2] if hasattr(self, "train_data") else None,
+                    norm_means=_nm,
+                    norm_stds=_ns,
+                    apply_log1p=_ali,
                 )
                 datasets.append(("test", test_ds))
 
