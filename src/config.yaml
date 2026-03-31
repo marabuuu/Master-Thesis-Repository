@@ -279,39 +279,55 @@ sampling:
   device: null             # null = auto-detect cuda/cpu
 
 evaluation:
-  # Directories for reconstruction quality assessment
-  original_zip_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise/original_samples
-  reconstructed_zip_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise/reconstructed_samples
-  
-  # Output locations
-  output_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/evaluation_random_noise  # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/evaluation_random_noise/plots
-  
-  # Patient filtering: optional list of specific TCGA patient IDs to evaluate
+  # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
+  mode: image_guided        # choices: image_guided, random_noise
+                            # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
+                            # random_noise: no originals needed; skips metric computation
+
+  # ── Directories for reconstruction quality assessment ─────────────────
+  original_zip_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided/original_samples
+                            # not required when mode=random_noise
+  reconstructed_zip_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided/reconstructed_samples
+
+  # ── Output locations ──────────────────────────────────────────────────
+  output_dir: ./experiments/20260331_cross_attention_training/evaluation_image_guided  # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260331_cross_attention_training/evaluation_image_guided/plots
+
+  # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]         # or e.g., [TCGA-A1-A0SM, TCGA-5L-AAT0, TCGA-5T-A9QA]
-  
-  # Metrics and results
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0]
+  #[TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  #conditioning_patients: [TCGA-A1-A0SJ]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
+  # ── Subtype metadata ──────────────────────────────────────────────────
+  # Point to the same gene-expression CSV used for training/reconstruction.
+  # The subtype_col value is shown in every plot as a coloured annotation.
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
+  subtype_col: Majority_Subtype_mRNA   # column holding the histological subtype
+  patient_col: Patient_ID              # column holding the patient identifier
+
+  # ── Metrics and results ───────────────────────────────────────────────
   save_csv: true           # save per-tile and per-patient CSV summaries
   save_json: true          # save evaluation summary to JSON
-  
-  # Visualization options
+
+  # ── Visualization options ─────────────────────────────────────────────
   plot_types:              # which plots to generate
-    - metrics_summary      # 2×3 histograms & box plots for MSE/PSNR/SSIM
-    - per_patient_metrics  # bar charts per patient
-    - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs
-    - metric_correlation   # scatter plots of metric pairs
-  
-  num_comparison_samples: 16  # max tile pairs to visualize in comparison grid
+    - metrics_summary      # 2×3 histograms & box plots for MSE/PSNR/SSIM (image_guided only)
+    - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
+    - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
+    - metric_correlation   # scatter plots of metric pairs (image_guided only)
+    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
+
+  num_comparison_samples: 12  # max tile pairs to visualize in comparison grid / random_noise_grid
   include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
-  
-  # Plot styling
+
+  # ── Plot styling ──────────────────────────────────────────────────────
   figsize_metrics_summary: [14, 10]
   figsize_per_patient: null   # auto-size based on patient count
   figsize_comparison_grid: null  # auto-size based on num_cols × num_pairs
   num_cols_comparison: 4      # columns in comparison grid
-  
-  # Colormaps (from Fabio Crameri scientific colormaps)
+
+  # ── Colormaps (from Fabio Crameri scientific colormaps) ───────────────
   cmap_categorical: batlowS
   cmap_sequential: batlow
   cmap_diverging: vik         # for SSIM difference maps
@@ -394,7 +410,7 @@ subtype_classifier:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260326_cross_attention_genomic_counterfactual/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  checkpoint_path: ./experiments/20260331_cross_attention_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ../dataframes/brca_gene_expression.csv
@@ -402,15 +418,15 @@ reconstruction:
   patient_col: Patient_ID
   patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
   #conditioning_patients: [TCGA-A1-A0SJ]
-  patient_splits_path: ./experiments/20260326_cross_attention_genomic_counterfactual/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_splits_path: ./experiments/20260331_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: random_noise        # choices: image_guided, random_noise
+  mode: image_guided        # choices: image_guided, random_noise
   investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260326_cross_attention_genomic_counterfactual/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided  # Note: absolute path for remote mount compatibility
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu
