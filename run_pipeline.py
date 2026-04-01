@@ -194,6 +194,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'segmentation' section in config.yaml")
         run_segmentation(config["segmentation"], verbose=verbose)
 
+    elif stage == "virchow2_extraction":
+        from src.classifier import run_virchow2_extraction
+        if "virchow2_extraction" not in config:
+            raise ValueError("No 'virchow2_extraction' section in config.yaml")
+        run_virchow2_extraction(dict(config["virchow2_extraction"]), verbose=verbose)
+
     elif stage == "subtype_classifier":
         from src.classifier import run_subtype_classifier
         if "subtype_classifier" not in config:

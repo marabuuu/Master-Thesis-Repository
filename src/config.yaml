@@ -406,6 +406,35 @@ subtype_classifier:
     # null -> auto-uses <output_dir>/train/subtype_linear_model.joblib
     model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
 
+# ─── Virchow2 Feature Extraction from Generated Tiles ───────────────────
+#
+# Extracts Virchow2 patch embeddings from per-patient ZIP archives produced
+# by the reconstruction stage and writes per-patient H5 files that the
+# subtype_classifier pipeline consumes directly.
+#
+# Typical workflow:
+#   1. run_pipeline.py --stage reconstruction     -> per-patient ZIPs
+#   2. run_pipeline.py --stage virchow2_extraction -> per-patient H5 files
+#   3. run_pipeline.py --stage subtype_classifier  -> predictions on synthetic tiles
+#      (set features_dir below to the same output_dir)
+
+virchow2_extraction:
+  # Input: directory produced by the reconstruction stage
+  # Contains <patient_id>.zip archives with PNG tiles.
+  tiles_dir: ./experiments/20260325_cross_attention_training/reconstructed
+
+  # Output: one <patient_id>.h5 per patient, dataset "features" (N, 1280) float32
+  output_dir: ./experiments/20260325_cross_attention_training/synthetic_virchow2_features
+
+  # Number of tiles per GPU forward pass (reduce if running out of memory)
+  batch_size: 32
+
+  # null = auto-detect (cuda if available, else cpu)
+  device: null
+
+  # Skip patients whose .h5 already exists (useful for resuming interrupted runs)
+  skip_existing: true
+
 # ─── Tile Reconstruction from Genomic Features ──────────────────────────
 
 reconstruction:

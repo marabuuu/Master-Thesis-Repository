@@ -8,12 +8,15 @@ cell segmentation and classification for histopathology tiles.
 Components:
     - train_subtype_classifier: Train Basal-vs-LumA classifier on Virchow2 H5 features
     - evaluate_subtype_classifier: Evaluate subtype classifier on val/test splits
+    - extract_virchow2_features: Extract Virchow2 features from generated tiles and
+      save as per-patient H5 files compatible with the subtype classifier pipeline
     - segment_and_classify_cells: Run DeepCMorph cell segmentation on H&E tiles
       to produce per-cell-type binary masks (.npy) compatible with TopoFD
 
 Usage:
     python -m src.classifier.train_subtype_classifier --help
     python -m src.classifier.evaluate_subtype_classifier --help
+    python -m src.classifier.extract_virchow2_features --help
     python -m src.classifier.segment_and_classify_cells --help
 """
 
@@ -21,6 +24,21 @@ from __future__ import annotations
 
 from pathlib import Path
 from typing import Any, Dict
+
+
+def run_virchow2_extraction(cfg: Dict[str, Any], verbose: bool = True) -> None:
+    """Extract Virchow2 features from generated tiles and save as H5 files.
+
+    Expected config section (``virchow2_extraction``):
+      tiles_dir:      path to per-patient ZIP archives / tile directories
+      output_dir:     destination for per-patient .h5 feature files
+      batch_size:     optional int (default 32)
+      device:         optional str (default auto-detect)
+      skip_existing:  optional bool (default true)
+    """
+    from .extract_virchow2_features import run_virchow2_extraction as _run
+
+    _run(cfg, verbose=verbose)
 
 
 def run_subtype_classifier(cfg: Dict[str, Any], verbose: bool = True) -> None:
