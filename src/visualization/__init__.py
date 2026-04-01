@@ -39,6 +39,7 @@ globally by setting ``core.CATEGORICAL_CMAP`` etc.
 
 # -- public API --------------------------------------------------------
 from .core import (
+    build_label_palette,
     get_categorical_colors,
     get_crameri_cmap,
     save_figure,
@@ -66,6 +67,7 @@ from .latent_space import (
     plot_dendrogram,
     plot_kmeans_confusion,
     plot_pca,
+    plot_pca_variance,
     plot_projection,
     plot_silhouette_per_group,
     plot_tsne,
@@ -89,6 +91,7 @@ __all__ = [
     "get_categorical_colors",
     "save_figure",
     "show_or_save",
+    "build_label_palette",
     # embedding I/O
     "load_embedding",
     "collect_embeddings",
@@ -104,6 +107,7 @@ __all__ = [
     "plot_umap",
     "plot_tsne",
     "plot_pca",
+    "plot_pca_variance",
     "plot_umap_interactive",
     "plot_cosine_distance_clustermap",
     "plot_silhouette_per_group",

@@ -32,11 +32,13 @@ from visualization import (
     plot_umap,
     plot_tsne,
     plot_pca,
+    plot_pca_variance,
     plot_umap_interactive,
     plot_cosine_distance_clustermap,
     plot_silhouette_per_group,
     plot_dendrogram,
     compute_silhouette,
+    plot_kmeans_confusion,
     plot_countplot,
     plot_stacked_bar,
     plot_mosaic,
@@ -228,6 +230,19 @@ def run_visualizations(config: dict, verbose: bool = True):
     if verbose: print("[Latents] Computing PCA...")
     X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "PCA.png")
 
+    # 8.b PCA variance scree plot
+    if verbose: print("[Latents] PCA variance scree plot...")
+    try:
+        plot_pca_variance(X, n_components=min(20, X.shape[1]), save_path=out_dir / "PCA_variance.png", show=False)
+    except Exception as e:
+        print(f"  ⚠️ PCA variance plot failed: {e}")
+
+    # 8.c UMAP coloured by split (second view)
+    if verbose: print("[Latents] UMAP coloured by split...")
+    plot_umap(X, y_split, title="UMAP — coloured by data split", style_labels=y_subtype,
+              markers={"LumA": "o", "LumB": "s", "Basal": "^", "Her2": "D", "Normal": "P"},
+              save_path=out_dir / "UMAP_split.png", show=False)
+
     # 9. Cosine Distance Clustermap
     if verbose: print("[Latents] Plotting Cosine Clustermap...")
     n_sample = min(200, len(X))
@@ -246,6 +261,15 @@ def run_visualizations(config: dict, verbose: bool = True):
         plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col, metric="euclidean", save_path=out_dir / "silhouette_per_subtype_umap.png")
     except Exception as e:
         print(f"  ⚠️ Silhouette failed: {e}")
+
+    # 12. K-means confusion matrix on UMAP embedding
+    if verbose: print("[Latents] K-means confusion matrix...")
+    try:
+        n_clusters = len(np.unique(y_subtype))
+        plot_kmeans_confusion(X_umap, y_subtype, k=n_clusters,
+                              save_path=out_dir / "kmeans_confusion_umap.png", show=False)
+    except Exception as e:
+        print(f"  ⚠️ K-means confusion failed: {e}")
 
     # 11. Dendrogram
     if verbose: print("[Latents] Plotting Dendrogram...")

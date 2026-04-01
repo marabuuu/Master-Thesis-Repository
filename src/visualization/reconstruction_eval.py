@@ -45,12 +45,14 @@ except Exception:
 try:
     from .core import (
         _check_matplotlib,
+        build_label_palette,
         get_categorical_colors,
         get_crameri_cmap,
         save_figure,
         setup_style,
         show_or_save,
         HAS_CRAMERI,
+        CATEGORICAL_CMAP,
         DIVERGING_CMAP,
         HEATMAP_CMAP,
         SEQUENTIAL_CMAP,
@@ -75,13 +77,15 @@ except Exception:
         _check_matplotlib()
         plt.style.use("seaborn-v0_8-whitegrid" if "seaborn-v0_8-whitegrid" in plt.style.available else "seaborn-whitegrid")
         plt.rcParams.update({
-            "figure.figsize": (12, 8),
-            "figure.dpi": 100,
-            "savefig.dpi": 150,
+            "figure.dpi": 120,
+            "savefig.dpi": 300,
+            "savefig.bbox": "tight",
             "font.size": 10,
-            "axes.titlesize": 12,
-            "axes.labelsize": 10,
+            "axes.titlesize": 13,
+            "axes.labelsize": 11,
             "legend.fontsize": 9,
+            "xtick.labelsize": 9,
+            "ytick.labelsize": 9,
         })
     
     def save_figure(fig: "Figure", save_path: Union[str, Path], close: bool = True) -> None:
@@ -117,14 +121,20 @@ def _get_colors():
 
 
 def _build_subtype_colors(subtypes: List[str]) -> Dict[str, Any]:
-    """Return a mapping from subtype string to a distinct matplotlib colour.
+    """Return a mapping from subtype string to a distinct Crameri colour.
 
-    Uses tab10 so that up to 10 subtypes get visually distinct colours.
-    A stable sort is applied so that the mapping is deterministic across calls.
+    Delegates to :func:`core.build_label_palette` so that subtype colours are
+    identical to those produced by :mod:`latent_space` and other modules.
+    Falls back to matplotlib ``tab10`` only when the core module is unavailable
+    (standalone execution outside the package).
     """
-    unique = sorted(set(s for s in subtypes if s and str(s).lower() not in ("nan", "none", "")))
-    if not unique:
+    valid = [s for s in subtypes if s and str(s).lower() not in ("nan", "none", "")]
+    if not valid:
         return {}
+    if _HAS_CORE:
+        return build_label_palette(np.array(valid))
+    # Fallback: tab10 (standalone only)
+    unique = sorted(set(valid))
     try:
         cmap = plt.cm.get_cmap("tab10", max(len(unique), 1))
     except Exception:

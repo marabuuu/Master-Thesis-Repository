@@ -176,6 +176,78 @@ def compute_pca(
     return X_pca, pca
 
 
+def plot_pca_variance(
+    X: np.ndarray,
+    n_components: int = 20,
+    cmap_name: str = SEQUENTIAL_CMAP,
+    figsize: Tuple[float, float] = (10, 4),
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+    pca_kw: Optional[Dict[str, Any]] = None,
+) -> Tuple[Figure, Any]:
+    """PCA scree plot: per-component and cumulative explained variance.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n, d)
+    n_components : int
+        Number of components to inspect (capped at min(n, d)).
+    cmap_name : str
+        Crameri sequential colourmap for the bar chart.
+    figsize : tuple
+    save_path, show : standard output options.
+    pca_kw : dict, optional
+        Extra keyword arguments forwarded to ``sklearn.decomposition.PCA``.
+
+    Returns
+    -------
+    (fig, pca)  – figure and the fitted ``sklearn`` PCA object.
+    """
+    _check_matplotlib()
+    from sklearn.decomposition import PCA
+
+    setup_style()
+    X = _ensure_2d(X)
+    n = min(n_components, X.shape[1], X.shape[0])
+    pca = PCA(n_components=n, **(pca_kw or {}))
+    pca.fit(X)
+
+    var_ratio = pca.explained_variance_ratio_
+    cum_var = np.cumsum(var_ratio)
+    cmap = get_crameri_cmap(cmap_name)
+    bar_colors = [cmap(i / max(n - 1, 1)) for i in range(n)]
+
+    fig, axes = plt.subplots(1, 2, figsize=figsize)
+
+    # Left: per-component bar chart
+    axes[0].bar(range(1, n + 1), var_ratio * 100, color=bar_colors, alpha=0.85, edgecolor="white")
+    axes[0].set_xlabel("Principal Component")
+    axes[0].set_ylabel("Explained Variance (%)")
+    axes[0].set_title("Per-Component Variance")
+    tick_step = max(1, n // 10)
+    axes[0].set_xticks(range(1, n + 1, tick_step))
+    axes[0].grid(True, alpha=0.25, axis="y")
+
+    # Right: cumulative variance line
+    c_line = cmap(0.75)
+    axes[1].plot(range(1, n + 1), cum_var * 100, "-o", markersize=4,
+                 linewidth=1.5, color=c_line)
+    axes[1].axhline(90, color="firebrick", linestyle="--", alpha=0.6, label="90%")
+    axes[1].axhline(95, color="darkorange", linestyle=":", alpha=0.6, label="95%")
+    axes[1].set_xlabel("Number of Components")
+    axes[1].set_ylabel("Cumulative Explained Variance (%)")
+    axes[1].set_title("Cumulative Variance")
+    axes[1].set_ylim(0, 105)
+    axes[1].legend(framealpha=0.9)
+    axes[1].grid(True, alpha=0.25)
+
+    fig.suptitle("PCA Explained Variance", fontweight="bold")
+    fig.tight_layout()
+
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig, pca
+
+
 # ===================================================================
 #  Scatter plots for 2-D projections
 # ===================================================================

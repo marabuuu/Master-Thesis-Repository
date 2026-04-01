@@ -22,6 +22,34 @@ from PIL import Image
 
 logger = logging.getLogger(__name__)
 
+try:
+    from .core import setup_style, save_figure
+    _HAS_CORE = True
+except ImportError:
+    try:
+        from visualization.core import setup_style, save_figure
+        _HAS_CORE = True
+    except ImportError:
+        _HAS_CORE = False
+
+        def setup_style() -> None:  # type: ignore[misc]
+            import matplotlib as _mpl
+            _mpl.rcParams.update({
+                "figure.dpi": 120, "savefig.dpi": 300, "savefig.bbox": "tight",
+                "font.size": 10, "axes.titlesize": 13, "axes.labelsize": 11,
+                "legend.fontsize": 9, "xtick.labelsize": 9, "ytick.labelsize": 9,
+            })
+
+        def save_figure(fig, save_path, close: bool = True, **kw) -> None:  # type: ignore[misc]
+            import matplotlib.pyplot as _plt
+            from pathlib import Path as _Path
+            p = _Path(save_path)
+            p.parent.mkdir(parents=True, exist_ok=True)
+            fig.savefig(p, bbox_inches="tight", facecolor="white", edgecolor="none", dpi=300)
+            print(f"[OK] Saved figure → {p}")
+            if close:
+                _plt.close(fig)
+
 
 def _extract_tile_and_masks(
     tile_zip_path: Path,
@@ -263,7 +291,8 @@ def visualize_segmentation_results(
     syn_masks_dir = Path(synthetic_masks_dir)
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+    setup_style()
+
     # Get patient IDs from tile ZIPs
     ref_tile_zips = sorted(ref_tiles_dir.glob("*.zip"))
     syn_tile_zips = sorted(syn_tiles_dir.glob("*.zip"))
@@ -335,7 +364,11 @@ def visualize_segmentation_results(
         figsize=(figsize[0], max(figsize[1], 2.5 * n_rows)),
         squeeze=False,
     )
-    
+    fig.suptitle(
+        "Segmentation Comparison: Reference vs Synthetic",
+        fontsize=13, fontweight="bold", y=1.01,
+    )
+
     for row, sample in enumerate(all_samples):
         patient_id = sample['patient_id']
         tile_name = sample['tile_name']
@@ -410,21 +443,19 @@ def visualize_segmentation_results(
                 logger.warning(f"syn_cls colorization produced invalid shape: {colored_cls.shape}")
         axes[row, 5].axis('off')
     
-    # Add column headers
+    # Add column headers (use rcParam axes.titlesize via fontsize=None → default)
     col_titles = ["Reference\nTile", "Reference\nSegmentation", "Reference\nClasses",
                   "Synthetic\nTile", "Synthetic\nSegmentation", "Synthetic\nClasses"]
     for col, title in enumerate(col_titles):
-        axes[0, col].text(0.5, 1.15, title, ha='center', va='bottom', fontsize=10, fontweight='bold',
+        axes[0, col].text(0.5, 1.12, title, ha='center', va='bottom', fontweight='bold',
                           transform=axes[0, col].transAxes)
     
     plt.tight_layout()
-    
+
     output_path = output_dir / "segmentation_comparison_grid.png"
-    plt.savefig(output_path, dpi=100, bbox_inches='tight')
+    save_figure(fig, output_path, close=True)
     if verbose:
         print(f"[OK] Saved visualization to {output_path}")
-    
-    plt.close(fig)
 
 
 if __name__ == "__main__":
