@@ -344,7 +344,7 @@ def plot_comparison_grid(
     save_path: Optional[Union[str, Path]] = None,
     show: bool = False,
     figsize: Optional[Tuple[float, float]] = None,
-    num_cols: int = 4,
+    num_cols: int = 1,
     include_metrics: bool = True,
     include_diff: bool = True,
     subtype_map: Optional[Dict[str, str]] = None,

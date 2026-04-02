@@ -58,6 +58,7 @@ def run_evaluation(config: Dict[str, Any], verbose: bool = True) -> None:
     save_json = config.get("save_json", True)
     plot_dir = config.get("plot_dir")
     num_comparison_samples = config.get("num_comparison_samples", 16)
+    num_cols_comparison = config.get("num_cols_comparison", 1)
     include_diff = config.get("include_diff_heatmap", True)
 
     # Subtype metadata — loaded from an optional CSV
@@ -242,6 +243,7 @@ def run_evaluation(config: Dict[str, Any], verbose: bool = True) -> None:
                         include_diff=include_diff,
                         subtype_map=subtype_map,
                         mode=mode,
+                        num_cols=num_cols_comparison,
                     )
 
             if "metric_correlation" in plot_types:
