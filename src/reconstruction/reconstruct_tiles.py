@@ -958,7 +958,7 @@ def reconstruct_tile_random_noise(
         else:
             # For consistency with the investigate=True path, use the EMA model
             # and prefer DDIM sampling when available.
-            sampler = getattr(model, "sampler", None) or getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
+            sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
             unet_model = getattr(model, "ema_model", getattr(model, "model", model))
             logger.debug(f"Sampling using sampler={type(sampler).__name__ if sampler is not None else None} unet={type(unet_model).__name__}")
 
@@ -1399,12 +1399,16 @@ def main(
     if conditioning_ids_list is not None:
         gene_patient_ids.update(conditioning_ids_list)
 
+    _norm_stats = getattr(model, "_norm_stats", None)
     gene_data, gene_names = load_gene_expression(
         gene_csv_path,
         sorted(gene_patient_ids),
         patient_col=joint_cfg_ckpt.get("patient_col", "Patient_ID"),
         label_col=joint_cfg_ckpt.get("label_col"),
         gene_list_path=joint_cfg_ckpt.get("gene_list_path"),
+        norm_means=_norm_stats["means"] if _norm_stats else None,
+        norm_stds=_norm_stats["stds"] if _norm_stats else None,
+        apply_log1p=_norm_stats["apply_log1p"] if _norm_stats else None,
     )
     
     # Load tiles

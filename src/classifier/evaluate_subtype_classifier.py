@@ -22,7 +22,7 @@ from sklearn.metrics import (
 )
 
 try:
-    from classifier.utils_subtype_data import (
+    from .utils_subtype_data import (
         build_tile_feature_table,
         infer_label_csv_and_columns,
         load_patient_splits,

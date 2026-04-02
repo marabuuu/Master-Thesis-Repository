@@ -12,7 +12,7 @@ from sklearn.metrics import balanced_accuracy_score
 from sklearn.preprocessing import StandardScaler
 
 try:
-    from classifier.utils_subtype_data import (
+    from .utils_subtype_data import (
         build_tile_feature_table,
         infer_label_csv_and_columns,
         load_patient_splits,

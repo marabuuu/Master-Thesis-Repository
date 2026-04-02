@@ -100,7 +100,6 @@ class _Virchow2Extractor:
         for p in self.model.parameters():
             p.requires_grad = False
 
-        from timm.data import create_transform, resolve_data_config
         self.transform = create_transform(
             **resolve_data_config(self.model.pretrained_cfg, model=self.model)
         )
