@@ -134,21 +134,21 @@ cross_attention_joint_training:
   counterfactual_zero_threshold: 1e-4
 
 extract_joint_latents:
-  ckpt: ./experiments/20260325_gene_token_cross_attention_training/joint/last.ckpt
-  out_dir: ./experiments/20260325_gene_token_cross_attention_training/joint_latents
+  ckpt: ./experiments/20260331_cross_attention_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  out_dir: ./experiments/20260331_cross_attention_training/joint_latents  # Note: absolute path for remote mount compatibility
   split: all                              # train, val, test, or all
 
 visualize_latents:
-  latent_dir: ./experiments/20260325_gene_token_cross_attention_training/joint_latents  # Note: absolute path for remote mount compatibility
+  latent_dir: ./experiments/20260331_cross_attention_training/joint_latents  # Note: absolute path for remote mount compatibility
   csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
-  patient_splits_path: ./experiments/20260325_gene_token_cross_attention_training/patient_splits.json  # optional: required if using split-specific latent_dir
-  output_dir: ./experiments/20260325_gene_token_cross_attention_training/latent_plots
+  patient_splits_path: ./experiments/20260331_cross_attention_training/patient_splits.json  # optional: required if using split-specific latent_dir
+  output_dir: ./experiments/20260331_cross_attention_training/latent_plots
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
 training_stats:
-  logdir: ./experiments/20260325_gene_token_cross_attention_training/joint
-  output_dir: ./experiments/20260325_gene_token_cross_attention_training/training_stats
+  logdir: ./experiments/20260331_cross_attention_training/joint
+  output_dir: ./experiments/20260331_cross_attention_training/training_stats
   plots:
     - loss_curves          # epoch-level train & val loss
     - batch_trajectory     # per-step loss across all epochs
@@ -285,19 +285,20 @@ evaluation:
                             # random_noise: no originals needed; skips metric computation
 
   # ── Directories for reconstruction quality assessment ─────────────────
-  original_zip_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided/original_samples
+  original_zip_dir: ./experiments/20260331_joint_training/reconstructions_image_guided/original_samples
                             # not required when mode=random_noise
-  reconstructed_zip_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided/reconstructed_samples
+  reconstructed_zip_dir: ./experiments/20260331_joint_training/reconstructions_image_guided/reconstructed_samples
 
   # ── Output locations ──────────────────────────────────────────────────
-  output_dir: ./experiments/20260331_cross_attention_training/evaluation_image_guided  # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260331_cross_attention_training/evaluation_image_guided/plots
+  output_dir: ./experiments/20260331_joint_training/evaluation_image_guided  # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260331_joint_training/evaluation_image_guided/plots
 
   # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0]
-  #[TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
-  #conditioning_patients: [TCGA-A1-A0SJ]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
+  #patient_ids: [TCGA-A1-A0SJ]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
+  #, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
   # ── Subtype metadata ──────────────────────────────────────────────────
   # Point to the same gene-expression CSV used for training/reconstruction.
   # The subtype_col value is shown in every plot as a coloured annotation.
@@ -439,23 +440,24 @@ virchow2_extraction:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260331_cross_attention_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  checkpoint_path: ./experiments/20260331_gene_token_transformer_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ../dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-all
   patient_col: Patient_ID
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  #conditioning_patients: [TCGA-A1-A0SJ]
-  patient_splits_path: ./experiments/20260331_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
+  #patient_ids: [TCGA-A1-A0SJ]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  #conditioning_patients: [TCGA-A2-A04T]
+  patient_splits_path: ./experiments/20260331_gene_token_transformer_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: image_guided        # choices: image_guided, random_noise
+  mode: random_noise       # choices: image_guided, random_noise
   investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260331_cross_attention_training/reconstructions_image_guided  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260331_gene_token_transformer_training/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
   
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

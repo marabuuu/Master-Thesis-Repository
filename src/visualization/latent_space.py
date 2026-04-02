@@ -646,6 +646,7 @@ def plot_silhouette_per_group(
     )
     ax.set_title(f"Silhouette scores per {group_col_name}")
     ax.set_ylabel("Silhouette coefficient")
+    ax.set_ylim(-1, 1)  # Fixed scale for consistent perception across all plots
     fig.tight_layout()
 
     show_or_save(fig, save_path=save_path, show=show)

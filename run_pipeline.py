@@ -13,7 +13,7 @@ import argparse
 import sys
 import yaml
 from pathlib import Path
-from typing import Dict, Any
+from typing import Dict, Any, Optional
 
 # Ensure the local mopadi package is on sys.path when running from repo root.
 # This avoids `No module named 'mopadi.configs'` when mopadi is available as sibling package.
@@ -79,7 +79,7 @@ def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[s
     return config_dict
 
 
-def load_config(config_path: str, repo_root: Path | None = None) -> Dict[str, Any]:
+def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str, Any]:
     """
     Load configuration from YAML file and resolve relative paths.
     

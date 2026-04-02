@@ -956,30 +956,30 @@ def reconstruct_tile_random_noise(
 
             recon_tensor: torch.Tensor = final_reconstruction if final_reconstruction is not None else torch.empty(0)
         else:
-            # For consistency with the investigate=True path, prefer the same
-            # sampler and UNet (non-EMA) when available. This avoids divergent
-            # outputs between the two code paths that can produce colour casts.
+            # For consistency with the investigate=True path, use the EMA model
+            # and prefer DDIM sampling when available.
             sampler = getattr(model, "sampler", None) or getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
             unet_model = getattr(model, "ema_model", getattr(model, "model", model))
             logger.debug(f"Sampling using sampler={type(sampler).__name__ if sampler is not None else None} unet={type(unet_model).__name__}")
 
             if sampler is not None and hasattr(sampler, "ddim_sample_loop_progressive"):
-                prog = sampler.p_sample_loop_progressive(
+                prog = sampler.ddim_sample_loop_progressive(
                     model=unet_model,
                     shape=noise.shape,
                     noise=noise,
                     model_kwargs={"cond": cond},
                     device=device,
                     progress=False,
+                    eta=0.0,
                 )
                 final_reconstruction = None
                 for out in prog:
                     final_reconstruction = out["sample"]
                 if final_reconstruction is None:
-                    raise RuntimeError("No reconstruction produced from progressive sampler")
+                    raise RuntimeError("No reconstruction produced from DDIM progressive sampler")
                 recon_tensor = final_reconstruction
             else:
-                # Fallback to existing helper which may use eval_sampler/ema_model
+                # Fallback: use p_sample_loop_progressive (DDPM) if DDIM not available
                 recon_tensor = _reconstruct_from_noise_with_cond(model, cond, noise, device)
 
     # Debug: log tensor stats before conversion
