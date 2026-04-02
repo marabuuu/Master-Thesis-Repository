@@ -299,6 +299,7 @@ evaluation:
   patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
   #, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
   #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
+
   # ── Subtype metadata ──────────────────────────────────────────────────
   # Point to the same gene-expression CSV used for training/reconstruction.
   # The subtype_col value is shown in every plot as a coloured annotation.
@@ -318,6 +319,7 @@ evaluation:
     - metric_correlation   # scatter plots of metric pairs (image_guided only)
     #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
     #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
+
 
   num_comparison_samples: 12  # max tile pairs to visualize in comparison grid / random_noise_grid
   include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
