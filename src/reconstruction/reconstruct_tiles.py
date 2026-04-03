@@ -599,6 +599,7 @@ def _reconstruct_from_image_with_cond(
     cond: torch.Tensor,
     device: torch.device,
     *,
+    cond_invert: Optional[torch.Tensor] = None,
     seed: Optional[int] = None,
     save_dir: Optional[Path] = None,
     n_steps: int = 5,
@@ -617,7 +618,13 @@ def _reconstruct_from_image_with_cond(
     img_tensor:
         Image tensor in [-1, 1], shape (1, 3, H, W).
     cond:
-        Conditioning vector from `model.encode()` (shape (1, C)).
+        Conditioning vector used for **decoding** (shape (1, C)).  In
+        cross-patient conditioning this is the target patient's genomic vector.
+    cond_invert:
+        Conditioning vector used for **inversion** (DDIM reverse pass).  When
+        provided this should be the tile patient's own conditioning so that the
+        inversion is self-consistent and the noise ``x_T`` encodes pure content.
+        If ``None``, ``cond`` is reused for inversion (self-reconstruction).
     seed:
         Optional integer seed for deterministic behavior.
     save_dir:
@@ -669,17 +676,24 @@ def _reconstruct_from_image_with_cond(
     unet_model = getattr(model, "ema_model", getattr(model, "model", model))
     unet_model.eval()
 
+    # For cross-patient conditioning: invert with the tile patient's own cond so
+    # that x_T captures pure content under the tile patient's genomic prior.
+    # Decoding then uses the target patient's cond to apply their genomic style.
+    # If cond_invert is None we fall back to cond (self-reconstruction path).
+    _cond_for_inversion = cond_invert if cond_invert is not None else cond
+
     decode_eta = 0.0  # deterministic decode
     logger.info(
         f"  Encoding tile to noise using DDIM reverse inversion "
-        f"(T_inv={T_inv}, T_dec={T_dec}, eta={decode_eta})..."
+        f"(T_inv={T_inv}, T_dec={T_dec}, eta={decode_eta}, "
+        f"cross_cond={'yes' if cond_invert is not None else 'no'})..."
     )
     with torch.no_grad():
         inversion_out = inversion_sampler.ddim_reverse_sample_loop(
             model=unet_model,
             x=img_tensor,
             clip_denoised=True,
-            model_kwargs={"cond": cond},
+            model_kwargs={"cond": _cond_for_inversion},
             eta=0.0,
             device=device,
         )
@@ -757,6 +771,7 @@ def reconstruct_tile_image_guided(
     tile_path: Union[Path, str],
     genomic: torch.Tensor,
     device: torch.device,
+    genomic_tile: Optional[torch.Tensor] = None,
     seed: Optional[int] = None,
     investigate: bool = False,
     investigate_dir: Optional[Path] = None,
@@ -765,6 +780,19 @@ def reconstruct_tile_image_guided(
     decode_steps: Optional[int] = None,
 ) -> Tuple[torch.Tensor, np.ndarray, Dict]:
     """Reconstruct a tile using diffusion encoding/decoding + genomic conditioning.
+
+    Parameters
+    ----------
+    genomic:
+        Genomic conditioning vector for the **target** patient (used during
+        the DDIM decoding / reverse-diffusion pass).
+    genomic_tile:
+        Genomic vector of the patient whose **tile** is being encoded.  When
+        provided it is used for the DDIM inversion pass so that the content
+        noise ``x_T`` is computed under the tile patient's own genomic prior.
+        For cross-patient conditioning this should always be supplied; omitting
+        it causes inversion and decoding to use the same (target) conditioning,
+        which mathematically guarantees reconstruction ≈ original tile.
 
     When ``investigate=True``, intermediate forward/reverse diffusion steps are
     saved into ``investigate_dir`` and the final reconstruction is guaranteed to
@@ -815,11 +843,27 @@ def reconstruct_tile_image_guided(
         if os.getenv("ZERO_COND", "0") == "1":
             cond = torch.zeros_like(cond)
             logger.info("  [DEBUG] ZERO_COND=1 -> conditioning zeroed for ablation")
+
+        # Encode tile patient's own genomic vector for the inversion pass so that
+        # x_T is computed under the tile patient's prior (cross-conditioning fix).
+        cond_invert: Optional[torch.Tensor] = None
+        if genomic_tile is not None:
+            cond_invert = model.encode(genomic_tile.unsqueeze(0))  # type: ignore[attr-defined]
+            logger.info(
+                "  [DEBUG] cond_invert stats (tile patient): mean=%.4f std=%.4f first5=%s"
+                % (
+                    cond_invert.mean().item(),
+                    cond_invert.std().item(),
+                    [float(x) for x in cond_invert[0, :5].tolist()],
+                )
+            )
+
         recon_tensor = _reconstruct_from_image_with_cond(
             model,
             img_tensor,
             cond,
             device=device,
+            cond_invert=cond_invert,
             seed=seed,
             save_dir=investigate_dir if investigate else None,
             n_steps=n_steps,
@@ -1471,11 +1515,22 @@ def main(
 
                         try:
                             if mode == "image_guided":
+                                # Provide the tile patient's own genomic vector for
+                                # inversion so that x_T is self-consistent with their
+                                # genomic prior.  The decoding step uses genomic_tensor
+                                # (the conditioning/target patient) to apply their style.
+                                tile_genes_np = gene_data.get(patient_id)
+                                genomic_tile_tensor = (
+                                    torch.from_numpy(tile_genes_np).to(device_obj, dtype=torch.float32)
+                                    if tile_genes_np is not None
+                                    else None
+                                )
                                 recon_tensor, recon_image, metrics = reconstruct_tile_image_guided(
                                     model,
                                     tile_path,
                                     genomic_tensor,
                                     device_obj,
+                                    genomic_tile=genomic_tile_tensor,
                                     seed=tile_seed,
                                     investigate=investigate,
                                     investigate_dir=inv_dir,
