@@ -248,15 +248,21 @@ gene_token_cross_attention_joint_training:
     dim_per_head: 64
     patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
 
-  cond_dropout_prob: 0.05
+  cond_dropout_prob: 0.15       # raised from 0.05 — required for CFG to work well at inference
   cond_feature_dropout: 0.05
   xT_dropout_prob: 0.3
 
   # Counterfactual conditioning objective
-  counterfactual_loss_weight: 0.2
+  counterfactual_loss_weight: 0.3   # raised from 0.2 — stronger gradient signal to use conditioning
   counterfactual_margin: 0.1   # ~10-30% of typical diffusion loss range (0.05-0.3)
   counterfactual_monitor_every_n_steps: 200
   counterfactual_zero_threshold: 1e-4
+
+  # Genomic auto-reconstruction auxiliary loss.
+  # Forces the gene-token transformer + cond_projection to preserve enough
+  # gene-level information so the conditioning vector is not degenerate.
+  # Set to 0.0 to disable.  Start at 0.05; increase if conditioning stays weak.
+  genomic_recon_loss_weight: 0.05
 
 sampling:
   ckpt: ./experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt
@@ -461,6 +467,12 @@ reconstruction:
   # ── Output ────────────────────────────────────────────────────────────
   output_dir: ./experiments/20260331_joint_training/reconstructions_crossconditioned_image_guided  # Note: absolute path for remote mount compatibility
   
+  # ── Classifier-Free Guidance ──────────────────────────────────────────
+  # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
+  # 1.0 = no guidance (standard DDIM).  Try 2.0–5.0 for cross-conditioning experiments.
+  # Requires the model to have been trained with cond_dropout_prob > 0.
+  guidance_scale: 3.0
+
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu
   batch_size: 1              # reconstructions are single-tile (no batching needed)

@@ -53,6 +53,7 @@ def run_reconstruction(rec_cfg: dict, verbose: bool = True) -> None:
     mode = rec_cfg.get("mode", "image_guided")
     investigate = rec_cfg.get("investigate", False)
     device = rec_cfg.get("device", None)
+    guidance_scale = float(rec_cfg.get("guidance_scale", 1.0))
     
     if verbose:
         print(f"[Reconstruction] Loading config from reconstruction section")
@@ -81,4 +82,5 @@ def run_reconstruction(rec_cfg: dict, verbose: bool = True) -> None:
         mode=mode,
         investigate=investigate,
         device=device,
+        guidance_scale=guidance_scale,
     )

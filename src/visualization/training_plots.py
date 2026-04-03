@@ -140,7 +140,12 @@ def plot_loss_curves(
             _annotate_min(ax, ep, train, color=c_train)
 
         if val and epochs:
-            ep = epochs[: len(val)]
+            # Use val_epochs (actual epoch positions) when available so that
+            # val_loss entries are plotted at their true epoch rather than at
+            # sequential indices 0…N-1 (which would make val look like it
+            # stopped early when val_check_interval > 1).
+            val_ep = run.get("val_epochs")
+            ep = val_ep if val_ep and len(val_ep) == len(val) else epochs[: len(val)]
             ax.plot(ep, val, "-s", markersize=3, linewidth=1.5,
                     color=c_val, label=f"{label} — val", alpha=0.85)
             _annotate_min(ax, ep, val, color=c_val)
@@ -345,8 +350,12 @@ def plot_early_stopping(
     if not val or not epochs:
         raise ValueError("val_loss and epochs are required")
 
-    n = min(len(epochs), len(val))
-    ep, vl = epochs[:n], val[:n]
+    val_ep = run.get("val_epochs")
+    if val_ep and len(val_ep) == len(val):
+        ep, vl = val_ep, val
+    else:
+        n = min(len(epochs), len(val))
+        ep, vl = epochs[:n], val[:n]
 
     colors = get_categorical_colors(4, cmap_name=cmap_name)
     best_idx = int(np.argmin(vl))
@@ -448,7 +457,8 @@ def plot_training_summary(
             _annotate_min(ax, ep, tr, color=colors[0])
         if has_val and epochs:
             vl = run["val_loss"]
-            ep = epochs[: len(vl)]
+            val_ep = run.get("val_epochs")
+            ep = val_ep if val_ep and len(val_ep) == len(vl) else epochs[: len(vl)]
             ax.plot(ep, vl, "-s", markersize=3, lw=1.5,
                     color=colors[1], label="Val", alpha=0.85)
             _annotate_min(ax, ep, vl, color=colors[1])
@@ -504,7 +514,8 @@ def plot_training_summary(
         ax = axes_flat[panel]
         panel += 1
         vl = run["val_loss"]
-        ep = epochs[: len(vl)]
+        val_ep = run.get("val_epochs")
+        ep = val_ep if val_ep and len(val_ep) == len(vl) else epochs[: len(vl)]
         ax.plot(ep, vl, "-o", markersize=4, lw=1.5, color=colors[0])
         best_idx = int(np.argmin(vl))
         ax.scatter([ep[best_idx]], [vl[best_idx]], s=160, marker="*",

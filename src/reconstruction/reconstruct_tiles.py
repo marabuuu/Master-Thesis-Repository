@@ -600,6 +600,7 @@ def _reconstruct_from_image_with_cond(
     device: torch.device,
     *,
     cond_invert: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
     seed: Optional[int] = None,
     save_dir: Optional[Path] = None,
     n_steps: int = 5,
@@ -625,6 +626,11 @@ def _reconstruct_from_image_with_cond(
         provided this should be the tile patient's own conditioning so that the
         inversion is self-consistent and the noise ``x_T`` encodes pure content.
         If ``None``, ``cond`` is reused for inversion (self-reconstruction).
+    guidance_scale:
+        Classifier-free guidance scale applied during **decoding only**.
+        1.0 = no guidance (standard sampling).  Values > 1 amplify the
+        conditioning signal: ``ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)``.
+        Requires the model to have been trained with ``cond_dropout_prob > 0``.
     seed:
         Optional integer seed for deterministic behavior.
     save_dir:
@@ -676,6 +682,15 @@ def _reconstruct_from_image_with_cond(
     unet_model = getattr(model, "ema_model", getattr(model, "model", model))
     unet_model.eval()
 
+    # Wrap UNet with classifier-free guidance for the decode pass.
+    # The inversion pass always uses the bare UNet (no CFG) so that the
+    # encoded noise faithfully represents the tile content.
+    if guidance_scale > 1.0:
+        decode_unet = _CFGWrapper(unet_model, scale=guidance_scale)
+        logger.info(f"  [CFG] guidance_scale={guidance_scale:.1f} applied to decode pass")
+    else:
+        decode_unet = unet_model
+
     # For cross-patient conditioning: invert with the tile patient's own cond so
     # that x_T captures pure content under the tile patient's genomic prior.
     # Decoding then uses the target patient's cond to apply their genomic style.
@@ -725,9 +740,11 @@ def _reconstruct_from_image_with_cond(
         Image.fromarray(_to_uint8(x_T.squeeze(0))).save(encoded_noise_path)
         logger.info(f"  Saved final encoded noise -> {encoded_noise_path.name}")
 
-    # Denoising (reverse diffusion) with deterministic sampling (fast with eval sampler)
+    # Denoising (reverse diffusion) with deterministic sampling.
+    # decode_unet is either the bare EMA model (guidance_scale=1.0) or a
+    # _CFGWrapper that amplifies the conditioning signal.
     prog = decode_sampler.ddim_sample_loop_progressive(
-        model=unet_model,
+        model=decode_unet,
         shape=img_tensor.shape,
         noise=x_T,
         model_kwargs={"cond": cond},
@@ -772,6 +789,7 @@ def reconstruct_tile_image_guided(
     genomic: torch.Tensor,
     device: torch.device,
     genomic_tile: Optional[torch.Tensor] = None,
+    guidance_scale: float = 1.0,
     seed: Optional[int] = None,
     investigate: bool = False,
     investigate_dir: Optional[Path] = None,
@@ -864,6 +882,7 @@ def reconstruct_tile_image_guided(
             cond,
             device=device,
             cond_invert=cond_invert,
+            guidance_scale=guidance_scale,
             seed=seed,
             save_dir=investigate_dir if investigate else None,
             n_steps=n_steps,
@@ -879,6 +898,34 @@ def reconstruct_tile_image_guided(
     metrics = compute_metrics(img_array, recon_image)
 
     return recon_tensor, recon_image, metrics
+
+
+class _CFGWrapper(torch.nn.Module):
+    """Classifier-free guidance wrapper for DDIM decoding.
+
+    At each denoising step computes:
+        ε_guided = ε_uncond + scale * (ε_cond − ε_uncond)
+
+    This amplifies the conditioning signal at inference time.  The model must
+    have been trained with a non-zero ``cond_dropout_prob`` so that it has
+    learnt a meaningful unconditioned (zero-cond) behaviour.
+
+    Only used for the **decoding** (reverse diffusion) pass.  The inversion pass
+    should use the regular model to ensure a faithful content encoding.
+    """
+
+    def __init__(self, model: torch.nn.Module, scale: float) -> None:
+        super().__init__()
+        self.model = model
+        self.scale = scale
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor, cond: Optional[torch.Tensor] = None, **kwargs):
+        from types import SimpleNamespace
+        out_cond = self.model(x, t, cond=cond, **kwargs)
+        cond_zeros = torch.zeros_like(cond) if cond is not None else None
+        out_uncond = self.model(x, t, cond=cond_zeros, **kwargs)
+        pred_guided = out_uncond.pred + self.scale * (out_cond.pred - out_uncond.pred)
+        return SimpleNamespace(pred=pred_guided)
 
 
 def _reconstruct_from_noise_with_cond(
@@ -927,6 +974,7 @@ def reconstruct_tile_random_noise(
     model: torch.nn.Module,
     genomic: torch.Tensor,
     device: torch.device,
+    guidance_scale: float = 1.0,
     seed: Optional[int] = None,
     investigate: bool = False,
     investigate_dir: Optional[Path] = None,
@@ -1004,6 +1052,10 @@ def reconstruct_tile_random_noise(
             # and prefer DDIM sampling when available.
             sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
             unet_model = getattr(model, "ema_model", getattr(model, "model", model))
+            unet_model.eval()
+            if guidance_scale > 1.0:
+                unet_model = _CFGWrapper(unet_model, scale=guidance_scale)
+                logger.info(f"  [CFG] guidance_scale={guidance_scale:.1f} applied to random-noise sampling")
             logger.debug(f"Sampling using sampler={type(sampler).__name__ if sampler is not None else None} unet={type(unet_model).__name__}")
 
             if sampler is not None and hasattr(sampler, "ddim_sample_loop_progressive"):
@@ -1232,6 +1284,7 @@ def main(
     device: Optional[str] = None,
     inversion_steps: int = 250,
     decode_steps: Optional[int] = None,
+    guidance_scale: float = 1.0,
 ) -> None:
     """
     Main reconstruction pipeline.
@@ -1531,6 +1584,7 @@ def main(
                                     genomic_tensor,
                                     device_obj,
                                     genomic_tile=genomic_tile_tensor,
+                                    guidance_scale=guidance_scale,
                                     seed=tile_seed,
                                     investigate=investigate,
                                     investigate_dir=inv_dir,
@@ -1543,6 +1597,7 @@ def main(
                                     model,
                                     genomic_tensor,
                                     device_obj,
+                                    guidance_scale=guidance_scale,
                                     seed=tile_seed,
                                     investigate=investigate,
                                     investigate_dir=inv_dir,

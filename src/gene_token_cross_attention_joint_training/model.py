@@ -86,6 +86,17 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
         self.ema_model.requires_grad_(False)
         self.ema_model.eval()
 
+        # Genomic auto-reconstruction decoder.
+        # A small MLP that maps the conditioning vector back to the original gene
+        # expression space.  Training it jointly forces the transformer encoder +
+        # cond_projection to preserve gene-level information instead of collapsing
+        # to a degenerate constant.  Activated when genomic_recon_loss_weight > 0.
+        self.genomic_decoder = nn.Sequential(
+            nn.Linear(cond_dim, self.gtt_cfg.d_model),
+            nn.GELU(),
+            nn.Linear(self.gtt_cfg.d_model, n_genes),
+        )
+
         self.save_hyperparameters({
             "cross_cfg": self.cross_cfg,
             "joint_variant": "gene_token_cross_attention_joint_training",
@@ -108,6 +119,7 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             {"params": list(self.model.wrapper_parameters()), "lr": cross_attn_lr},
             {"params": list(self.gene_token_encoder.parameters()), "lr": float(jcfg.get("encoder_lr", lr))},
             {"params": list(self.cond_projection.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
+            {"params": list(self.genomic_decoder.parameters()), "lr": float(jcfg.get("proj_lr", lr))},
         ]
 
         if conf.optimizer == OptimizerType.adamw:
@@ -139,6 +151,15 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             # Stochastic encoding (reparameterisation trick) during training acts
             # as an additional regulariser on the genomic latent space.
             cond = self.encode_genomic(genomic)
+
+            # ── Genomic auto-reconstruction loss (before any dropout) ─────
+            # Computed on the clean cond so dropout doesn't corrupt supervision.
+            # Forces the encoder to preserve gene-level information.
+            genomic_recon_weight = float(self.cross_cfg.get("genomic_recon_loss_weight", 0.0))
+            genomic_recon_loss = torch.zeros((), device=imgs.device, dtype=cond.dtype)
+            if genomic_recon_weight > 0.0:
+                genomic_pred = self.genomic_decoder(cond)
+                genomic_recon_loss = F.mse_loss(genomic_pred, genomic)
 
             # ── Conditioning dropout ──────────────────────────────────────
             p_cond = self.cross_cfg.get("cond_dropout_prob", 0.0)
@@ -193,13 +214,14 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                 ).mean()
                 swap_gap = (swapped_loss_per_sample.detach() - main_loss_per_sample.detach()).mean()
 
-            loss = main_loss + cf_weight * cf_margin_loss
+            loss = main_loss + cf_weight * cf_margin_loss + genomic_recon_weight * genomic_recon_loss
 
         self.log("loss_epoch", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
         self.log("loss_step", loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
         self.log("loss_main_step", main_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
         self.log("loss_cf_margin_step", cf_margin_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
         self.log("cf_swap_gap_step", swap_gap, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+        self.log("loss_genomic_recon_step", genomic_recon_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
 
         monitor_every = int(self.cross_cfg.get("counterfactual_monitor_every_n_steps", 200))
         zero_threshold = float(self.cross_cfg.get("counterfactual_zero_threshold", 1e-4))
@@ -227,6 +249,10 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             self.logger.experiment.add_scalar("loss", loss.item(), self.num_samples)  # type: ignore[union-attr]
 
         return {"loss": loss}
+
+    def on_fit_start(self):
+        super().on_fit_start()
+        self.genomic_decoder = self.genomic_decoder.to(self.device)
 
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """EMA update for the full wrapped model (cross-attn layers included)."""

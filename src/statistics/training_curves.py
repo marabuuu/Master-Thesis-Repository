@@ -122,6 +122,10 @@ def _empty_run() -> TrainingRun:
         "epochs": [],
         "loss_epoch": [],
         "val_loss": [],
+        # Actual epoch indices where each val_loss entry was logged.
+        # Populated by parse_tensorboard_events when val_check_interval > 1.
+        # Avoids mapping val_loss[i] → epoch i (wrong) instead of epoch 5i (right).
+        "val_epochs": [],
         "loss_step": [],
         "step_numbers": [],
         "epoch_step_boundaries": [],
@@ -206,12 +210,14 @@ def parse_tensorboard_events(
 
         if tag_lower in ("loss_epoch", "train_loss", "train_loss_epoch", "train_loss_epoch"):
             run["loss_epoch"] = values
+            run["epoch_step_boundaries"] = steps  # global_step at the end of each epoch
             # Derive epoch indices (Lightning logs once per epoch for
             # on_epoch=True metrics)
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
         elif tag_lower in ("val_loss", "val_loss_epoch", "valid_loss", "val_loss_epoch"):
             run["val_loss"] = values
+            run["_val_loss_steps"] = steps  # keep raw steps for epoch-alignment below
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
         elif tag_lower in ("loss", "loss_step", "train_loss_step"):
@@ -227,6 +233,27 @@ def parse_tensorboard_events(
         run["epochs"] = list(range(max_len))
     elif len(run["epochs"]) < max_len:
         run["epochs"] = list(range(max_len))
+
+    # Compute val_epochs: the actual epoch index (into run["epochs"]) for each
+    # val_loss entry.  Without this, val_loss[i] would be plotted at epoch i
+    # instead of the epoch when validation actually ran.
+    # Example: val_check_interval=5, 100 epochs → 20 val entries at epochs
+    # 5,10,…,100 but without correction they'd appear at epochs 0–19.
+    val_steps = run.pop("_val_loss_steps", [])
+    epoch_boundaries = run["epoch_step_boundaries"]
+    if val_steps and epoch_boundaries and len(run["val_loss"]) < len(run["epochs"]):
+        import bisect
+        val_epochs = []
+        for vs in val_steps:
+            # epoch_boundaries[i] = global_step at end of epoch i+1.
+            # bisect_left gives the first boundary >= vs, i.e. epoch index.
+            idx = bisect.bisect_left(epoch_boundaries, vs)
+            idx = min(idx, len(run["epochs"]) - 1)
+            val_epochs.append(run["epochs"][idx])
+        run["val_epochs"] = val_epochs
+    else:
+        # 1:1 mapping (val_check_interval=1) or no step info available
+        run["val_epochs"] = list(run["epochs"][: len(run["val_loss"])])
 
     run["meta"]["source"] = "tensorboard"
     run["meta"]["event_file"] = str(event_files[0])
