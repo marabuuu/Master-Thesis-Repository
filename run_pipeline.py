@@ -120,8 +120,16 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         run_evaluation(config["evaluation"], verbose=verbose)
     
     elif stage == "preprocessing":
-        print(f"[INFO] Preprocessing stage not yet configured in this CLI")
-        print(f"       Run: python -m src.preprocessing.get_tiles_within_rois --config {config_path}")
+        from src.preprocessing.get_tiles_within_rois import main as run_roi_filter
+        if "preprocessing" not in config:
+            raise ValueError("No 'preprocessing' section in config.yaml")
+        pre_cfg = config["preprocessing"]
+
+        # Build sys.argv so argparse inside get_tiles_within_rois.main() picks up
+        # the config path — all actual values are read from the YAML.
+        import sys as _sys
+        _sys.argv = ["get_tiles_within_rois", "--config", config_path]
+        run_roi_filter()
     
     elif stage == "encoding":
         print(f"[INFO] Encoding stage not yet configured in this CLI")

@@ -43,6 +43,15 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
 
     gpus = joint_cfg.get("gpus", [0])
 
+    # When launched via torchrun each OS process already owns one GPU.
+    # Passing devices=[0,1] in that context causes PL to re-spawn subprocesses
+    # → only 1/1 DDP processes. With LOCAL_RANK set, use devices=1 instead.
+    import os as _os
+    if _os.environ.get("LOCAL_RANK") is not None:
+        devices = 1
+    else:
+        devices = gpus
+
     if not os.path.exists(conf.logdir):
         os.makedirs(conf.logdir)
 
@@ -81,10 +90,11 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
         save_dir=conf.logdir, name=None, version="",
     )
 
-    if len(gpus) > 1:
-        from pytorch_lightning.strategies import DDPStrategy
-
-        strategy = DDPStrategy(find_unused_parameters=True)
+    from pytorch_lightning.strategies import DDPStrategy
+    if isinstance(devices, list) and len(devices) > 1:
+        strategy = DDPStrategy(find_unused_parameters=False)
+    elif _os.environ.get("LOCAL_RANK") is not None:
+        strategy = DDPStrategy(find_unused_parameters=False)
     else:
         strategy = "auto"
 
@@ -97,7 +107,7 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
     trainer = pl.Trainer(
         max_epochs=int(joint_cfg.get("epochs", 100)),
         limit_train_batches=int(conf.steps_per_epoch),
-        devices=gpus,
+        devices=devices,
         accelerator="gpu" if gpus else "cpu",
         strategy=strategy,
         precision="16-mixed" if conf.fp16 else 32,

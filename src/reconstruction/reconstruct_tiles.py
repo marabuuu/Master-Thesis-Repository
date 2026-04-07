@@ -796,6 +796,7 @@ def reconstruct_tile_image_guided(
     n_steps: int = 5,
     inversion_steps: int = 250,
     decode_steps: Optional[int] = None,
+    zero_conditioning: bool = False,
 ) -> Tuple[torch.Tensor, np.ndarray, Dict]:
     """Reconstruct a tile using diffusion encoding/decoding + genomic conditioning.
 
@@ -858,15 +859,17 @@ def reconstruct_tile_image_guided(
                 [float(x) for x in cond[0, :5].tolist()],
             )
         )
-        if os.getenv("ZERO_COND", "0") == "1":
+        if zero_conditioning:
             cond = torch.zeros_like(cond)
-            logger.info("  [DEBUG] ZERO_COND=1 -> conditioning zeroed for ablation")
+            logger.info("  [ablation] zero_conditioning=True -> genomic conditioning zeroed")
 
         # Encode tile patient's own genomic vector for the inversion pass so that
         # x_T is computed under the tile patient's prior (cross-conditioning fix).
         cond_invert: Optional[torch.Tensor] = None
         if genomic_tile is not None:
             cond_invert = model.encode(genomic_tile.unsqueeze(0))  # type: ignore[attr-defined]
+            if zero_conditioning:
+                cond_invert = torch.zeros_like(cond_invert)
             logger.info(
                 "  [DEBUG] cond_invert stats (tile patient): mean=%.4f std=%.4f first5=%s"
                 % (
@@ -979,6 +982,7 @@ def reconstruct_tile_random_noise(
     investigate: bool = False,
     investigate_dir: Optional[Path] = None,
     n_steps: int = 5,
+    zero_conditioning: bool = False,
 ) -> Tuple[torch.Tensor, np.ndarray]:
     """Pure random reconstruction: sample from random noise + genomic conditioning.
 
@@ -990,6 +994,9 @@ def reconstruct_tile_random_noise(
 
     with torch.no_grad():
         cond = model.encode(genomic.unsqueeze(0))  # type: ignore[attr-defined]
+        if zero_conditioning:
+            cond = torch.zeros_like(cond)
+            logger.info("  [ablation] zero_conditioning=True -> genomic conditioning zeroed")
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -1005,8 +1012,9 @@ def reconstruct_tile_random_noise(
             Image.fromarray(tensor_to_image(noise.squeeze(0))).save(noise_path)
             logger.info(f"  Saved noise -> {noise_path.name}")
 
-            # Run sampler and save intermediate steps
-            sampler = getattr(model, "sampler", None)
+            # Run sampler and save intermediate steps — mirror the non-investigate
+            # path: prefer eval_sampler, use DDIM, apply CFG when guidance_scale > 1.
+            sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
             if sampler is None:
                 raise RuntimeError("Model does not expose `sampler` for diffusion decoding")
 
@@ -1022,14 +1030,29 @@ def reconstruct_tile_random_noise(
             save_timesteps = set(np.linspace(0, T - 1, n_steps, dtype=int))
 
             unet_model = getattr(model, "ema_model", getattr(model, "model", model))
-            prog = sampler.p_sample_loop_progressive(
-                model=unet_model,
-                shape=noise.shape,
-                noise=noise,
-                model_kwargs={"cond": cond},
-                device=device,
-                progress=False,
-            )
+            unet_model.eval()
+            if guidance_scale > 1.0:
+                unet_model = _CFGWrapper(unet_model, scale=guidance_scale)
+                logger.info(f"  [CFG] guidance_scale={guidance_scale:.1f} applied to investigate sampling")
+            if hasattr(sampler, "ddim_sample_loop_progressive"):
+                prog = sampler.ddim_sample_loop_progressive(
+                    model=unet_model,
+                    shape=noise.shape,
+                    noise=noise,
+                    model_kwargs={"cond": cond},
+                    device=device,
+                    progress=False,
+                    eta=0.0,
+                )
+            else:
+                prog = sampler.p_sample_loop_progressive(
+                    model=unet_model,
+                    shape=noise.shape,
+                    noise=noise,
+                    model_kwargs={"cond": cond},
+                    device=device,
+                    progress=False,
+                )
 
             final_reconstruction: torch.Tensor | None = None
             for idx, out in enumerate(prog):
@@ -1285,6 +1308,7 @@ def main(
     inversion_steps: int = 250,
     decode_steps: Optional[int] = None,
     guidance_scale: float = 1.0,
+    zero_conditioning: bool = False,
 ) -> None:
     """
     Main reconstruction pipeline.
@@ -1342,6 +1366,8 @@ def main(
     logger.info(f"Save dir:    {save_dir}")
     logger.info(f"Mode:        {mode}")
     logger.info(f"Investigate: {investigate}")
+    if zero_conditioning:
+        logger.info("Ablation:    zero_conditioning=True (genomic cond replaced with zeros)")
     logger.info("")
     
     # Load config (optional if called from pipeline)
@@ -1591,6 +1617,7 @@ def main(
                                     n_steps=5,
                                     inversion_steps=inversion_steps,
                                     decode_steps=decode_steps,
+                                    zero_conditioning=zero_conditioning,
                                 )
                             elif mode == "random_noise":
                                 recon_tensor, recon_image = reconstruct_tile_random_noise(
@@ -1602,6 +1629,7 @@ def main(
                                     investigate=investigate,
                                     investigate_dir=inv_dir,
                                     n_steps=5,
+                                    zero_conditioning=zero_conditioning,
                                 )
                                 metrics = {}  # No ground truth for comparison
                             else:

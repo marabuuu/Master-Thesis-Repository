@@ -47,10 +47,60 @@ import tarfile
 import argparse
 import json
 import yaml  # pyyaml is required for configuration file support
+from pathlib import Path
 
 
 load_dotenv()
 ws_path = os.getenv("WORKSPACE_PATH")
+
+
+def _resolve_config_paths(config_dict, repo_root):
+    """Resolve relative paths from preprocessing config with workspace fallback."""
+    path_keys = {
+        "zip_dir",
+        "slide_dir",
+        "img_dir",
+        "roi_dir",
+        "save_dir",
+        "csv_path",
+        "gene_list_path",
+        "tiles_zip_dir",
+        "out_dir",
+        "logdir",
+        "output_dir",
+        "patient_splits_path",
+        "latent_dir",
+        "ckpt",
+        "diffusion_ckpt",
+    }
+
+    def _resolve_single(value: str) -> str:
+        if not isinstance(value, str) or value.startswith("/"):
+            return value
+
+        repo_candidate = (repo_root / value).resolve()
+        normalized = value[2:] if value.startswith("./") else value
+
+        if normalized.startswith(("data/", "dataframes/", "experiments/")):
+            parent_candidate = (repo_root.parent / normalized).resolve()
+            if parent_candidate.exists() or not repo_candidate.exists():
+                return str(parent_candidate)
+
+        return str(repo_candidate)
+
+    if isinstance(config_dict, dict):
+        for key, value in list(config_dict.items()):
+            if isinstance(value, dict):
+                _resolve_config_paths(value, repo_root)
+            elif isinstance(value, list):
+                for item in value:
+                    if isinstance(item, dict):
+                        _resolve_config_paths(item, repo_root)
+            elif isinstance(value, str):
+                if key in path_keys or value.startswith("./") or value.startswith("../"):
+                    config_dict[key] = _resolve_single(value)
+
+    return config_dict
 
 
 def process_tile(tile_data):
@@ -307,27 +357,32 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
         print(f"Failed to pick hypothesis: {e}")
 
     # =========================================================================
-    # COORDINATE CONVERSION STRATEGY (matching original WSI script):
-    # - Tile coords in ZIP are in MICRONS -> convert to TARGET PIXELS
+    # COORDINATE CONVERSION STRATEGY:
+    # - Tile coords in ZIP are in MICRONS (HEST/STAMP) or native slide pixels —
+    #   the hypothesis evaluation above auto-detects which via coords_in_microns_flag.
     # - Annotation coords are in NATIVE SLIDE PIXELS -> convert to TARGET PIXELS
     # - Everything compared in TARGET PIXEL space
-    # - Tile polygons are 512x512 TARGET PIXELS (same as original script)
+    # - Tile polygons are tile_size_px × tile_size_px TARGET PIXELS
     # =========================================================================
-    
-    # Convert tile coordinates from microns to target pixels
-    # tile_coord_microns / target_mpp = tile_coord_target_pixels
+
+    # Convert tile coordinates to target pixels using the auto-chosen hypothesis.
     polygons = []
     for fn in tile_fnames:
         c = parse_tile_coords(fn)
         if c is None:
             continue
-        x_um, y_um = c
-        
-        # Convert from microns to target pixels
-        x_px = float(x_um) / float(target_mpp)
-        y_px = float(y_um) / float(target_mpp)
-        
-        # If coordinate represents center, shift to top-left
+        x_raw, y_raw = c
+
+        if coords_in_microns_flag is None or coords_in_microns_flag:
+            # microns -> target pixels
+            x_px = float(x_raw) / float(target_mpp)
+            y_px = float(y_raw) / float(target_mpp)
+        else:
+            # native slide pixels -> target pixels
+            x_px = float(x_raw) * (native_slide_mpp / float(target_mpp))
+            y_px = float(y_raw) * (native_slide_mpp / float(target_mpp))
+
+        # If coordinate represents tile center, shift to top-left corner
         if coord_is_center_flag:
             x_px -= tile_size_px / 2.0
             y_px -= tile_size_px / 2.0
@@ -433,7 +488,7 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
                     if ext is not None:
                         try:
                             x, y = ext.xy
-                            ax.fill(x, y, alpha=0.5, fc='r', ec='Annotated Tissue')
+                            ax.fill(x, y, alpha=0.5, fc='r', ec='red', label='Annotated Tissue')
                         except Exception:
                             pass
         except Exception as e:
@@ -577,12 +632,15 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
         except Exception as e:
             print(f"Failed to print diagnostics: {e}")
 
-    # create zip archive
+    # create zip archive — only include image files, not diagnostic JSON
     archive_path = os.path.join(save_dir, f"{tiles_folder}.zip")
+    image_extensions = {'.png', '.jpg', '.jpeg', '.tif', '.tiff'}
     try:
         with zipfile.ZipFile(archive_path, 'w', zipfile.ZIP_DEFLATED) as zf:
             for root, dirs, files in os.walk(filtered_tiles_dir):
                 for file in files:
+                    if os.path.splitext(file)[1].lower() not in image_extensions:
+                        continue
                     file_path = os.path.join(root, file)
                     arcname = os.path.join(tiles_folder, os.path.relpath(file_path, filtered_tiles_dir))
                     zf.write(file_path, arcname)
@@ -619,13 +677,20 @@ def main():
     temp_args, _ = parser.parse_known_args()
     if temp_args.config:
         try:
-            with open(temp_args.config) as f:
+            config_path_obj = Path(temp_args.config).expanduser().resolve()
+            with open(config_path_obj) as f:
                 cfg = yaml.safe_load(f) or {}
             # support hierarchical config files where arguments live under a
             # "preprocessing" section (makes it easier to combine with other
             # workflows). if so, pull that sub-dictionary.
             if isinstance(cfg, dict) and 'preprocessing' in cfg:
                 cfg = cfg['preprocessing'] or {}
+            # Resolve relative paths from config location and support sibling
+            # workspace folders like ../data when data is outside the repo.
+            repo_root = config_path_obj.parent
+            if repo_root.name == "src":
+                repo_root = repo_root.parent
+            _resolve_config_paths(cfg, repo_root)
             parser.set_defaults(**cfg)
         except Exception as e:
             print(f"Failed to load config file {temp_args.config}: {e}")
@@ -690,9 +755,9 @@ def main():
         with concurrent.futures.ProcessPoolExecutor(max_workers=num_workers) as executor:
             futures = {
                 executor.submit(
+                    process_zip,
                     fname,
                     slide_dir,
-                    img_dir,
                     save_dir,
                     roi_dir,
                     target_mpp,

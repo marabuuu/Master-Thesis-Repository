@@ -3,6 +3,7 @@ from __future__ import annotations
 import copy
 
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 from torch.amp.autocast_mode import autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LambdaLR, SequentialLR
@@ -72,6 +73,7 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             "counterfactual_margin": float(joint_cfg.get("counterfactual_margin", 0.02)),
             "counterfactual_monitor_every_n_steps": int(joint_cfg.get("counterfactual_monitor_every_n_steps", 200)),
             "counterfactual_zero_threshold": float(joint_cfg.get("counterfactual_zero_threshold", 1e-4)),
+            "genomic_recon_loss_weight": float(joint_cfg.get("genomic_recon_loss_weight", 0.0)),
         }
 
         # Wrap base UNet with patchified cross-attention
@@ -161,27 +163,40 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                 genomic_pred = self.genomic_decoder(cond)
                 genomic_recon_loss = F.mse_loss(genomic_pred, genomic)
 
-            # ── Conditioning dropout ──────────────────────────────────────
-            p_cond = self.cross_cfg.get("cond_dropout_prob", 0.0)
-            if p_cond > 0:
-                mask = torch.rand(cond.shape[0], device=cond.device) < p_cond
-                if mask.any():
-                    cond = cond.clone()
-                    cond[mask] = 0
+            # ── Three mutually exclusive training modes ───────────────────
+            # A single draw assigns each sample to exactly one mode so that
+            # cond-dropout and xT-forcing never cancel each other out:
+            #
+            #   [0, p_cond)            cond dropout  → trains unconditional (CFG)
+            #   [p_cond, p_cond+p_xt)  xT forcing    → t near-T, x_t≈N(0,I),
+            #                                           model must use genomic cond
+            #   [p_cond+p_xt, 1.0)     normal        → standard reconstruction
+            p_cond = float(self.cross_cfg.get("cond_dropout_prob", 0.0))
+            p_xt   = float(self.cross_cfg.get("xT_dropout_prob", 0.0))
+            r = torch.rand(cond.shape[0], device=cond.device)
+            cond_drop_mask = r < p_cond
+            xt_force_mask  = (r >= p_cond) & (r < p_cond + p_xt)
 
-            p_feat = self.cross_cfg.get("cond_feature_dropout", 0.0)
+            if cond_drop_mask.any():
+                cond = cond.clone()
+                cond[cond_drop_mask] = 0
+
+            p_feat = float(self.cross_cfg.get("cond_feature_dropout", 0.0))
             if p_feat > 0:
                 cond = F.dropout(cond, p=p_feat, training=self.training)
 
-            # ── x_T dropout (curriculum) ──────────────────────────────────
+            # ── xT forcing: override t → near-T so x_t ≈ N(0,I) ─────────
             x_start = imgs
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
-            p_x = self.cross_cfg.get("xT_dropout_prob", 0.0)
-            if p_x > 0:
-                mask_x = torch.rand(imgs.shape[0], device=imgs.device) < p_x
-                if mask_x.any():
-                    t = t.clone()
-                    t[mask_x] = int(self.conf.T - 1)
+            if xt_force_mask.any():
+                T_max = int(getattr(self.conf, "T", 1000))
+                t_high = torch.randint(
+                    int(T_max * 0.8), T_max,
+                    (int(xt_force_mask.sum().item()),),
+                    device=imgs.device,
+                )
+                t = t.clone()
+                t[xt_force_mask] = t_high
 
             losses = self.sampler.training_losses(
                 model=self.model,

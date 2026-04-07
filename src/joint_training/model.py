@@ -180,6 +180,17 @@ class JointLitModel(LitModel):
             print(f"[Joint] Loading diffusion checkpoint: {diffusion_ckpt}")
             state = torch.load(diffusion_ckpt, map_location="cpu", weights_only=False)
             sd = state.get("state_dict", state)
+            # Filter out keys whose shape doesn't match the current model
+            # (e.g. x_T buffer varies with sample_size between checkpoints).
+            # strict=False skips missing/unexpected keys but still errors on
+            # shape mismatches, so we must drop them explicitly.
+            current_sd = self.state_dict()
+            mismatched = [k for k, v in sd.items()
+                          if k in current_sd and current_sd[k].shape != v.shape]
+            if mismatched:
+                print(f"[Joint] Skipping {len(mismatched)} shape-mismatched key(s) "
+                      f"from checkpoint: {mismatched}")
+                sd = {k: v for k, v in sd.items() if k not in mismatched}
             self.load_state_dict(sd, strict=False)
 
         encoder_ckpt = joint_cfg.get("encoder_ckpt")

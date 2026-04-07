@@ -268,6 +268,95 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
         print(f"[GeneTokenJoint] Saved latent features for {saved} patients to {out_dir}")
         return out_dir
 
+    # ──────────────────────────────────────────────────────────────────
+    #  Training step — adds cond dropout for CFG support at inference
+    # ──────────────────────────────────────────────────────────────────
+
+    def training_step(self, batch, batch_idx):
+        """Diffusion loss with three mutually exclusive training modes per sample.
+
+        A single uniform draw ``r ~ U[0,1)`` assigns each sample in the batch
+        to exactly one mode:
+
+          [0, p_cond)              → **cond dropout**  (zeros genomic cond)
+              Required for classifier-free guidance (CFG) at inference.
+              Teaches the model an unconditional distribution alongside the
+              conditioned one.
+
+          [p_cond, p_cond+p_xt)   → **xT forcing**  (overrides t to near-T)
+              At timestep t ≈ T, x_t ≈ N(0,I) regardless of x_start, so the
+              model receives almost no image-content signal.  It must rely on
+              the genomic conditioning vector to predict the noise direction.
+              Directly trains Goals 2 (cross-conditioning) and 3 (random-noise
+              generation): the model learns *which direction to denoise* from
+              pure noise given a genomic cond vector.
+
+          [p_cond+p_xt, 1.0)      → **normal**  (real image + real cond)
+              Standard diffusion loss for image-guided reconstruction (Goal 1).
+
+        ``cond_feature_dropout`` is applied after mode selection as a
+        per-dimension regulariser on the conditioning pathway (not mutually
+        exclusive with the mode above, but only active in cond+xt modes since
+        the cond-dropout mode already zeros the whole vector).
+        """
+        from torch.amp.autocast_mode import autocast
+
+        with autocast(device_type="cuda", enabled=self.conf.fp16):
+            imgs = batch["img"].to(self.device)
+            genomic = batch["genomic"].to(self.device, dtype=torch.float32)
+
+            cond = self.encode_genomic(genomic)
+
+            p_cond = float(self.joint_cfg.get("cond_dropout_prob", 0.0))
+            p_xt   = float(self.joint_cfg.get("xt_zero_prob", 0.0))
+
+            # Single draw → mutually exclusive mode assignment
+            r = torch.rand(len(imgs), device=imgs.device)
+            cond_drop_mask = r < p_cond
+            xt_force_mask  = (r >= p_cond) & (r < p_cond + p_xt)
+
+            # Mode 1 — cond dropout (CFG training)
+            if cond_drop_mask.any():
+                cond = cond.clone()
+                cond[cond_drop_mask] = 0.0
+
+            # Per-dimension feature dropout (applied after cond dropout, mild regulariser)
+            p_feat = float(self.joint_cfg.get("cond_feature_dropout", 0.0))
+            if p_feat > 0.0:
+                cond = F.dropout(cond, p=p_feat, training=self.training)
+
+            # Mode 2 — xT forcing: override t to near-T so x_t ≈ N(0,I)
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+            if xt_force_mask.any():
+                T_max = int(getattr(self.conf, "T", 1000))
+                t_high = torch.randint(
+                    int(T_max * 0.8), T_max,
+                    (int(xt_force_mask.sum().item()),),
+                    device=imgs.device,
+                )
+                t = t.clone()
+                t[xt_force_mask] = t_high
+
+            losses = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=cond,
+                t=t,
+                model_kwargs={"cond": cond},
+            )
+            loss = losses["loss"].mean()
+
+        self.log("loss_epoch", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
+        self.log("loss_step", loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+
+        if self.global_rank == 0 and hasattr(self, "logger") and hasattr(self.logger, "experiment"):
+            tb = self.logger.experiment  # type: ignore[union-attr]
+            tb.add_scalar("loss", loss.item(), self.num_samples)
+            tb.add_scalar("frac/cond_drop", cond_drop_mask.float().mean().item(), self.num_samples)
+            tb.add_scalar("frac/xt_force",  xt_force_mask.float().mean().item(), self.num_samples)
+
+        return {"loss": loss}
+
 
 def build_gene_token_transformer_conf(joint_cfg: dict):
     """Reuse baseline joint config builder for diffusion/training defaults."""
