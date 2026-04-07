@@ -48,7 +48,10 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
     # → only 1/1 DDP processes. With LOCAL_RANK set, use devices=1 instead.
     import os as _os
     if _os.environ.get("LOCAL_RANK") is not None:
-        devices = 1
+        # Launched via torchrun: PL is in TorchElastic mode and does NOT
+        # re-spawn processes. It validates: devices * num_nodes == WORLD_SIZE,
+        # so we must pass the total GPU count, not 1.
+        devices = int(_os.environ.get("WORLD_SIZE", len(gpus)))
     else:
         devices = gpus
 
