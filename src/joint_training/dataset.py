@@ -172,30 +172,43 @@ class GenomicTileDataset(Dataset):
         if patient_col in df.columns:
             df = df.set_index(patient_col)
 
-        # Keep sample-level rows (no averaging across samples) while preserving
-        # patient-level split assignment downstream.
-        raw_ids = df.index.astype(str)
-        sample_ids = pd.Series(raw_ids.map(canonical_sample_id).to_numpy(), index=df.index, dtype=str)
-        duplicated = int(sample_ids.duplicated(keep="first").sum())
-        if duplicated > 0:
+        # Build per-row unique keys from the raw CSV index.
+        # We keep ALL rows — patients with multiple samples (e.g. two biopsies,
+        # a primary and a recurrence, or multiple aliquots) each get their own
+        # genomic vector and all contribute independently to training.
+        # Keys are the original index values; if the CSV has exact duplicate
+        # index values we append _1, _2, ... to guarantee uniqueness.
+        raw_ids = df.index.astype(str).tolist()
+        seen: dict[str, int] = {}
+        sample_keys: list[str] = []
+        for rid in raw_ids:
+            if rid in seen:
+                seen[rid] += 1
+                sample_keys.append(f"{rid}_{seen[rid]}")
+            else:
+                seen[rid] = 0
+                sample_keys.append(rid)
+
+        n_disambiguated = sum(1 for k, c in seen.items() if c > 0)
+        if n_disambiguated > 0:
+            n_extra = sum(c for c in seen.values() if c > 0)
             print(
-                f"[GenomicTileDataset][WARN] Found {duplicated} duplicate genomic rows after sample canonicalization; "
-                "keeping first row per sample ID."
+                f"[GenomicTileDataset] {n_extra} rows share an index value with another row "
+                f"({n_disambiguated} base IDs affected); appended _N suffix to keep all samples."
             )
-        dedup_mask = ~sample_ids.duplicated(keep="first")
-        df = df.loc[dedup_mask].copy()
-        sample_ids = pd.Series(sample_ids.to_numpy()[dedup_mask.to_numpy()], index=df.index, dtype=str)
-        patient_ids_from_df = sample_ids.map(canonical_patient_id)
+
+        patient_ids_from_df = pd.Series(
+            [canonical_patient_id(k) for k in sample_keys], dtype=str
+        )
 
         # Restrict to requested patient split before fitting any preprocessing
         # statistics to avoid train/val/test leakage.
         if patient_ids is not None:
             allowed = {canonical_patient_id(str(pid)) for pid in patient_ids}
-            keep_mask = patient_ids_from_df.isin(allowed)
-            df = df.loc[keep_mask].copy()
-            mask_np = keep_mask.to_numpy()
-            sample_ids = pd.Series(sample_ids.to_numpy()[mask_np], index=df.index, dtype=str)
-            patient_ids_from_df = pd.Series(patient_ids_from_df.to_numpy()[mask_np], index=df.index, dtype=str)
+            keep_mask_arr = patient_ids_from_df.isin(allowed).to_numpy()
+            df = df.iloc[keep_mask_arr].copy()
+            sample_keys = [k for k, m in zip(sample_keys, keep_mask_arr) if m]
+            patient_ids_from_df = patient_ids_from_df[keep_mask_arr].reset_index(drop=True)
 
         # Drop non-numeric label column if present
         if label_col and label_col in df.columns:
@@ -245,11 +258,11 @@ class GenomicTileDataset(Dataset):
         self.gene_names = list(df.columns)
         self.n_genes = len(self.gene_names)
         self._genomic = {
-            str(sample_ids.iloc[i]): torch.from_numpy(values[i].astype(np.float32))
+            sample_keys[i]: torch.from_numpy(values[i].astype(np.float32))
             for i in range(len(df))
         }
         self._sample_to_patient = {
-            str(sample_ids.iloc[i]): str(patient_ids_from_df.iloc[i])
+            sample_keys[i]: str(patient_ids_from_df.iloc[i])
             for i in range(len(df))
         }
         self._patient_to_samples: dict[str, list[str]] = {}
@@ -259,20 +272,23 @@ class GenomicTileDataset(Dataset):
         self._norm_means = means
         self._norm_stds = stds
 
-        print(f"[GenomicTileDataset] Loaded {len(self._genomic)} patients, "
-              f"{self.n_genes} genes")
+        n_samples = len(self._genomic)
+        n_patients = len(self._patient_to_samples)
+        print(f"[GenomicTileDataset] Loaded {n_samples} genomic samples "
+              f"from {n_patients} patients, {self.n_genes} genes")
 
         # ── Index tile ZIPs ────────────────────────────────────────────
         tiles_dir = Path(tiles_zip_dir).expanduser()
-        zip_map: dict[str, list[Path]] = {}  # patient_id -> list of zip paths
-        zip_sample_map: dict[Path, str] = {}
+        zip_map: dict[str, list[Path]] = {}  # patient_id (3-token) -> list of zip paths
+        zip_sample_map: dict[Path, str] = {}  # zip path -> canonical_sample_id (4-token)
         for zp in sorted(tiles_dir.glob("*.zip")):
             pid = canonical_patient_id(zp.name)
             zip_map.setdefault(pid, []).append(zp)
             zip_sample_map[zp] = canonical_sample_id(zp.name)
 
-        # Match patients present in both genomic and tile data
-        common = set(self._genomic) & set(zip_map)
+        # Match at patient level: zip_map keys and _patient_to_samples keys are
+        # both 3-token canonical patient IDs.
+        common = set(self._patient_to_samples) & set(zip_map)
 
         # Further restrict to allowed patient set (for train/val/test splits)
         if patient_ids is not None:
@@ -293,21 +309,25 @@ class GenomicTileDataset(Dataset):
 
         # Build flat list: (patient_id, zip_path, tile_name)
         self.samples: list[tuple[str, Path, str, str]] = []
-        unmatched_zips = 0
+        rng_zip = random.Random(42)
         for pid in common_sorted:
             for zpath in zip_map[pid]:
-                sample_id = zip_sample_map[zpath]
-                if sample_id in self._genomic:
-                    genomic_key = sample_id
+                zip_canonical = zip_sample_map[zpath]   # 4-token canonical of zip name
+                patient_samples = self._patient_to_samples.get(pid, [])
+
+                # 1. Exact match: a genomic key whose canonical form equals the zip's
+                exact = [k for k in patient_samples
+                         if canonical_sample_id(k) == zip_canonical]
+                if exact:
+                    genomic_key = exact[0]
                 else:
-                    # Fallback: if exactly one genomic sample exists for this patient,
-                    # use it; otherwise skip this zip to avoid ambiguous matching.
-                    patient_samples = self._patient_to_samples.get(pid, [])
-                    if len(patient_samples) == 1:
-                        genomic_key = patient_samples[0]
-                    else:
-                        unmatched_zips += 1
+                    # 2. No exact match — use all available genomic samples for this
+                    #    patient (not just one, not skip). Each zip gets a randomly
+                    #    chosen sample; over many tiles this exposes the model to all
+                    #    genomic vectors from the patient equally.
+                    if not patient_samples:
                         continue
+                    genomic_key = rng_zip.choice(patient_samples)
 
                 try:
                     with zipfile.ZipFile(zpath, "r") as zf:
@@ -327,11 +347,6 @@ class GenomicTileDataset(Dataset):
 
                 for name in names:
                     self.samples.append((pid, zpath, name, genomic_key))
-
-        if unmatched_zips > 0:
-            print(
-                f"[GenomicTileDataset][WARN] Skipped {unmatched_zips} zip files because sample-level genomic match was ambiguous"
-            )
 
         print(f"[GenomicTileDataset] {len(self.samples)} tile-genomic pairs total")
 
