@@ -198,11 +198,19 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                 t = t.clone()
                 t[xt_force_mask] = t_high
 
+            # Sample noise ONCE and reuse for both main and CF forward passes.
+            # Using the same noise ensures x_t is identical in both passes, so
+            # (swapped_loss - main_loss) reflects only the conditioning difference,
+            # not variance from independent noise draws.  With independent noise the
+            # CF loss expectation is dominated by variance and collapses toward 0.
+            shared_noise = torch.randn_like(x_start)
+
             losses = self.sampler.training_losses(
                 model=self.model,
                 x_start=x_start,
                 cond=cond,
                 t=t,
+                noise=shared_noise,
                 model_kwargs={"cond": cond},
             )
             main_loss_per_sample = losses["loss"]
@@ -220,6 +228,7 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                     x_start=x_start,
                     cond=cond_swapped,
                     t=t,
+                    noise=shared_noise,  # same x_t, only cond differs
                     model_kwargs={"cond": cond_swapped},
                 )
                 swapped_loss_per_sample = losses_swapped["loss"]

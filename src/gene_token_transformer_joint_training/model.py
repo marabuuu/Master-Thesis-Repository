@@ -20,6 +20,14 @@ except ImportError:
     from src.mopadi.configs.choices import OptimizerType  # type: ignore[import-not-found]
 
 
+def _build_swapped_indices(batch_size: int, device: torch.device):
+    """Return a cyclic permutation of batch indices (shift by random amount ≥1)."""
+    if batch_size < 2:
+        return None
+    shift = int(torch.randint(1, batch_size, (1,), device=device).item())
+    return torch.roll(torch.arange(batch_size, device=device), shifts=shift)
+
+
 class GeneTokenTransformerEncoder(nn.Module):
     """Token/value embedding + transformer encoder for genomic conditioning."""
 
@@ -273,7 +281,7 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
     # ──────────────────────────────────────────────────────────────────
 
     def training_step(self, batch, batch_idx):
-        """Diffusion loss with three mutually exclusive training modes per sample.
+        """Diffusion loss with three mutually exclusive training modes + CF loss.
 
         A single uniform draw ``r ~ U[0,1)`` assigns each sample in the batch
         to exactly one mode:
@@ -298,6 +306,14 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
         per-dimension regulariser on the conditioning pathway (not mutually
         exclusive with the mode above, but only active in cond+xt modes since
         the cond-dropout mode already zeros the whole vector).
+
+        **Counterfactual margin loss** (when ``counterfactual_loss_weight > 0``):
+        A second forward pass is run with shuffled conditioning vectors using the
+        *same* noise sample so x_t is identical.  The margin loss penalises the
+        model whenever swapped-cond loss ≤ matched-cond loss + margin, i.e. it
+        explicitly forces the model to produce higher diffusion loss when the
+        genomic conditioning does not match the image.  Both passes share noise
+        so the gap is purely due to conditioning, not noise variance.
         """
         from torch.amp.autocast_mode import autocast
 
@@ -337,23 +353,78 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
                 t = t.clone()
                 t[xt_force_mask] = t_high
 
+            # Sample noise ONCE — shared between main and CF forward passes so
+            # x_t is identical and (swapped_loss - main_loss) reflects only the
+            # conditioning difference, not independent noise variance.
+            shared_noise = torch.randn_like(imgs)
+
             losses = self.sampler.training_losses(
                 model=self.model,
                 x_start=imgs,
                 cond=cond,
                 t=t,
+                noise=shared_noise,
                 model_kwargs={"cond": cond},
             )
-            loss = losses["loss"].mean()
+            main_loss_per_sample = losses["loss"]
+            main_loss = main_loss_per_sample.mean()
+
+            # ── Counterfactual margin loss ────────────────────────────────
+            cf_weight = float(self.joint_cfg.get("counterfactual_loss_weight", 0.0))
+            cf_margin_loss = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
+            swap_gap = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
+            swap_idx = _build_swapped_indices(cond.shape[0], cond.device)
+            if cf_weight > 0.0 and swap_idx is not None:
+                cond_swapped = cond[swap_idx]
+                losses_swapped = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=cond_swapped,
+                    t=t,
+                    noise=shared_noise,  # same x_t, only cond differs
+                    model_kwargs={"cond": cond_swapped},
+                )
+                swapped_loss_per_sample = losses_swapped["loss"]
+                margin = float(self.joint_cfg.get("counterfactual_margin", 0.05))
+                cf_margin_loss = F.relu(
+                    margin + main_loss_per_sample.detach() - swapped_loss_per_sample
+                ).mean()
+                swap_gap = (swapped_loss_per_sample.detach() - main_loss_per_sample.detach()).mean()
+
+            loss = main_loss + cf_weight * cf_margin_loss
 
         self.log("loss_epoch", loss, on_step=False, on_epoch=True, prog_bar=True, sync_dist=True, batch_size=len(imgs))
         self.log("loss_step", loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+        self.log("loss_main_step", main_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+        self.log("loss_cf_margin_step", cf_margin_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
+        self.log("cf_swap_gap_step", swap_gap, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
 
         if self.global_rank == 0 and hasattr(self, "logger") and hasattr(self.logger, "experiment"):
             tb = self.logger.experiment  # type: ignore[union-attr]
             tb.add_scalar("loss", loss.item(), self.num_samples)
             tb.add_scalar("frac/cond_drop", cond_drop_mask.float().mean().item(), self.num_samples)
             tb.add_scalar("frac/xt_force",  xt_force_mask.float().mean().item(), self.num_samples)
+
+        monitor_every = int(self.joint_cfg.get("counterfactual_monitor_every_n_steps", 200))
+        zero_threshold = float(self.joint_cfg.get("counterfactual_zero_threshold", 1e-4))
+        if (
+            self.global_rank == 0
+            and cf_weight > 0.0
+            and monitor_every > 0
+            and self.global_step % monitor_every == 0
+        ):
+            cf_margin_value = float(cf_margin_loss.detach().item())
+            message = (
+                f"[CF-TUNING] step={self.global_step} total={float(loss.detach().item()):.6f} "
+                f"main={float(main_loss.detach().item()):.6f} cf_margin={cf_margin_value:.6f} "
+                f"swap_gap={float(swap_gap.detach().item()):.6f} "
+                f"weight={cf_weight:.3f} margin={float(self.joint_cfg.get('counterfactual_margin', 0.05)):.3f}"
+            )
+            if cf_margin_value <= zero_threshold:
+                message += " | hint: cf_margin≈0 -> swapped loss already > matched + margin (good!)"
+            else:
+                message += " | hint: cf_margin>0 -> model not yet differentiating conditioning"
+            print(message)
 
         return {"loss": loss}
 
