@@ -212,15 +212,23 @@ gene_token_transformer_joint_training:
   #   ─────────────────────────────────────────────────────────────────────
   #   cond dropout     0.15    zeros genomic cond → trains unconditional
   #                            distribution; required for CFG at inference
-  #   xT forcing       0.30    overrides t to near-T (t ∈ [0.8T, T)) so
+  #   xT forcing       0.55    overrides t to near-T (t ∈ [0.8T, T)) so
   #                            x_t ≈ N(0,I) and model must use genomic cond
   #                            to predict noise direction → trains Goals 2+3
-  #   normal           0.55    real image + real cond → trains Goal 1
+  #   normal           0.30    real image + real cond → trains Goal 1
   #   ─────────────────────────────────────────────────────────────────────
-  #   Over 5M samples: 750K cond-drop / 1.5M xT-force / 2.75M normal
+  #   Over 5M samples: 750K cond-drop / 2.75M xT-force / 1.5M normal
   cond_dropout_prob: 0.15                 # 15 % of samples train unconditionally (CFG)
-  xt_zero_prob: 0.30                      # 30 % of samples use high-noise timesteps
+  xt_zero_prob: 0.55                      # raised from 0.30 — encoder is diverse, UNet needs forcing
   cond_feature_dropout: 0.05             # per-dimension dropout on cond vector
+
+  # Counterfactual margin loss — same objective as gtca for a clean ablation.
+  # Both passes share the same noise tensor so x_t is identical; the loss gap
+  # is purely due to the conditioning vector, not noise variance.
+  counterfactual_loss_weight: 0.5
+  counterfactual_margin: 0.05
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
 
   # Schedule — pragmatic 5M-sample target on 2× H100 (~40–60 h).
   # Resume and extend with the same script if conditioning looks promising.
@@ -282,13 +290,16 @@ gene_token_cross_attention_joint_training:
     dim_per_head: 64
     patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
 
-  cond_dropout_prob: 0.15       # raised from 0.05 — required for CFG to work well at inference
+  cond_dropout_prob: 0.15       # required for CFG to work well at inference
   cond_feature_dropout: 0.05
-  xT_dropout_prob: 0.3
+  xT_dropout_prob: 0.55         # increased from 0.30 — encoder is diverse; UNet was ignoring cond
 
-  # Counterfactual conditioning objective
-  counterfactual_loss_weight: 0.3   # raised from 0.2 — stronger gradient signal to use conditioning
-  counterfactual_margin: 0.1   # ~10-30% of typical diffusion loss range (0.05-0.3)
+  # Counterfactual conditioning objective.
+  # BUG FIX: both CF passes now share the same noise tensor so x_t is identical
+  # and (swapped_loss - main_loss) reflects only conditioning, not noise variance.
+  # Previously, independent noise drew CF loss to ≈0 (pure noise gradient).
+  counterfactual_loss_weight: 0.5   # raised: CF loss now provides clean signal
+  counterfactual_margin: 0.05   # lowered: same-noise gaps are small; 0.05 gives early gradient
   counterfactual_monitor_every_n_steps: 200
   counterfactual_zero_threshold: 1e-4
 
@@ -320,24 +331,25 @@ sampling:
 
 evaluation:
   # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
-  mode: random_noise       # choices: image_guided, random_noise
+  mode: image_guided       # choices: image_guided, random_noise
                             # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
                             # random_noise: no originals needed; skips metric computation
 
   # ── Directories for reconstruction quality assessment ─────────────────
-  original_zip_dir: ./experiments/20260403_gene_token_cross_attention_training/reconstructions_random_noise/original_samples
+  original_zip_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise_ablate_genomics/reconstructed_samples
                             # not required when mode=random_noise
-  reconstructed_zip_dir: ./experiments/20260403_gene_token_cross_attention_training/reconstructions_random_noise/reconstructed_samples
+  reconstructed_zip_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise/reconstructed_samples
                             # can point to a different reconstruction run for cross-condition evaluation
 
   # ── Output locations ──────────────────────────────────────────────────
-  output_dir: ./experiments/20260403_gene_token_cross_attention_training/evaluation_random_noise  # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260403_gene_token_cross_attention_training/evaluation_random_noise/plots  # where to save generated plots (can be same as output_dir)
+  output_dir: ./experiments/20260407_gene_token_transformer_training/evaluation_difference_random_noise  # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260407_gene_token_transformer_training/evaluation_difference_random_noise/plots  # where to save generated plots (can be same as output_dir)
 
   # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
   #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
+  #TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
   #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
 
   # ── Subtype metadata ──────────────────────────────────────────────────
@@ -357,11 +369,11 @@ evaluation:
     - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
     - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
     - metric_correlation   # scatter plots of metric pairs (image_guided only)
-    - random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
     #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
 
 
-  num_comparison_samples: 16  # max tile pairs to visualize in comparison grid / random_noise_grid
+  num_comparison_samples: 6  # max tile pairs to visualize in comparison grid / random_noise_grid
   include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
 
   # ── Plot styling ──────────────────────────────────────────────────────
@@ -436,13 +448,16 @@ subtype_classifier:
   patient_splits_path: ./experiments/20260320_joint_training_encoder_only_slurm/patient_splits.json
   # Optional override (defaults to encoding.csv_path in config)
   # label_csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
-  # Optional cap for balanced tile counts per patient
-  max_tiles_per_patient: null
+  # Cap tiles per patient to prevent large-WSI patients from dominating training.
+  # 100 tiles/patient gives ~80K training tiles for ~800 train patients — more
+  # than enough for a linear probe on 1280-dim Virchow2 features.
+  max_tiles_per_patient: 100
   seed: 42
   output_dir: ./experiments/20260326_cross_subtype_classifier
   train:
     solver: liblinear
-    C: 1.0
+    Cs: [0.01, 0.1, 1.0, 10.0, 100.0]  # searched via 5-fold CV on train set
+    cv_folds: 5
     max_iter: 2000
     class_weight: balanced
   evaluate:
@@ -482,37 +497,38 @@ virchow2_extraction:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260403_gene_token_cross_attention_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  checkpoint_path: ./experiments/20260407_gene_token_transformer_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ../dataframes/brca_gene_expression.csv
-  tiles_zip_dir: ./data/BRCA-tumor-tiles-all
+  tiles_zip_dir: ./data/BRCA-tumor-tiles-corrected
   patient_col: Patient_ID
   #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
+  #TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
   #conditioning_patients: [TCGA-A2-A04T]
-  patient_splits_path: ./experiments/20260403_gene_token_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_splits_path: ./experiments/20260407_gene_token_transformer_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
-  n_tiles_per_patient: 5    # number of tiles to sample per patient
+  n_tiles_per_patient: 2    # number of tiles to sample per patient
   mode: random_noise       # choices: image_guided, random_noise
   investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260403_gene_token_cross_attention_training/reconstructions_random_noise_ablate_genomics  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
   
   # ── Classifier-Free Guidance ──────────────────────────────────────────
   # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
   # 1.0 = no guidance (standard DDIM).  Try 2.0–5.0 for cross-conditioning experiments.
   # Requires the model to have been trained with cond_dropout_prob > 0.
-  guidance_scale: 7.0
+  guidance_scale: 2.0
 
   # ── Ablation: zero conditioning ───────────────────────────────────────
   # Replace the genomic conditioning vector with zeros before passing it to
   # the diffusion model.  Measures how much reconstruction changes without
   # any genomic information — baseline for comparing conditioned vs. unconditioned.
   # Works in both image_guided and random_noise modes.
-  zero_conditioning: true
+  zero_conditioning: false
 
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu

@@ -7,7 +7,7 @@ from pathlib import Path
 
 import joblib
 import numpy as np
-from sklearn.linear_model import LogisticRegression
+from sklearn.linear_model import LogisticRegressionCV
 from sklearn.metrics import balanced_accuracy_score
 from sklearn.preprocessing import StandardScaler
 
@@ -73,7 +73,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-tiles-per-patient", type=int, default=None, help="Optional tile cap per patient")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--solver", type=str, default="liblinear", choices=["liblinear", "lbfgs", "saga"])
-    parser.add_argument("--C", type=float, default=1.0)
+    parser.add_argument("--Cs", type=float, nargs="+", default=[0.01, 0.1, 1.0, 10.0, 100.0],
+                        help="C values to search over in cross-validation")
+    parser.add_argument("--cv-folds", type=int, default=5, help="Number of CV folds for C selection")
     parser.add_argument("--max-iter", type=int, default=2000)
     parser.add_argument("--class-weight", type=str, default="balanced", choices=["balanced", "none"])
     return parser.parse_args()
@@ -120,14 +122,21 @@ def main(args: dict | argparse.Namespace | None = None) -> None:
     x_val_s = scaler.transform(x_val)
     x_test_s = scaler.transform(x_test)
 
-    clf = LogisticRegression(
-        C=args.C,
+    Cs = getattr(args, "Cs", [0.01, 0.1, 1.0, 10.0, 100.0])
+    cv_folds = getattr(args, "cv_folds", 5)
+    clf = LogisticRegressionCV(
+        Cs=Cs,
+        cv=cv_folds,
         solver=args.solver,
         class_weight=None if args.class_weight == "none" else "balanced",
+        scoring="balanced_accuracy",
         max_iter=args.max_iter,
         random_state=args.seed,
+        n_jobs=-1,
     )
     clf.fit(x_train_s, y_train)
+    best_C = float(clf.C_[0])
+    print(f"[SubtypeClassifier] Best C (via {cv_folds}-fold CV): {best_C}")
 
     val_prob = clf.predict_proba(x_val_s)[:, 1]
     threshold = tune_threshold(y_val, val_prob)
@@ -140,7 +149,9 @@ def main(args: dict | argparse.Namespace | None = None) -> None:
         "feature_dim": int(x_train_s.shape[1]),
         "config": {
             "solver": args.solver,
-            "C": args.C,
+            "Cs_searched": Cs,
+            "best_C": best_C,
+            "cv_folds": cv_folds,
             "max_iter": args.max_iter,
             "class_weight": args.class_weight,
             "seed": args.seed,

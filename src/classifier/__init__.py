@@ -103,7 +103,8 @@ def run_subtype_classifier(cfg: Dict[str, Any], verbose: bool = True) -> None:
             **optional,
             "output_dir": train_dir,
             "solver": str(train_cfg.get("solver", "liblinear")),
-            "C": float(train_cfg.get("C", 1.0)),
+            "Cs": list(train_cfg.get("Cs", [0.01, 0.1, 1.0, 10.0, 100.0])),
+            "cv_folds": int(train_cfg.get("cv_folds", 5)),
             "max_iter": int(train_cfg.get("max_iter", 2000)),
             "class_weight": str(train_cfg.get("class_weight", "balanced")),
         }
