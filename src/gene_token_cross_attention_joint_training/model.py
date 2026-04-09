@@ -264,9 +264,9 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                 f"margin={float(self.cross_cfg.get('counterfactual_margin', 0.0)):.3f}"
             )
             if cf_margin_value <= zero_threshold:
-                message += " | hint: loss_cf_margin_step≈0 -> try margin=0.05 or weight=0.3"
+                message += " | GOOD: swapped loss exceeds matched by >= margin (model uses conditioning)"
             else:
-                message += " | hint: if training/image quality becomes unstable, lower weight to 0.1"
+                message += " | LEARNING: cf_margin>0 means model not yet differentiating conditioning"
             print(message)
 
         if self.global_rank == 0 and hasattr(self, "logger") and hasattr(self.logger, "experiment"):

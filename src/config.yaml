@@ -146,6 +146,40 @@ visualize_latents:
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
+dataset_statistics:
+  # ── Input ─────────────────────────────────────────────────────────────────
+  # Clinical CSV containing patient-level metadata and survival endpoints.
+  # brca_subtypes.csv has: ajcc_pathologic_tumor_stage, menopause_status,
+  # Majority_Subtype_mRNA, OS, OS.time, and other TCGA clinical columns.
+  clinical_csv: ../dataframes/brca_subtypes.csv
+  patient_col: bcr_patient_barcode
+  subtype_col: Majority_Subtype_mRNA
+  stage_col: ajcc_pathologic_tumor_stage
+  menopause_col: menopause_status
+  os_time_col: OS.time            # overall survival time in days
+  os_event_col: OS                # 1 = event (death), 0 = censored
+
+  # ── Output ────────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260408_dataset_statistics
+
+  # ── Plots to generate ─────────────────────────────────────────────────────
+  plots:
+    - tumor_stage_distribution    # AJCC stage horizontal bar chart
+    - menopause_distribution      # menopause status horizontal bar chart
+    - subtype_distribution        # PAM50 subtype pie chart
+    - kaplan_meier_by_subtype     # KM overall survival curves per subtype
+
+  # ── Styling ───────────────────────────────────────────────────────────────
+  # cmap_categorical must match the latent-space pipeline (romaO) so that
+  # PAM50 subtype colours are identical across all pipeline figures.
+  cmap_categorical: romaO
+  cmap_sequential: batlow
+  figsize_distributions: [10, 6]  # bar charts
+  figsize_pie: [8, 8]             # subtype pie
+  figsize_km: [10, 7]             # Kaplan-Meier
+  dpi: 200
+  min_patients_km: 10             # skip subtypes with fewer patients in KM
+
 training_stats:
   logdir: ./experiments/20260331_gene_token_cross_attention_training/joint
   output_dir: ./experiments/20260331_gene_token_cross_attention_training/training_stats
@@ -267,10 +301,14 @@ gene_token_cross_attention_joint_training:
   # deep-merge path, and a missing gpus key would silently fall back to [0].
   gpus: [0, 1]
 
-  # fp16 is essential here: the counterfactual objective runs TWO full UNet
-  # forward passes per step. Without fp16, both passes' activations sit in
-  # GPU memory simultaneously and OOM on a single 93 GiB H100.
-  fp16: true
+  # bf16 instead of fp16: both have the same memory footprint, but bf16 has
+  # float32 dynamic range (8 exponent bits vs 5 in fp16).  With a well-trained
+  # UNet, per-step diffusion loss falls to ~1e-5, which is below fp16's
+  # precision floor near zero — making swapped_loss == main_loss exactly and
+  # killing the CF swap_gap signal.  bf16 represents these tiny differences
+  # correctly while keeping the 2× memory saving we need for the double forward.
+  fp16: false
+  bf16: true
 
   # batch_size reduced to 2 to give headroom for the double forward pass +
   # EMA model (139 M params) all living on GPU simultaneously.
@@ -331,25 +369,24 @@ sampling:
 
 evaluation:
   # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
-  mode: image_guided       # choices: image_guided, random_noise
+  mode: random_noise       # choices: image_guided, random_noise
                             # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
                             # random_noise: no originals needed; skips metric computation
 
   # ── Directories for reconstruction quality assessment ─────────────────
-  original_zip_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise_ablate_genomics/reconstructed_samples
+  original_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise_ablate_genomics/original_samples
                             # not required when mode=random_noise
-  reconstructed_zip_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise/reconstructed_samples
+  reconstructed_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise_ablate_genomics/reconstructed_samples
                             # can point to a different reconstruction run for cross-condition evaluation
 
   # ── Output locations ──────────────────────────────────────────────────
-  output_dir: ./experiments/20260407_gene_token_transformer_training/evaluation_difference_random_noise  # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260407_gene_token_transformer_training/evaluation_difference_random_noise/plots  # where to save generated plots (can be same as output_dir)
+  output_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_random_noise_ablate_genomics  # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_random_noise_ablate_genomics/plots  # where to save generated plots (can be same as output_dir)
 
   # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
   #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
-  #TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
   #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
 
   # ── Subtype metadata ──────────────────────────────────────────────────
@@ -369,11 +406,11 @@ evaluation:
     - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
     - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
     - metric_correlation   # scatter plots of metric pairs (image_guided only)
-    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    - random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
     #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
 
 
-  num_comparison_samples: 6  # max tile pairs to visualize in comparison grid / random_noise_grid
+  num_comparison_samples: 16  # max tile pairs to visualize in comparison grid / random_noise_grid
   include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
 
   # ── Plot styling ──────────────────────────────────────────────────────
@@ -497,17 +534,16 @@ virchow2_extraction:
 
 reconstruction:
   # ── Model Checkpoint ──────────────────────────────────────────────────
-  checkpoint_path: ./experiments/20260407_gene_token_transformer_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  checkpoint_path: ./experiments/20260407_gene_token_cross_attention_training/joint/last.ckpt  # Note: absolute path for remote mount compatibility
   
   # ── Data Input ────────────────────────────────────────────────────────
   csv_path: ../dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-corrected
   patient_col: Patient_ID
   #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R]
-  #TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
   #conditioning_patients: [TCGA-A2-A04T]
-  patient_splits_path: ./experiments/20260407_gene_token_transformer_training/patient_splits.json  # optional: required if patient_ids is a split name
+  patient_splits_path: ./experiments/20260407_gene_token_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
@@ -515,7 +551,7 @@ reconstruction:
   investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260407_gene_token_transformer_training/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
   
   # ── Classifier-Free Guidance ──────────────────────────────────────────
   # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
