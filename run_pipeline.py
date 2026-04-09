@@ -174,6 +174,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"[INFO] Training stage not yet configured in this CLI")
         print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
     
+    elif stage == "dataset_statistics":
+        from src.statistics.dataset_statistics import run_dataset_statistics
+        if "dataset_statistics" not in config:
+            raise ValueError("No 'dataset_statistics' section in config.yaml")
+        run_dataset_statistics(config["dataset_statistics"], verbose=verbose)
+
     elif stage == "training_stats":
         # This stage wraps src.statistics.training_curves CLI using the provided config
         from src.statistics import training_curves
@@ -231,7 +237,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
         )
 
 
@@ -263,7 +269,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
