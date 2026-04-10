@@ -217,7 +217,14 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
             main_loss = main_loss_per_sample.mean()
 
             # ── Counterfactual margin loss ────────────────────────────────
-            cf_weight = float(self.cross_cfg.get("counterfactual_loss_weight", 0.0))
+            # Read CF params from joint_cfg (the live config dict passed at
+            # construction time), NOT from self.cross_cfg.  self.cross_cfg is
+            # persisted via save_hyperparameters and restored from the
+            # checkpoint on every resume — meaning config changes made after
+            # the first checkpoint are silently ignored.  joint_cfg is
+            # re-passed from the training script on every run, so it always
+            # reflects the current config.yaml values.
+            cf_weight = float(self.joint_cfg.get("counterfactual_loss_weight", 0.0))
             cf_margin_loss = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
             swap_gap = torch.zeros((), device=imgs.device, dtype=main_loss.dtype)
             swap_idx = _build_swapped_indices(cond.shape[0], cond.device)
@@ -232,7 +239,7 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
                     model_kwargs={"cond": cond_swapped},
                 )
                 swapped_loss_per_sample = losses_swapped["loss"]
-                margin = float(self.cross_cfg.get("counterfactual_margin", 0.02))
+                margin = float(self.joint_cfg.get("counterfactual_margin", 0.02))
                 cf_margin_loss = F.relu(
                     margin + main_loss_per_sample.detach() - swapped_loss_per_sample
                 ).mean()
@@ -247,21 +254,21 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
         self.log("cf_swap_gap_step", swap_gap, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
         self.log("loss_genomic_recon_step", genomic_recon_loss, on_step=True, on_epoch=False, prog_bar=False, sync_dist=True, batch_size=len(imgs))
 
-        monitor_every = int(self.cross_cfg.get("counterfactual_monitor_every_n_steps", 200))
-        zero_threshold = float(self.cross_cfg.get("counterfactual_zero_threshold", 1e-4))
+        monitor_every = int(self.joint_cfg.get("counterfactual_monitor_every_n_steps", 200))
+        zero_threshold = float(self.joint_cfg.get("counterfactual_zero_threshold", 1e-4))
         if (
             self.global_rank == 0
             and monitor_every > 0
             and self.global_step % monitor_every == 0
-            and self.cross_cfg.get("counterfactual_loss_weight", 0.0) > 0.0
+            and self.joint_cfg.get("counterfactual_loss_weight", 0.0) > 0.0
         ):
             cf_margin_value = float(cf_margin_loss.detach().item())
             message = (
                 f"[CF-TUNING] step={self.global_step} total={float(loss.detach().item()):.6f} "
                 f"main={float(main_loss.detach().item()):.6f} cf_margin={cf_margin_value:.6f} "
                 f"swap_gap={float(swap_gap.detach().item()):.6f} "
-                f"weight={float(self.cross_cfg.get('counterfactual_loss_weight', 0.0)):.3f} "
-                f"margin={float(self.cross_cfg.get('counterfactual_margin', 0.0)):.3f}"
+                f"weight={cf_weight:.3f} "
+                f"margin={float(self.joint_cfg.get('counterfactual_margin', 0.0)):.3f}"
             )
             if cf_margin_value <= zero_threshold:
                 message += " | GOOD: swapped loss exceeds matched by >= margin (model uses conditioning)"

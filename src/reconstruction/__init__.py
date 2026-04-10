@@ -55,6 +55,9 @@ def run_reconstruction(rec_cfg: dict, verbose: bool = True) -> None:
     device = rec_cfg.get("device", None)
     guidance_scale = float(rec_cfg.get("guidance_scale", 1.0))
     zero_conditioning = bool(rec_cfg.get("zero_conditioning", False))
+    seed = rec_cfg.get("seed", None)
+    if seed is not None:
+        seed = int(seed)
     
     if verbose:
         print(f"[Reconstruction] Loading config from reconstruction section")
@@ -85,4 +88,5 @@ def run_reconstruction(rec_cfg: dict, verbose: bool = True) -> None:
         device=device,
         guidance_scale=guidance_scale,
         zero_conditioning=zero_conditioning,
+        seed=seed,
     )

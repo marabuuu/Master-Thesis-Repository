@@ -295,56 +295,54 @@ gene_token_transformer_joint_training:
 gene_token_cross_attention_joint_training:
   # Override-only section: values are merged on top of
   # gene_token_transformer_joint_training by the hybrid train entrypoint.
-  out_dir: ./experiments/20260407_gene_token_cross_attention_training
+  #
+  # FRESH START (2026-04-10): restarted from diffusion_without_encoder.ckpt
+  # after diagnosing that the CF loss was silently disabled for 154 epochs
+  # (epochs 100-254) because save_hyperparameters() was restoring an old
+  # cross_cfg from the checkpoint that predated CF loss.  Fix: all CF params
+  # are now read from joint_cfg (live config) not self.cross_cfg (checkpoint).
+  out_dir: ./experiments/20260410_gtca_v2
 
   # Must be explicit — inheritance from base section is unreliable in the
   # deep-merge path, and a missing gpus key would silently fall back to [0].
   gpus: [0, 1]
 
-  # bf16 instead of fp16: both have the same memory footprint, but bf16 has
-  # float32 dynamic range (8 exponent bits vs 5 in fp16).  With a well-trained
-  # UNet, per-step diffusion loss falls to ~1e-5, which is below fp16's
-  # precision floor near zero — making swapped_loss == main_loss exactly and
-  # killing the CF swap_gap signal.  bf16 represents these tiny differences
-  # correctly while keeping the 2× memory saving we need for the double forward.
+  # bf16 instead of fp16: same memory footprint but float32 dynamic range —
+  # avoids precision floor that kills CF swap_gap at low loss scales (~1e-5).
   fp16: false
   bf16: true
 
-  # batch_size reduced to 2 to give headroom for the double forward pass +
-  # EMA model (139 M params) all living on GPU simultaneously.
-  # accumulate_grad_batches=4 keeps the effective global batch at
-  # 2 samples × 4 accum × 2 GPUs = 16 — identical to the base run.
+  # batch_size=2 for double-forward headroom; accumulate_grad_batches=4 keeps
+  # effective global batch at 2 × 4 × 2 GPUs = 16 (same as base run).
   batch_size: 2
   accumulate_grad_batches: 4
 
-  # LR ratio tuning: keep UNet slower than conditioning path
+  # LR schedule: UNet learns slowly (pre-trained), conditioning path faster.
   unet_lr: 5e-6
-  cross_attn_lr: 1e-4    # patch_proj / k_proj / v_proj / attn / out_proj (zero-init, need higher LR)
+  cross_attn_lr: 1e-4    # zero-init layers need higher LR
   encoder_lr: 1e-4
   proj_lr: 3e-4
 
   cross_attention:
     heads: 4
     dim_per_head: 64
-    patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
+    patch_size: 16        # must divide img_size (512 / 16 = 32 patches per side)
 
-  cond_dropout_prob: 0.15       # required for CFG to work well at inference
+  cond_dropout_prob: 0.15       # classifier-free guidance training
   cond_feature_dropout: 0.05
-  xT_dropout_prob: 0.55         # increased from 0.30 — encoder is diverse; UNet was ignoring cond
+  xT_dropout_prob: 0.55         # force model to rely on genomic cond at high noise
 
-  # Counterfactual conditioning objective.
-  # BUG FIX: both CF passes now share the same noise tensor so x_t is identical
-  # and (swapped_loss - main_loss) reflects only conditioning, not noise variance.
-  # Previously, independent noise drew CF loss to ≈0 (pure noise gradient).
-  counterfactual_loss_weight: 0.5   # raised: CF loss now provides clean signal
-  counterfactual_margin: 0.05   # lowered: same-noise gaps are small; 0.05 gives early gradient
+  # Counterfactual margin loss — forces UNet to use conditioning.
+  # Both CF passes share the same noise tensor so x_t is identical and
+  # (swapped_loss - main_loss) reflects only the conditioning difference.
+  # Params read from joint_cfg at every step (not self.cross_cfg) to avoid
+  # checkpoint-restore silently overwriting them.
+  counterfactual_loss_weight: 0.5
+  counterfactual_margin: 0.05
   counterfactual_monitor_every_n_steps: 200
   counterfactual_zero_threshold: 1e-4
 
-  # Genomic auto-reconstruction auxiliary loss.
-  # Forces the gene-token transformer + cond_projection to preserve enough
-  # gene-level information so the conditioning vector is not degenerate.
-  # Set to 0.0 to disable.  Start at 0.05; increase if conditioning stays weak.
+  # Genomic auto-reconstruction: keeps cond vector informationally rich.
   genomic_recon_loss_weight: 0.05
 
 sampling:
@@ -369,25 +367,25 @@ sampling:
 
 evaluation:
   # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
-  mode: random_noise       # choices: image_guided, random_noise
+  mode: image_guided       # choices: image_guided, random_noise
                             # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
                             # random_noise: no originals needed; skips metric computation
 
   # ── Directories for reconstruction quality assessment ─────────────────
-  original_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise_ablate_genomics/original_samples
+  original_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_image_guided_crossconditioned/original_samples
                             # not required when mode=random_noise
-  reconstructed_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise_ablate_genomics/reconstructed_samples
+  reconstructed_zip_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_image_guided_crossconditioned/reconstructed_samples
                             # can point to a different reconstruction run for cross-condition evaluation
 
   # ── Output locations ──────────────────────────────────────────────────
-  output_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_random_noise_ablate_genomics  # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_random_noise_ablate_genomics/plots  # where to save generated plots (can be same as output_dir)
+  output_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_image_guided_crossconditioned # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260407_gene_token_cross_attention_training/evaluation_image_guided_crossconditioned/plots  # where to save generated plots (can be same as output_dir)
 
   # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
-  #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
-  #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
+  patient_ids: [TCGA-A1-A0SJ]
+  #patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
 
   # ── Subtype metadata ──────────────────────────────────────────────────
   # Point to the same gene-expression CSV used for training/reconstruction.
@@ -406,8 +404,8 @@ evaluation:
     - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
     - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
     - metric_correlation   # scatter plots of metric pairs (image_guided only)
-    - random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
-    #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
+    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    - cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
 
 
   num_comparison_samples: 16  # max tile pairs to visualize in comparison grid / random_noise_grid
@@ -540,24 +538,25 @@ reconstruction:
   csv_path: ../dataframes/brca_gene_expression.csv
   tiles_zip_dir: ./data/BRCA-tumor-tiles-corrected
   patient_col: Patient_ID
-  #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
-  #conditioning_patients: [TCGA-A2-A04T]
+  patient_ids: [TCGA-A1-A0SJ]
+  #patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  conditioning_patients: [TCGA-A2-A04T]
   patient_splits_path: ./experiments/20260407_gene_token_cross_attention_training/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: random_noise       # choices: image_guided, random_noise
+  mode: image_guided       # choices: image_guided, random_noise
   investigate: false         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260407_gene_token_cross_attention_training/reconstructions_image_guided_crossconditioned  # Note: absolute path for remote mount compatibility
   
   # ── Classifier-Free Guidance ──────────────────────────────────────────
   # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
   # 1.0 = no guidance (standard DDIM).  Try 2.0–5.0 for cross-conditioning experiments.
   # Requires the model to have been trained with cond_dropout_prob > 0.
   guidance_scale: 2.0
+  seed: 42
 
   # ── Ablation: zero conditioning ───────────────────────────────────────
   # Replace the genomic conditioning vector with zeros before passing it to

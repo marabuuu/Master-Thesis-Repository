@@ -281,17 +281,19 @@ def load_tiles_for_patients(
     tiles_dir: Path,
     patient_ids: List[str],
     n_tiles_per_patient: int = 20,
+    seed: Optional[int] = None,
 ) -> Dict[str, List[Tuple[Union[Path, str], str]]]:
     """
     Load tile paths for specified patients.
-    
+
     Returns:
         {patient_id: [(tile_path, tile_basename), ...]}
         where tile_path is either a Path (for directories) or a str "zip_path::member_name" (for zip files)
     """
     logger.info(f"Discovering tiles for {len(patient_ids)} patients from {tiles_dir}")
     patient_tiles = {}
-    
+    rng = np.random.default_rng(seed)
+
     for patient_id in patient_ids:
         # Check for non-zip directories
         patient_folders = [
@@ -331,10 +333,8 @@ def load_tiles_for_patients(
         
         # Sample tiles
         if len(tile_files) > n_tiles_per_patient:
-            indices = np.random.choice(  # type: ignore[call-overload]
-                len(tile_files), n_tiles_per_patient, replace=False
-            )
-            tile_files = [tile_files[i] for i in indices]
+            indices = rng.choice(len(tile_files), n_tiles_per_patient, replace=False)
+            tile_files = [tile_files[i] for i in sorted(indices)]
         
         patient_tiles[patient_id] = tile_files
         logger.info(f"  {patient_id}: {len(tile_files)} tiles")
@@ -1421,7 +1421,7 @@ def main(
         # Use all patients in CSV
         df = pd.read_csv(gene_csv_path)
         patient_ids_list = [extract_patient_id(str(p)) for p in df.get("Patient_ID", [])]
-        patient_ids_list = list(set(patient_ids_list))  # Unique
+        patient_ids_list = sorted(set(patient_ids_list))  # Unique, deterministic order
         logger.info(f"Using all {len(patient_ids_list)} patients from CSV")
     else:
         patient_ids_list = [extract_patient_id(p) for p in patients]
@@ -1540,6 +1540,7 @@ def main(
         tiles_dir_path,
         patient_ids_list,
         n_tiles_per_patient,
+        seed=seed,
     )
     
     # Reconstruction loop
