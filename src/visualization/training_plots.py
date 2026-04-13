@@ -261,21 +261,39 @@ def plot_train_val_comparison(
     if not train or not val or not epochs:
         raise ValueError("Both loss_epoch and val_loss are required")
 
-    n = min(len(epochs), len(train), len(val))
-    ep, tr, vl = (np.array(x[:n]) for x in (epochs, train, val))
+    # Use val_epochs (actual epoch positions) when available so that
+    # val_loss entries land at the right x position (e.g. every 5th epoch)
+    # rather than being truncated to len(val) epochs.
+    val_epochs = run.get("val_epochs")
+    val_ep = np.array(val_epochs) if val_epochs and len(val_epochs) == len(val) else np.array(epochs[: len(val)])
+
+    n_train = min(len(epochs), len(train))
+    train_ep = np.array(epochs[:n_train])
+    tr = np.array(train[:n_train])
+    vl = np.array(val)
 
     colors = get_categorical_colors(4, cmap_name=cmap_name)
 
     fig, ax = plt.subplots(figsize=figsize)
 
-    ax.plot(ep, tr, "-o", markersize=3, linewidth=1.5, color=colors[0],
+    ax.plot(train_ep, tr, "-o", markersize=3, linewidth=1.5, color=colors[0],
             label="Train loss", alpha=0.85)
-    ax.plot(ep, vl, "-s", markersize=3, linewidth=1.5, color=colors[1],
+    ax.plot(val_ep, vl, "-s", markersize=3, linewidth=1.5, color=colors[1],
             label="Val loss", alpha=0.85)
-    ax.fill_between(ep, tr, vl, alpha=0.12, color=colors[2],
-                     label="Train-Val gap")
 
-    _annotate_min(ax, ep.tolist(), vl.tolist(), color=colors[1], label="best val")
+    # Shade the train-val gap only over the shared x range
+    if len(train_ep) > 0 and len(val_ep) > 0:
+        x_min = max(train_ep[0], val_ep[0])
+        x_max = min(train_ep[-1], val_ep[-1])
+        if x_min < x_max:
+            import numpy as _np
+            x_shared = _np.linspace(x_min, x_max, 300)
+            tr_interp = _np.interp(x_shared, train_ep, tr)
+            vl_interp = _np.interp(x_shared, val_ep, vl)
+            ax.fill_between(x_shared, tr_interp, vl_interp, alpha=0.12,
+                            color=colors[2], label="Train-Val gap")
+
+    _annotate_min(ax, val_ep.tolist(), vl.tolist(), color=colors[1], label="best val")
 
     ax.set_xlabel("Epoch")
     ax.set_ylabel("Loss")
@@ -356,6 +374,7 @@ def plot_early_stopping(
     else:
         n = min(len(epochs), len(val))
         ep, vl = epochs[:n], val[:n]
+    n = len(ep)
 
     colors = get_categorical_colors(4, cmap_name=cmap_name)
     best_idx = int(np.argmin(vl))
@@ -495,13 +514,29 @@ def plot_training_summary(
         panel += 1
         tr = np.array(run["loss_epoch"])
         vl = np.array(run["val_loss"])
-        n = min(len(epochs), len(tr), len(vl))
-        ep = np.array(epochs[:n])
-        ax.plot(ep, tr[:n], "-o", markersize=3, lw=1.5,
+        n_train = min(len(epochs), len(tr))
+        train_ep = np.array(epochs[:n_train])
+        val_epochs = run.get("val_epochs")
+        if val_epochs and len(val_epochs) == len(vl):
+            val_ep = np.array(val_epochs)
+        else:
+            val_ep = np.array(epochs[: len(vl)])
+
+        ax.plot(train_ep, tr[:n_train], "-o", markersize=3, lw=1.5,
                 color=colors[0], label="Train", alpha=0.85)
-        ax.plot(ep, vl[:n], "-s", markersize=3, lw=1.5,
+        ax.plot(val_ep, vl, "-s", markersize=3, lw=1.5,
                 color=colors[1], label="Val", alpha=0.85)
-        ax.fill_between(ep, tr[:n], vl[:n], alpha=0.12, color=colors[2])
+
+        # Shade train-val gap only over shared x-range via interpolation.
+        if len(train_ep) > 0 and len(val_ep) > 0:
+            x_min = max(train_ep[0], val_ep[0])
+            x_max = min(train_ep[-1], val_ep[-1])
+            if x_min < x_max:
+                x_shared = np.linspace(x_min, x_max, 300)
+                tr_interp = np.interp(x_shared, train_ep, tr[:n_train])
+                vl_interp = np.interp(x_shared, val_ep, vl)
+                ax.fill_between(x_shared, tr_interp, vl_interp, alpha=0.12, color=colors[2])
+
         ax.set_xlabel("Epoch")
         ax.set_ylabel("Loss")
         ax.set_title("Train–Val Gap")

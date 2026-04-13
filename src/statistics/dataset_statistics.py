@@ -113,12 +113,14 @@ def load_clinical_data(csv_path: str, patient_col: str) -> pd.DataFrame:
 def plot_tumor_stage(
     df: pd.DataFrame,
     stage_col: str,
+    subtype_col: str,
     output_dir: Path,
-    cmap_name: str = SEQUENTIAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
+    cmap_name: str = CATEGORICAL_CMAP,
     figsize: tuple = (10, 6),
     dpi: int = 200,
 ) -> None:
-    """Horizontal bar chart of AJCC pathologic tumor stage distribution."""
+    """Stacked horizontal bar chart of AJCC stage split by PAM50 subtype."""
     if not HAS_MPL:
         return
 
@@ -126,46 +128,76 @@ def plot_tumor_stage(
         print(f"[DatasetStats][WARN] Column '{stage_col}' not found — skipping tumor stage plot")
         return
 
-    stage_values = (
-        df[stage_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
+    if subtype_col not in df.columns:
+        print(f"[DatasetStats][WARN] Column '{subtype_col}' not found — skipping tumor stage plot")
+        return
+
+    stage_values = df[stage_col].dropna().astype(str).str.strip()
     invalid_values = {"[Not Available]", "[Discrepancy]", "nan", ""}
     stage_values = stage_values[~stage_values.isin(invalid_values)]
-    counts = stage_values.value_counts().sort_index()
 
-    if counts.empty:
+    subtype_values = df[subtype_col].fillna("").astype(str).str.strip()
+    subtype_values = subtype_values[~subtype_values.isin({"", "nan"})]
+
+    valid_idx = stage_values.index.intersection(subtype_values.index)
+    stage_values = stage_values.loc[valid_idx]
+    subtype_values = subtype_values.loc[valid_idx]
+
+    if stage_values.empty or subtype_values.empty:
+        print("[DatasetStats][WARN] No valid stage/subtype pairs found — skipping")
+        return
+
+    stage_by_subtype = pd.crosstab(stage_values, subtype_values)
+    stage_by_subtype = stage_by_subtype.sort_index()
+
+    ordered_subtypes = _canonical_order(list(stage_by_subtype.columns))
+    stage_by_subtype = stage_by_subtype.reindex(columns=ordered_subtypes, fill_value=0)
+
+    if stage_by_subtype.empty:
         print("[DatasetStats][WARN] No valid tumor stage values found — skipping")
         return
 
     assert plt is not None
     assert mticker is not None
 
-    cmap = get_crameri_cmap(cmap_name)
-    colours = [cmap(i) for i in np.linspace(0.15, 0.85, len(counts))]
-    count_values = counts.to_numpy(dtype=float)
-    max_count = float(count_values.max()) if count_values.size else 0.0
+    if palette is None:
+        palette = build_label_palette(np.array(ordered_subtypes), cmap_name=cmap_name)
+
+    totals = stage_by_subtype.sum(axis=1).to_numpy(dtype=float)
+    max_count = float(totals.max()) if totals.size else 0.0
 
     fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.barh(counts.index.tolist(), count_values, color=colours, edgecolor="white", linewidth=0.5)
+    left = np.zeros(len(stage_by_subtype), dtype=float)
+    for subtype in ordered_subtypes:
+        vals = stage_by_subtype[subtype].to_numpy(dtype=float)
+        if not np.any(vals):
+            continue
+        ax.barh(
+            stage_by_subtype.index.tolist(),
+            vals,
+            left=left,
+            color=palette.get(subtype, "#888888"),
+            edgecolor="white",
+            linewidth=0.5,
+            label=subtype,
+        )
+        left += vals
 
-    # Annotate counts
-    for bar, val in zip(bars, count_values):
+    for i, total in enumerate(totals):
         ax.text(
-            bar.get_width() + max_count * 0.01,
-            bar.get_y() + bar.get_height() / 2,
-            str(int(val)),
+            total + max_count * 0.01,
+            i,
+            str(int(total)),
             va="center", ha="left", fontsize=9,
         )
 
     ax.set_xlabel("Number of patients", fontsize=11)
-    ax.set_title("AJCC Pathologic Tumor Stage Distribution", fontsize=13, fontweight="bold")
+    ax.set_title("AJCC Pathologic Tumor Stage by PAM50 Subtype", fontsize=13, fontweight="bold")
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.invert_yaxis()
+    ax.legend(title="PAM50 Subtype", fontsize=9, title_fontsize=10, frameon=False)
 
     fig.tight_layout()
     save_figure(fig, output_dir / "tumor_stage_distribution.png", dpi=dpi)
@@ -174,12 +206,14 @@ def plot_tumor_stage(
 def plot_menopause_status(
     df: pd.DataFrame,
     menopause_col: str,
+    subtype_col: str,
     output_dir: Path,
-    cmap_name: str = SEQUENTIAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
+    cmap_name: str = CATEGORICAL_CMAP,
     figsize: tuple = (9, 5),
     dpi: int = 200,
 ) -> None:
-    """Horizontal bar chart of menopause status distribution."""
+    """Stacked horizontal bar chart of menopause status split by PAM50 subtype."""
     if not HAS_MPL:
         return
 
@@ -187,17 +221,30 @@ def plot_menopause_status(
         print(f"[DatasetStats][WARN] Column '{menopause_col}' not found — skipping menopause plot")
         return
 
-    menopause_values = (
-        df[menopause_col]
-        .dropna()
-        .astype(str)
-        .str.strip()
-    )
+    if subtype_col not in df.columns:
+        print(f"[DatasetStats][WARN] Column '{subtype_col}' not found — skipping menopause plot")
+        return
+
+    menopause_values = df[menopause_col].dropna().astype(str).str.strip()
     invalid_values = {"[Not Available]", "[Unknown]", "nan", ""}
     menopause_values = menopause_values[~menopause_values.isin(invalid_values)]
-    counts = menopause_values.value_counts()
 
-    if counts.empty:
+    subtype_values = df[subtype_col].fillna("").astype(str).str.strip()
+    subtype_values = subtype_values[~subtype_values.isin({"", "nan"})]
+
+    valid_idx = menopause_values.index.intersection(subtype_values.index)
+    menopause_values = menopause_values.loc[valid_idx]
+    subtype_values = subtype_values.loc[valid_idx]
+
+    if menopause_values.empty or subtype_values.empty:
+        print("[DatasetStats][WARN] No valid menopause/subtype pairs found — skipping")
+        return
+
+    meno_by_subtype = pd.crosstab(menopause_values, subtype_values)
+    ordered_subtypes = _canonical_order(list(meno_by_subtype.columns))
+    meno_by_subtype = meno_by_subtype.reindex(columns=ordered_subtypes, fill_value=0)
+
+    if meno_by_subtype.empty:
         print("[DatasetStats][WARN] No valid menopause values found — skipping")
         return
 
@@ -205,30 +252,46 @@ def plot_menopause_status(
     assert mticker is not None
 
     # Wrap long labels for readability
-    wrapped = [lbl.replace(" or ", "\nor ") for lbl in counts.index]
+    wrapped_labels = [lbl.replace(" or ", "\nor ") for lbl in meno_by_subtype.index]
 
-    cmap = get_crameri_cmap(cmap_name)
-    colours = [cmap(i) for i in np.linspace(0.2, 0.8, len(counts))]
-    count_values = counts.to_numpy(dtype=float)
-    max_count = float(count_values.max()) if count_values.size else 0.0
+    if palette is None:
+        palette = build_label_palette(np.array(ordered_subtypes), cmap_name=cmap_name)
+
+    totals = meno_by_subtype.sum(axis=1).to_numpy(dtype=float)
+    max_count = float(totals.max()) if totals.size else 0.0
 
     fig, ax = plt.subplots(figsize=figsize)
-    bars = ax.barh(wrapped, count_values, color=colours, edgecolor="white", linewidth=0.5)
+    left = np.zeros(len(meno_by_subtype), dtype=float)
+    for subtype in ordered_subtypes:
+        vals = meno_by_subtype[subtype].to_numpy(dtype=float)
+        if not np.any(vals):
+            continue
+        ax.barh(
+            wrapped_labels,
+            vals,
+            left=left,
+            color=palette.get(subtype, "#888888"),
+            edgecolor="white",
+            linewidth=0.5,
+            label=subtype,
+        )
+        left += vals
 
-    for bar, val in zip(bars, count_values):
+    for i, total in enumerate(totals):
         ax.text(
-            bar.get_width() + max_count * 0.01,
-            bar.get_y() + bar.get_height() / 2,
-            str(int(val)),
+            total + max_count * 0.01,
+            i,
+            str(int(total)),
             va="center", ha="left", fontsize=9,
         )
 
     ax.set_xlabel("Number of patients", fontsize=11)
-    ax.set_title("Menopause Status Distribution", fontsize=13, fontweight="bold")
+    ax.set_title("Menopause Status by PAM50 Subtype", fontsize=13, fontweight="bold")
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
     ax.invert_yaxis()
+    ax.legend(title="PAM50 Subtype", fontsize=9, title_fontsize=10, frameon=False)
 
     fig.tight_layout()
     save_figure(fig, output_dir / "menopause_status_distribution.png", dpi=dpi)
@@ -437,6 +500,218 @@ _AVAILABLE_PLOTS = {
 }
 
 
+def _fmt_median_iqr(series: pd.Series, decimals: int = 1) -> str:
+    """Format numeric series as median [Q1, Q3]."""
+    vals = pd.to_numeric(series, errors="coerce").dropna()
+    if vals.empty:
+        return "NA"
+    q1 = float(vals.quantile(0.25))
+    med = float(vals.median())
+    q3 = float(vals.quantile(0.75))
+    return f"{med:.{decimals}f} [{q1:.{decimals}f}, {q3:.{decimals}f}]"
+
+
+def _fmt_count_pct(mask: pd.Series, denom: int) -> str:
+    """Format count and percentage for a boolean mask."""
+    count = int(mask.sum())
+    if denom <= 0:
+        return f"{count} (NA)"
+    pct = 100.0 * count / denom
+    return f"{count} ({pct:.1f}%)"
+
+
+def write_patient_characteristics_table(
+    df: pd.DataFrame,
+    output_dir: Path,
+    age_col: str = "age_at_initial_pathologic_diagnosis",
+    followup_col: str = "OS.time",
+    sex_col: str = "gender",
+    status_col: str = "vital_status",
+) -> None:
+    """Write a patient characteristics table to LaTeX (.tex) and Markdown (.md).
+
+    Continuous variables: median [Q1, Q3].
+    Categorical variables: n (%).
+
+    The LaTeX output uses the ``booktabs`` package (\\toprule / \\midrule /
+    \\bottomrule) and escapes ``%`` as ``\\%`` so the file compiles without
+    errors.  Categorical sub-rows are indented with ``\\quad``.
+    BMI is intentionally omitted — it is not present in the TCGA clinical data.
+    """
+    if df.empty:
+        print("[DatasetStats][WARN] Empty dataframe — skipping patient characteristics table")
+        return
+
+    n_total = len(df)
+
+    # ------------------------------------------------------------------
+    # Build a list of (latex_char, latex_val, md_char, md_val) tuples.
+    # latex_char / latex_val go directly into the .tex file (already escaped).
+    # md_char / md_val go into the Markdown table.
+    # A tuple with latex_char == "" inserts an \addlinespace row separator.
+    # ------------------------------------------------------------------
+    Entry = Dict[str, str]
+    entries: List[Entry] = []
+
+    def _separator() -> Entry:
+        return {"latex_char": "", "latex_val": "", "md_char": "", "md_val": ""}
+
+    def _row(char: str, val: str) -> Entry:
+        """Plain row — escape % for LaTeX, keep raw for Markdown."""
+        return {
+            "latex_char": char,
+            "latex_val": val.replace("%", r"\%"),
+            "md_char": char,
+            "md_val": val,
+        }
+
+    def _header(char: str) -> Entry:
+        """Category header row: bold in LaTeX, bold in Markdown, no value."""
+        return {
+            "latex_char": r"\textit{" + char + "}",
+            "latex_val": "",
+            "md_char": f"**{char}**",
+            "md_val": "",
+        }
+
+    def _subrow(char: str, val: str) -> Entry:
+        """Indented sub-row inside a category block."""
+        return {
+            "latex_char": r"\quad " + char,
+            "latex_val": val.replace("%", r"\%"),
+            "md_char": f"&nbsp;&nbsp;{char}",
+            "md_val": val,
+        }
+
+    # ── Age at diagnosis ────────────────────────────────────────────────
+    if age_col in df.columns:
+        entries.append(_row("Age at diagnosis, years", _fmt_median_iqr(df[age_col], decimals=1)))
+    else:
+        print(f"[DatasetStats][INFO] Column '{age_col}' not found — age row will show NA")
+        entries.append(_row("Age at diagnosis, years", "not available"))
+
+    # ── Follow-up from diagnosis ────────────────────────────────────────
+    if followup_col in df.columns:
+        fu_years = pd.to_numeric(df[followup_col], errors="coerce") / 365.25
+        entries.append(_row("Follow-up from diagnosis, years", _fmt_median_iqr(fu_years, decimals=1)))
+    else:
+        print(f"[DatasetStats][INFO] Column '{followup_col}' not found — follow-up row will show NA")
+        entries.append(_row("Follow-up from diagnosis, years", "not available"))
+
+    entries.append(_separator())
+
+    # ── Sex ─────────────────────────────────────────────────────────────
+    if sex_col in df.columns:
+        sex_vals = df[sex_col].fillna("").astype(str).str.strip()
+        female_mask  = sex_vals.str.upper().isin({"FEMALE", "F"})
+        male_mask    = sex_vals.str.upper().isin({"MALE", "M"})
+        other_mask   = ~female_mask & ~male_mask & (sex_vals != "") & (sex_vals.str.lower() != "nan")
+        missing_mask = (sex_vals == "") | (sex_vals.str.lower() == "nan")
+
+        entries.append(_header("Sex"))
+        entries.append(_subrow("Female", _fmt_count_pct(female_mask, n_total)))
+        if int(male_mask.sum()) > 0:
+            entries.append(_subrow("Male", _fmt_count_pct(male_mask, n_total)))
+        if int(other_mask.sum()) > 0:
+            entries.append(_subrow("Other / unknown", _fmt_count_pct(other_mask, n_total)))
+        if int(missing_mask.sum()) > 0:
+            entries.append(_subrow("Missing", _fmt_count_pct(missing_mask, n_total)))
+    else:
+        print(f"[DatasetStats][INFO] Column '{sex_col}' not found — sex rows will show NA")
+        entries.append(_header("Sex"))
+        entries.append(_subrow("Female", "not available"))
+
+    entries.append(_separator())
+
+    # ── Vital status ────────────────────────────────────────────────────
+    if status_col in df.columns:
+        status_vals  = df[status_col].fillna("").astype(str).str.strip()
+        alive_mask   = status_vals.str.upper() == "ALIVE"
+        dead_mask    = status_vals.str.upper() == "DEAD"
+        other_mask   = ~alive_mask & ~dead_mask & (status_vals != "") & (status_vals.str.lower() != "nan")
+        missing_mask = (status_vals == "") | (status_vals.str.lower() == "nan")
+
+        entries.append(_header("Vital status"))
+        entries.append(_subrow("Alive", _fmt_count_pct(alive_mask, n_total)))
+        entries.append(_subrow("Dead",  _fmt_count_pct(dead_mask,  n_total)))
+        if int(other_mask.sum()) > 0:
+            entries.append(_subrow("Other / unknown", _fmt_count_pct(other_mask, n_total)))
+        if int(missing_mask.sum()) > 0:
+            entries.append(_subrow("Missing", _fmt_count_pct(missing_mask, n_total)))
+    else:
+        print(f"[DatasetStats][INFO] Column '{status_col}' not found — vital status rows will show NA")
+        entries.append(_header("Vital status"))
+        entries.append(_subrow("Alive", "not available"))
+        entries.append(_subrow("Dead",  "not available"))
+
+    # ------------------------------------------------------------------
+    # Build LaTeX table (booktabs style, compiles without modification)
+    # ------------------------------------------------------------------
+    latex_rows: List[str] = []
+    for e in entries:
+        if not e["latex_char"] and not e["latex_val"]:
+            latex_rows.append(r"  \addlinespace")
+        else:
+            latex_rows.append(f"  {e['latex_char']} & {e['latex_val']} \\\\")
+
+    latex_body = "\n".join(latex_rows)
+
+    latex_table = (
+        r"\begin{table}[htbp]" "\n"
+        r"\centering" "\n"
+        r"\caption{Patient characteristics. "
+        r"Continuous variables are presented as median [IQR]; "
+        r"categorical variables as $n$ (\%). "
+        f"N~=~{n_total:,}." + r"}" "\n"
+        r"\label{tab:patient_characteristics}" "\n"
+        r"\begin{tabular}{ll}" "\n"
+        r"\toprule" "\n"
+        r"  \textbf{Characteristic} & \textbf{Value} \\" "\n"
+        r"\midrule" "\n"
+        + latex_body + "\n"
+        r"\bottomrule" "\n"
+        r"\end{tabular}" "\n"
+        r"\end{table}"
+    )
+
+    latex_path = output_dir / "patient_characteristics_table.tex"
+    latex_path.write_text(latex_table, encoding="utf-8")
+
+    # ------------------------------------------------------------------
+    # Build Markdown (renders in GitHub / VS Code / Obsidian)
+    # ------------------------------------------------------------------
+    md_table_rows: List[str] = []
+    for e in entries:
+        if not e["md_char"] and not e["md_val"]:
+            continue  # skip separator rows — Markdown tables have no spacer rows
+        md_table_rows.append(f"| {e['md_char']} | {e['md_val']} |")
+
+    md_lines = [
+        "# Patient Characteristics",
+        "",
+        f"**Total patients: {n_total:,}**",
+        "",
+        "> Continuous variables: median \\[Q1, Q3\\]. Categorical variables: n (%).",
+        "",
+        "| Characteristic | Value |",
+        "|:---|:---|",
+        *md_table_rows,
+        "",
+        "---",
+        "",
+        "## LaTeX source",
+        "",
+        "```latex",
+        latex_table,
+        "```",
+    ]
+
+    md_path = output_dir / "patient_characteristics_table.md"
+    md_path.write_text("\n".join(md_lines), encoding="utf-8")
+
+    print(f"[DatasetStats] Saved patient characteristics table → {latex_path.name}, {md_path.name}")
+
+
 def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
     """Run all configured dataset statistics plots.
 
@@ -479,25 +754,37 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
     # ── Load data ─────────────────────────────────────────────────────────────
     df = load_clinical_data(str(clinical_csv), patient_col)
 
+    shared_palette: Dict[str, str] = {}
+    if subtype_col in df.columns:
+        subtype_values = df[subtype_col].dropna().astype(str).str.strip()
+        subtype_values = subtype_values[subtype_values != ""]
+        ordered = _canonical_order(subtype_values.unique().tolist())
+        if ordered:
+            shared_palette = build_label_palette(np.array(ordered), cmap_name=cmap_cat)
+
     if verbose:
         n_sub = df[subtype_col].nunique() if subtype_col in df.columns else 0
         print(f"[DatasetStats] Patients: {len(df):,}  |  Subtypes: {n_sub}  |  Output: {output_dir}")
 
     # ── Plot: tumor stage ─────────────────────────────────────────────────────
     if "tumor_stage_distribution" in requested:
-        plot_tumor_stage(df, stage_col, output_dir,
-                         cmap_name=cmap_seq, figsize=figsize_dist, dpi=dpi)
+        plot_tumor_stage(df, stage_col, subtype_col, output_dir,
+                         palette=shared_palette, cmap_name=cmap_cat,
+                         figsize=figsize_dist, dpi=dpi)
 
     # ── Plot: menopause ───────────────────────────────────────────────────────
     if "menopause_distribution" in requested:
-        plot_menopause_status(df, menopause_col, output_dir,
-                              cmap_name=cmap_seq, figsize=figsize_dist, dpi=dpi)
+        plot_menopause_status(df, menopause_col, subtype_col, output_dir,
+                              palette=shared_palette, cmap_name=cmap_cat,
+                              figsize=figsize_dist, dpi=dpi)
 
     # ── Plot: subtype pie (returns palette for KM re-use) ─────────────────────
     palette: Dict[str, str] = {}
     if "subtype_distribution" in requested:
         palette = plot_subtype_distribution(df, subtype_col, output_dir,
                                             cmap_name=cmap_cat, figsize=figsize_pie, dpi=dpi)
+    elif shared_palette:
+        palette = shared_palette
 
     # ── Plot: Kaplan-Meier ────────────────────────────────────────────────────
     if "kaplan_meier_by_subtype" in requested:
@@ -512,6 +799,16 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
             cmap_name=cmap_cat, min_patients=min_patients,
             figsize=figsize_km, dpi=dpi,
         )
+
+    # ── Table: patient characteristics (LaTeX + Markdown) ───────────────────
+    write_patient_characteristics_table(
+        df,
+        output_dir,
+        age_col=cfg.get("age_col", "age_at_initial_pathologic_diagnosis"),
+        followup_col=cfg.get("followup_col", os_time_col),
+        sex_col=cfg.get("sex_col", "gender"),
+        status_col=cfg.get("status_col", "vital_status"),
+    )
 
     if verbose:
         print(f"[DatasetStats] All plots saved to {output_dir}")

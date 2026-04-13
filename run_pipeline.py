@@ -221,7 +221,38 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         cfg = dict(config["subtype_classifier"])
         cfg.setdefault("config_path", config_path)
         run_subtype_classifier(cfg, verbose=verbose)
-    
+
+    elif stage in ("gtca_training", "gtca_nocfg", "gtca_scratch"):
+        # Gene-token cross-attention training — three variants sharing one train function.
+        #   gtca_training : mopadi init, cond_dropout=0.15 (CFG, for guidance experiments)
+        #   gtca_nocfg    : mopadi init, cond_dropout=0.0  (no uncond path; zero-cond → noise)
+        #   gtca_scratch  : random init, cond_dropout=0.0  (fully from scratch baseline)
+        from src.gene_token_cross_attention_joint_training.train import (
+            run_gene_token_cross_attention_training,
+        )
+        try:
+            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
+        except ImportError:
+            from src.gene_token_cross_attention_joint_training.train import _deep_update
+            _resolve_config_paths = lambda cfg, _: cfg  # noqa: E731
+
+        from pathlib import Path as _Path
+        _repo_root = _Path(config_path).resolve().parent.parent
+        _full_cfg = _resolve_config_paths(dict(config), _repo_root)
+
+        _section_map = {
+            "gtca_training": "gene_token_cross_attention_joint_training",
+            "gtca_nocfg":    "gene_token_cross_attention_nocfg_training",
+            "gtca_scratch":  "gene_token_cross_attention_scratch_training",
+        }
+        _section = _section_map[stage]
+        if _section not in _full_cfg:
+            raise ValueError(f"No '{_section}' section in config.yaml")
+        _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
+        _overrides = _full_cfg[_section]
+        _joint_cfg = _deep_update(_base, _overrides)
+        run_gene_token_cross_attention_training(_joint_cfg, verbose=verbose)
+
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
         for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
@@ -237,7 +268,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
         )
 
 

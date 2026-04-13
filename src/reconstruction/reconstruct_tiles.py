@@ -931,7 +931,40 @@ class _CFGWrapper(torch.nn.Module):
         return SimpleNamespace(pred=pred_guided)
 
 
-def _reconstruct_from_noise_with_cond(
+def _attach_cross_attn_diagnostic_hook(model: torch.nn.Module) -> Optional[List]:
+    """
+    Attach a hook to the CrossAttentionUNetWrapper to log output deltas.
+    
+    Returns a list that accumulates logs across forward passes so we can inspect
+    whether the cross-attention wrapper is producing non-zero outputs.
+    """
+    logs = []
+    
+    def hook_fn(module, input, output):
+        try:
+            # output from wrapper.forward is the result of base_unet(x_mod, t, cond, ...)
+            # but we want to intercept just before that to see the delta
+            # This is harder since we only see the final output
+            # So let's just log that the wrapper was called
+            logs.append({
+                "module": type(module).__name__,
+                "output_shape": tuple(output.shape) if hasattr(output, 'shape') else str(type(output)),
+            })
+        except Exception as e:
+            logger.debug(f"Hook error: {e}")
+    
+    # Try to attach to the wrapper itself
+    if hasattr(model, 'model') and hasattr(model.model, 'register_forward_hook'):
+        model.model.register_forward_hook(hook_fn)
+        logger.info("  [DIAGNOSTIC] Registered hook on CrossAttentionUNetWrapper")
+    elif hasattr(model, 'ema_model') and hasattr(model.ema_model.model, 'register_forward_hook'):
+        model.ema_model.model.register_forward_hook(hook_fn)
+        logger.info("  [DIAGNOSTIC] Registered hook on EMA model's wrapper")
+    
+    return logs
+
+
+def decode_from_noise(
     model: torch.nn.Module,
     cond: torch.Tensor,
     noise: torch.Tensor,
@@ -993,10 +1026,21 @@ def reconstruct_tile_random_noise(
         raise ValueError("investigate_dir must be provided when investigate=True")
 
     with torch.no_grad():
-        cond = model.encode(genomic.unsqueeze(0))  # type: ignore[attr-defined]
+        # ── DIAGNOSTIC: Check encoder output before zero-conditioning ──
+        cond_real = model.encode(genomic.unsqueeze(0))  # type: ignore[attr-defined]
+        cond_real_norm = float(torch.norm(cond_real).item())
+        cond_real_mean = float(cond_real.mean().item())
+        cond_real_std = float(cond_real.std().item())
+        logger.info(
+            f"  [COND-DIAGNOSTIC] Real conditioning: norm={cond_real_norm:.6f} "
+            f"mean={cond_real_mean:.6f} std={cond_real_std:.6f}"
+        )
+        
         if zero_conditioning:
-            cond = torch.zeros_like(cond)
+            cond = torch.zeros_like(cond_real)
             logger.info("  [ablation] zero_conditioning=True -> genomic conditioning zeroed")
+        else:
+            cond = cond_real
 
         if seed is not None:
             torch.manual_seed(seed)
@@ -1076,6 +1120,10 @@ def reconstruct_tile_random_noise(
             sampler = getattr(model, "eval_sampler", None) or getattr(model, "sampler", None)
             unet_model = getattr(model, "ema_model", getattr(model, "model", model))
             unet_model.eval()
+            
+            # Attach diagnostic hook to see if cross-attn is being used
+            _attach_cross_attn_diagnostic_hook(model)
+            
             if guidance_scale > 1.0:
                 unet_model = _CFGWrapper(unet_model, scale=guidance_scale)
                 logger.info(f"  [CFG] guidance_scale={guidance_scale:.1f} applied to random-noise sampling")
@@ -1249,6 +1297,14 @@ def investigate_noising_steps(
             logger.info(f"  Saved random noise -> {noise_save_path.name}")
             denoise_timesteps = set()
 
+        # ── DIAGNOSTIC: Log conditioning before sampling ──
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] Conditioning shape: {cond.shape}")
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] Conditioning norm: {torch.norm(cond).item():.6f}")
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] Conditioning mean: {cond.mean().item():.6f}")
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] Conditioning std: {cond.std().item():.6f}")
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] UNet model type: {type(unet_model).__name__}")
+        logger.info(f"  [SAMPLING-DIAGNOSTIC] Has base_unet (cross-attn): {hasattr(unet_model, 'base_unet')}")
+        
         logger.info("\nStarting DDIM reverse denoising (sampling) ...")
         prog = sampler.ddim_sample_loop_progressive(
             model=unet_model,
@@ -1386,6 +1442,26 @@ def main(
     # Joint training checkpoint successfully loaded - genomic conditioning is available
     logger.info("✅ Using genomic conditioning from joint training model")
     assert joint_cfg_ckpt is not None, "Joint training checkpoint should always have joint_cfg"
+    
+    # ── DIAGNOSTIC: Verify model architecture and state ──
+    logger.info("=" * 80)
+    logger.info("MODEL ARCHITECTURE DIAGNOSTIC")
+    logger.info("=" * 80)
+    logger.info(f"Model type: {type(model).__name__}")
+    logger.info(f"Model training mode: {model.training}")
+    logger.info(f"Has ema_model: {hasattr(model, 'ema_model')}")
+    if hasattr(model, 'ema_model'):
+        logger.info(f"  ema_model training mode: {model.ema_model.training}")
+    logger.info(f"Has model.model: {hasattr(model, 'model')}")
+    if hasattr(model, 'model'):
+        logger.info(f"  model.model type: {type(model.model).__name__}")
+        logger.info(f"  model.model training mode: {model.model.training}")
+        if hasattr(model.model, 'base_unet'):
+            logger.info(f"    Has base_unet: True (CrossAttentionUNetWrapper detected)")
+        else:
+            logger.info(f"    Has base_unet: False (no cross-attention wrapper)")
+    logger.info(f"Has encode method: {hasattr(model, 'encode')}")
+    logger.info("=" * 80)
     
     # Determine patients (CLI takes priority over config)
     if patients is None:
@@ -1757,21 +1833,26 @@ EXAMPLES:
         help="Path to tiles directory (auto-inferred from config if not provided)",
     )
     parser.add_argument(
-        "--save-dir", type=str, default="experiments/reconstructed_tiles",
+        "--save-dir", type=str, default=None,
         help="Output directory for reconstructions",
     )
     parser.add_argument(
-        "--n-tiles-per-patient", type=int, default=20,
+        "--n-tiles-per-patient", type=int, default=None,
         help="Number of tiles per patient to reconstruct",
     )
     parser.add_argument(
-        "--mode", type=str, choices=["image_guided", "random_noise"], default="image_guided",
+        "--mode", type=str, choices=["image_guided", "random_noise"], default=None,
         help="Reconstruction mode",
     )
     parser.add_argument(
-        "--investigate", action="store_true",
+        "--investigate", dest="investigate", action="store_true",
         help="Save intermediate noising steps for inspection",
     )
+    parser.add_argument(
+        "--no-investigate", dest="investigate", action="store_false",
+        help="Disable intermediate noising-step visualization",
+    )
+    parser.set_defaults(investigate=None)
     parser.add_argument(
         "--seed", type=int, default=None,
         help="Optional base seed for deterministic (reproducible) sampling.",
@@ -1781,13 +1862,26 @@ EXAMPLES:
         help="Device (e.g., cuda:0, cpu)",
     )
     parser.add_argument(
-        "--inversion-steps", type=int, default=250,
+        "--inversion-steps", type=int, default=None,
         help="Number of DDIM reverse inversion steps for image-guided mode (MoPaDi-style).",
     )
     parser.add_argument(
         "--decode-steps", type=int, default=None,
         help="Optional number of DDIM decode steps. Defaults to --inversion-steps.",
     )
+    parser.add_argument(
+        "--guidance-scale", type=float, default=None,
+        help="Classifier-free guidance scale. If omitted, uses reconstruction.guidance_scale from config.",
+    )
+    parser.add_argument(
+        "--zero-conditioning", dest="zero_conditioning", action="store_true",
+        help="Replace conditioning vector with zeros (ablation).",
+    )
+    parser.add_argument(
+        "--no-zero-conditioning", dest="zero_conditioning", action="store_false",
+        help="Use normal genomic conditioning (disable ablation).",
+    )
+    parser.set_defaults(zero_conditioning=None)
     
     args = parser.parse_args()
     
@@ -1795,9 +1889,50 @@ EXAMPLES:
     with open(args.config) as f:
         config = yaml.safe_load(f)
     
+    rec_cfg = config.get("reconstruction", {})
     joint_cfg = config.get("joint_training", {})
-    gene_csv = args.gene_csv or joint_cfg.get("csv_path")
-    tiles_dir = args.tiles_dir or joint_cfg.get("tiles_zip_dir")
+
+    # Prefer explicit CLI args; otherwise fall back to reconstruction section.
+    # Keep joint_training fallback for backward compatibility with old configs.
+    gene_csv = args.gene_csv or rec_cfg.get("csv_path") or joint_cfg.get("csv_path")
+    tiles_dir = args.tiles_dir or rec_cfg.get("tiles_zip_dir") or joint_cfg.get("tiles_zip_dir")
+    save_dir = args.save_dir or rec_cfg.get("output_dir") or "experiments/reconstructed_tiles"
+
+    patients = args.patients if args.patients is not None else rec_cfg.get("patient_ids")
+    conditioning_patients = (
+        args.conditioning_patients if args.conditioning_patients is not None
+        else rec_cfg.get("conditioning_patients")
+    )
+    patient_splits_path = rec_cfg.get("patient_splits_path")
+    n_tiles_per_patient = int(
+        args.n_tiles_per_patient
+        if args.n_tiles_per_patient is not None
+        else rec_cfg.get("n_tiles_per_patient", 20)
+    )
+    mode = args.mode if args.mode is not None else rec_cfg.get("mode", "image_guided")
+    investigate = bool(
+        args.investigate
+        if args.investigate is not None
+        else rec_cfg.get("investigate", False)
+    )
+    guidance_scale = float(
+        args.guidance_scale
+        if args.guidance_scale is not None
+        else rec_cfg.get("guidance_scale", 1.0)
+    )
+    zero_conditioning = bool(
+        args.zero_conditioning
+        if args.zero_conditioning is not None
+        else rec_cfg.get("zero_conditioning", False)
+    )
+    seed = args.seed if args.seed is not None else rec_cfg.get("seed")
+    device = args.device or rec_cfg.get("device")
+    inversion_steps = int(
+        args.inversion_steps
+        if args.inversion_steps is not None
+        else rec_cfg.get("inversion_steps", 250)
+    )
+    decode_steps = args.decode_steps if args.decode_steps is not None else rec_cfg.get("decode_steps")
     
     if not gene_csv or not os.path.exists(gene_csv):
         parser.error(f"Gene CSV not found: {gene_csv}")
@@ -1809,17 +1944,20 @@ EXAMPLES:
         config_path=args.config,
         gene_csv_path=gene_csv,
         tiles_dir=tiles_dir,
-        save_dir=args.save_dir,
-        patients=args.patients,
+        save_dir=save_dir,
+        patients=patients,
         split=args.split,
         subtypes=args.subtypes,
         subtype_col=args.subtype_col,
-        conditioning_patients=args.conditioning_patients,
-        n_tiles_per_patient=args.n_tiles_per_patient,
-        investigate=args.investigate,
-        mode=args.mode,
-        seed=args.seed,
-        device=args.device,
-        inversion_steps=args.inversion_steps,
-        decode_steps=args.decode_steps,
+        conditioning_patients=conditioning_patients,
+        patient_splits_path=patient_splits_path,
+        n_tiles_per_patient=n_tiles_per_patient,
+        investigate=investigate,
+        mode=mode,
+        seed=seed,
+        device=device,
+        inversion_steps=inversion_steps,
+        decode_steps=decode_steps,
+        guidance_scale=guidance_scale,
+        zero_conditioning=zero_conditioning,
     )

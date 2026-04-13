@@ -251,6 +251,18 @@ def parse_tensorboard_events(
             idx = min(idx, len(run["epochs"]) - 1)
             val_epochs.append(run["epochs"][idx])
         run["val_epochs"] = val_epochs
+    elif val_steps and run["epochs"] and len(run["val_loss"]) < len(run["epochs"]):
+        # Fallback when TensorBoard lacks epoch-boundary steps for loss_epoch.
+        # We still know validation was logged throughout training, so distribute
+        # the available val points across the full epoch span.
+        n_val = len(run["val_loss"])
+        n_epochs = len(run["epochs"])
+        if n_val == 1:
+            run["val_epochs"] = [run["epochs"][-1]]
+        else:
+            step = max(1.0, (n_epochs - 1) / float(n_val - 1))
+            mapped = [run["epochs"][min(int(round(i * step)), n_epochs - 1)] for i in range(n_val)]
+            run["val_epochs"] = mapped
     else:
         # 1:1 mapping (val_check_interval=1) or no step info available
         run["val_epochs"] = list(run["epochs"][: len(run["val_loss"])])
@@ -532,12 +544,30 @@ def parse_experiment_dir(
 
     if prefer_tensorboard and tb_run.get("val_loss"):
         run["val_loss"] = tb_run["val_loss"]
+        if tb_run.get("val_epochs"):
+            run["val_epochs"] = tb_run["val_epochs"]
         if not run["epochs"]:
             run["epochs"] = tb_run["epochs"]
     elif log_run.get("val_loss"):
         run["val_loss"] = log_run["val_loss"]
+        if log_run.get("val_epochs"):
+            run["val_epochs"] = log_run["val_epochs"]
         if not run["epochs"]:
             run["epochs"] = log_run["epochs"]
+
+    # If val_loss exists but val_epochs was not carried from source, infer a
+    # consistent fallback mapping across the full epoch range.
+    if run.get("val_loss") and not run.get("val_epochs") and run.get("epochs"):
+        n_val = len(run["val_loss"])
+        n_epochs = len(run["epochs"])
+        if n_val == 1:
+            run["val_epochs"] = [run["epochs"][-1]]
+        else:
+            step = max(1.0, (n_epochs - 1) / float(max(1, n_val - 1)))
+            run["val_epochs"] = [
+                run["epochs"][min(int(round(i * step)), n_epochs - 1)]
+                for i in range(n_val)
+            ]
 
     # Per-step loss always comes from the log (TensorBoard may have it
     # but with sample-count steps that are harder to interpret).

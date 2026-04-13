@@ -179,6 +179,16 @@ def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = Tru
 def main() -> None:
     parser = argparse.ArgumentParser(description="Gene-token + cross-attention joint training")
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
+    parser.add_argument(
+        "--section",
+        type=str,
+        default="gene_token_cross_attention_joint_training",
+        help=(
+            "Config section name whose values override gene_token_transformer_joint_training. "
+            "Default: gene_token_cross_attention_joint_training. "
+            "Use 'gene_token_cross_attention_scratch_training' for the from-scratch variant."
+        ),
+    )
     args = parser.parse_args()
 
     with open(args.config) as f:
@@ -188,7 +198,7 @@ def main() -> None:
     full_cfg = _resolve_config_paths(full_cfg, repo_root)
 
     base_cfg = full_cfg.get("gene_token_transformer_joint_training", full_cfg.get("joint_training", {}))
-    overrides = full_cfg.get("gene_token_cross_attention_joint_training", {})
+    overrides = full_cfg.get(args.section, {})
     joint_cfg = _deep_update(base_cfg, overrides)
 
     if "out_dir" not in overrides:
