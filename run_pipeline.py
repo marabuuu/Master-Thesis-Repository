@@ -141,21 +141,41 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'extract_joint_latents' section in config.yaml")
         if "joint_training" not in config:
             raise ValueError("No 'joint_training' section in config.yaml to provide model definitions")
-            
-        joint_cfg = config["joint_training"].copy()
         extract_cfg = config["extract_joint_latents"]
+
+        section = extract_cfg.get("section", "joint_training")
+        if section == "joint_training":
+            joint_cfg = config["joint_training"].copy()
+            expected_variant = "joint_training"
+        else:
+            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
+
+            _repo_root = Path(config_path).resolve().parent.parent
+            _full_cfg = _resolve_config_paths(dict(config), _repo_root)
+            if section not in _full_cfg:
+                raise ValueError(f"No '{section}' section in config.yaml")
+            _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
+            _overrides = _full_cfg[section]
+            joint_cfg = _deep_update(_base, _overrides)
+            expected_variant = (
+                "gene_token_cross_attention_joint_training"
+                if section.startswith("gene_token_cross_attention_")
+                else "gene_token_transformer_joint_training"
+            )
         
         # Enforce output directory override
         joint_cfg["latent_dir"] = extract_cfg.get("out_dir")
         
         if verbose:
             print(f"[INFO] Extracting joint latents from {extract_cfg.get('ckpt')}...")
+            print(f"[INFO] Latent extraction section: {section}")
             
         extract_latents(
             joint_cfg=joint_cfg,
             ckpt_path=extract_cfg.get("ckpt"),
             split=extract_cfg.get("split", "all"),
-            verbose=verbose
+            verbose=verbose,
+            expected_variant=expected_variant,
         )
     
     elif stage == "visualize_latents":

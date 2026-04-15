@@ -285,6 +285,78 @@ class GeneTokenCrossAttentionJointLitModel(GeneTokenTransformerJointLitModel):  
         super().on_fit_start()
         self.genomic_decoder = self.genomic_decoder.to(self.device)
 
+    @torch.no_grad()
+    def save_latent_features(self, out_dir: str, split: str = "all") -> str:
+        """Save GTCA conditioning vectors used by diffusion as ``feats``.
+
+        For GTCA analyses we want to visualize the actual conditioning vector
+        passed to the UNet (post ``cond_projection``), not the pooled transformer
+        embedding before projection.
+        """
+        import os
+
+        import h5py
+        import numpy as np
+
+        os.makedirs(out_dir, exist_ok=True)
+        self.eval()
+
+        datasets = []
+        if split in ("train", "all") and hasattr(self, "train_data"):
+            datasets.append(("train", self.train_data))
+        if split in ("val", "all") and hasattr(self, "val_data"):
+            datasets.append(("val", self.val_data))
+        if split == "test":
+            try:
+                from joint_training.dataset import GenomicTileDataset, load_split
+            except ImportError:
+                from src.joint_training.dataset import GenomicTileDataset, load_split  # type: ignore[import-not-found]
+            split_path = os.path.join(self.conf.base_dir, "patient_splits.json")
+            if os.path.exists(split_path):
+                splits = load_split(split_path)
+                cfg = self.joint_cfg
+                _nm, _ns, _ali = (
+                    self.train_data.get_normalization_state()
+                    if hasattr(self, "train_data") else (None, None, None)
+                )
+                test_ds = GenomicTileDataset(
+                    csv_path=cfg["csv_path"],
+                    tiles_zip_dir=cfg["tiles_zip_dir"],
+                    img_size=self.conf.img_size,
+                    patient_col=cfg.get("patient_col", "Patient_ID"),
+                    label_col=cfg.get("label_col"),
+                    patient_ids=splits["test"],
+                    norm_means=_nm,
+                    norm_stds=_ns,
+                    apply_log1p=_ali,
+                )
+                datasets.append(("test", test_ds))
+
+        seen_patients: set[str] = set()
+        saved = 0
+
+        for split_name, ds in datasets:
+            raw_ds = ds.dataset if hasattr(ds, "dataset") else ds
+            for pid, genomic_vec in raw_ds._genomic.items():
+                if pid in seen_patients:
+                    continue
+                if hasattr(raw_ds, "patient_ids") and pid not in raw_ds.patient_ids:
+                    continue
+                seen_patients.add(pid)
+
+                g = genomic_vec.unsqueeze(0).to(self.device)
+                cond = self.encode_genomic(g)
+
+                h5_path = os.path.join(out_dir, f"{pid}.h5")
+                with h5py.File(h5_path, "w") as f:
+                    f.create_dataset("feats", data=cond.cpu().numpy().astype(np.float32))
+                    f.attrs["patient_id"] = pid
+                    f.attrs["split"] = split_name
+                saved += 1
+
+        print(f"[GeneTokenCrossJoint] Saved conditioning features for {saved} patients to {out_dir}")
+        return out_dir
+
     def on_train_batch_end(self, outputs, batch, batch_idx):
         """EMA update for the full wrapped model (cross-attn layers included)."""
         from mopadi.train_diff_autoenc import ema

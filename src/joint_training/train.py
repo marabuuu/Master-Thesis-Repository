@@ -34,38 +34,10 @@ try:
 except ImportError:
     from src.utils.logging_utils import build_robust_loggers  # type: ignore[import-not-found]
 
-
-def _resolve_config_paths(config_dict: dict, repo_root: Path) -> dict:
-    """Recursively resolve relative paths in config against repo_root."""
-    def _resolve_path(value: str) -> str:
-        repo_candidate = (repo_root / value).resolve()
-        normalized = value[2:] if value.startswith("./") else value
-
-        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
-        # live next to the repo root. Use parent fallback when repo-local target is absent.
-        if normalized.startswith(("data/", "dataframes/", "experiments/")):
-            parent_candidate = (repo_root.parent / normalized).resolve()
-            if parent_candidate.exists() or not repo_candidate.exists():
-                return str(parent_candidate)
-
-        return str(repo_candidate)
-
-    if isinstance(config_dict, dict):
-        for key, value in config_dict.items():
-            if isinstance(value, dict):
-                _resolve_config_paths(value, repo_root)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        _resolve_config_paths(item, repo_root)
-            elif isinstance(value, str):
-                if not value.startswith('/') and (
-                    value.startswith('./')
-                    or value.startswith('../')
-                    or any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
-                ):
-                    config_dict[key] = _resolve_path(value)
-    return config_dict
+try:
+    from utils.config_utils import resolve_config_paths as _resolve_config_paths
+except ImportError:
+    from src.utils.config_utils import resolve_config_paths as _resolve_config_paths  # type: ignore[import-not-found]
 
 
 def _count_genes(joint_cfg: dict) -> int:
@@ -175,8 +147,13 @@ def run_joint_training(joint_cfg: dict, verbose: bool = True) -> None:
         print(f"[Joint] Training complete. Checkpoints in {conf.logdir}")
 
 
-def extract_latents(joint_cfg: dict, ckpt_path: str | None = None,
-                    split: str = "all", verbose: bool = True) -> str:
+def extract_latents(
+    joint_cfg: dict,
+    ckpt_path: str | None = None,
+    split: str = "all",
+    verbose: bool = True,
+    expected_variant: str | None = None,
+) -> str:
     """Load a trained JointLitModel and save per-patient h5 latent features.
 
     Parameters
@@ -196,18 +173,106 @@ def extract_latents(joint_cfg: dict, ckpt_path: str | None = None,
         Path to the directory containing h5 files.
     """
     conf = build_conf(joint_cfg)
-    n_genes = _count_genes(joint_cfg)
 
     if ckpt_path is None:
         ckpt_path = os.path.join(conf.logdir, "last.ckpt")
     if not os.path.exists(ckpt_path):
         raise FileNotFoundError(f"Checkpoint not found: {ckpt_path}")
 
+    # Prefer the checkpoint's own n_genes to avoid config/checkpoint mismatch
+    # (e.g., config currently pointing to full-gene CSV while checkpoint was
+    # trained on a 512-gene subset).
+    n_genes = None
+    try:
+        ckpt_meta = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+        hp = ckpt_meta.get("hyper_parameters", {}) if isinstance(ckpt_meta, dict) else {}
+        ckpt_n_genes = hp.get("n_genes") if isinstance(hp, dict) else None
+        if ckpt_n_genes is not None:
+            n_genes = int(ckpt_n_genes)
+    except Exception:
+        # Keep backward-compatible fallback below.
+        n_genes = None
+
+    if n_genes is None:
+        n_genes = _count_genes(joint_cfg)
+
     if verbose:
         print(f"[Joint] Loading checkpoint: {ckpt_path}")
+        print(f"[Joint] Using n_genes={n_genes} for model construction")
 
     model = None
-    # Cross-attention checkpoints may include extra parameters; try loading with cross model first.
+    loaded_variant: str | None = None
+    load_errors: list[str] = []
+
+    # Try GTCA first for gene-token + cross-attention checkpoints.
+    try:
+        from gene_token_cross_attention_joint_training.model import (  # type: ignore[import-not-found]
+            GeneTokenCrossAttentionJointLitModel,
+            build_gene_token_cross_attention_conf,
+        )
+    except ImportError:
+        try:
+            from src.gene_token_cross_attention_joint_training.model import (  # type: ignore[import-not-found]
+                GeneTokenCrossAttentionJointLitModel,
+                build_gene_token_cross_attention_conf,
+            )
+        except ImportError:
+            GeneTokenCrossAttentionJointLitModel = None  # type: ignore[assignment]
+            build_gene_token_cross_attention_conf = None  # type: ignore[assignment]
+
+    if (
+        model is None
+        and GeneTokenCrossAttentionJointLitModel is not None
+        and build_gene_token_cross_attention_conf is not None
+    ):
+        try:
+            gtca_conf = build_gene_token_cross_attention_conf(joint_cfg)
+            model = GeneTokenCrossAttentionJointLitModel.load_from_checkpoint(
+                ckpt_path, conf=gtca_conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+            )
+            loaded_variant = "gene_token_cross_attention_joint_training"
+            if verbose:
+                print("[Joint] Loaded as GeneTokenCrossAttentionJointLitModel")
+        except Exception as ex:
+            load_errors.append(f"GeneTokenCrossAttentionJointLitModel: {ex}")
+            if verbose:
+                print(f"[Joint] GTCA load failed, trying next loader: {ex}")
+
+    # Try gene-token transformer checkpoints.
+    try:
+        from gene_token_transformer_joint_training.model import (  # type: ignore[import-not-found]
+            GeneTokenTransformerJointLitModel,
+            build_gene_token_transformer_conf,
+        )
+    except ImportError:
+        try:
+            from src.gene_token_transformer_joint_training.model import (  # type: ignore[import-not-found]
+                GeneTokenTransformerJointLitModel,
+                build_gene_token_transformer_conf,
+            )
+        except ImportError:
+            GeneTokenTransformerJointLitModel = None  # type: ignore[assignment]
+            build_gene_token_transformer_conf = None  # type: ignore[assignment]
+
+    if (
+        model is None
+        and GeneTokenTransformerJointLitModel is not None
+        and build_gene_token_transformer_conf is not None
+    ):
+        try:
+            gtt_conf = build_gene_token_transformer_conf(joint_cfg)
+            model = GeneTokenTransformerJointLitModel.load_from_checkpoint(
+                ckpt_path, conf=gtt_conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+            )
+            loaded_variant = "gene_token_transformer_joint_training"
+            if verbose:
+                print("[Joint] Loaded as GeneTokenTransformerJointLitModel")
+        except Exception as ex:
+            load_errors.append(f"GeneTokenTransformerJointLitModel: {ex}")
+            if verbose:
+                print(f"[Joint] GTT load failed, trying next loader: {ex}")
+
+    # Cross-attention checkpoints may include extra parameters.
     try:
         from cross_attention_joint_training.model import CrossAttentionJointLitModel  # type: ignore[import-not-found]
     except ImportError:
@@ -216,24 +281,42 @@ def extract_latents(joint_cfg: dict, ckpt_path: str | None = None,
         except ImportError:
             CrossAttentionJointLitModel = None  # type: ignore[assignment]
 
-    if CrossAttentionJointLitModel is not None:
+    if model is None and CrossAttentionJointLitModel is not None:
         try:
             model = CrossAttentionJointLitModel.load_from_checkpoint(
                 ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
             )
+            loaded_variant = "cross_attention_joint_training"
             if verbose:
                 print("[Joint] Loaded as CrossAttentionJointLitModel")
         except Exception as ex:
+            load_errors.append(f"CrossAttentionJointLitModel: {ex}")
             if verbose:
                 print(f"[Joint] CrossAttention load failed, falling back to JointLitModel: {ex}")
             model = None
 
     if model is None:
-        model = JointLitModel.load_from_checkpoint(
-            ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+        try:
+            model = JointLitModel.load_from_checkpoint(
+                ckpt_path, conf=conf, joint_cfg=joint_cfg, n_genes=n_genes, strict=False
+            )
+            loaded_variant = "joint_training"
+            if verbose:
+                print("[Joint] Loaded as JointLitModel (strict=False)")
+        except Exception as ex:
+            load_errors.append(f"JointLitModel: {ex}")
+            details = "\n  - ".join(load_errors) if load_errors else "(no loader details)"
+            raise RuntimeError(
+                "Failed to load checkpoint with available model loaders.\n"
+                f"  - {details}"
+            ) from ex
+
+    if expected_variant is not None and loaded_variant != expected_variant:
+        raise RuntimeError(
+            "Checkpoint/model variant mismatch during latent extraction: "
+            f"expected '{expected_variant}', loaded '{loaded_variant}'. "
+            "Aborting to avoid exporting wrong latent representations."
         )
-        if verbose:
-            print("[Joint] Loaded as JointLitModel (strict=False)")
 
     model.eval()
     model.setup()  # build datasets so we know which patients are in each split

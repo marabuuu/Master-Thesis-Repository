@@ -134,15 +134,16 @@ cross_attention_joint_training:
   counterfactual_zero_threshold: 1e-4
 
 extract_joint_latents:
-  ckpt: ./experiments/20260410_gtca_scratch/joint/last.ckpt  # Note: absolute path for remote mount compatibility
-  out_dir: ./experiments/20260410_gtca_scratch/joint_latents  # Note: absolute path for remote mount compatibility
+  ckpt: ./experiments/20260410_gtca_nocfg/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  out_dir: ./experiments/20260410_gtca_nocfg/joint_latents  # Note: absolute path for remote mount compatibility
   split: all                              # train, val, test, or all
+  section: gene_token_cross_attention_joint_training
 
 visualize_latents:
-  latent_dir: ./experiments/20260410_gtca_scratch/joint_latents  # Note: absolute path for remote mount compatibility
+  latent_dir: ./experiments/20260410_gtca_nocfg/joint_latents  # Note: absolute path for remote mount compatibility
   csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
-  patient_splits_path: ./experiments/20260410_gtca_scratch/patient_splits.json  # optional: required if using split-specific latent_dir
-  output_dir: ./experiments/20260410_gtca_scratch/latent_plots
+  patient_splits_path: ./experiments/20260410_gtca_nocfg/patient_splits.json  # optional: required if using split-specific latent_dir
+  output_dir: ./experiments/20260410_gtca_nocfg/latent_plots
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
@@ -181,8 +182,8 @@ dataset_statistics:
   min_patients_km: 10             # skip subtypes with fewer patients in KM
 
 training_stats:
-  logdir: ./experiments/20260410_gtca_scratch/joint  # where TensorBoard logs are saved during training
-  output_dir: ./experiments/20260410_gtca_scratch/training_stats
+  logdir: ./experiments/20260410_gtca_nocfg/joint  # where TensorBoard logs are saved during training
+  output_dir: ./experiments/20260410_gtca_nocfg/training_stats
   plots:
     - loss_curves          # epoch-level train & val loss
     - batch_trajectory     # per-step loss across all epochs
@@ -345,278 +346,21 @@ gene_token_cross_attention_joint_training:
   # Genomic auto-reconstruction: keeps cond vector informationally rich.
   genomic_recon_loss_weight: 0.05
 
-gene_token_cross_attention_nocfg_training:
-  # Fine-tuning variant: mopadi UNet checkpoint + NO unconditional path.
-  #
-  # Scientific purpose
-  # ------------------
-  # Combines fast convergence from the mopadi prior with the clean zero-cond
-  # ablation property.  Unlike gtca_v2 (cond_dropout=0.15), this model is never
-  # trained on zero conditioning, so at inference:
-  #   real genomics → coherent histology
-  #   zero/ablated  → incoherent output (out-of-distribution input)
-  # This is the intended demo for the meeting: unambiguous evidence that
-  # genomic conditioning drives generation, not the unconditional prior.
-  #
-  # IMPORTANT: guidance_scale MUST be 1.0 at inference — no unconditional
-  # baseline exists, so CFG is undefined.  The ablation comparison is:
-  #   reconstruction config: guidance_scale: 1.0
-  #   real genomics vs zero_conditioning: true
-  #
-  # How this differs from gtca_v2 (the only change that matters)
-  # -------------------------------------------------------------
-  #   cond_dropout_prob: 0.0   (was 0.15 — removes the CFG unconditional path)
-  #
-  # Everything else is identical to gtca_v2 for a clean one-variable comparison.
-  #
-  # How to launch
-  # -------------
-  #   sbatch slurm/gene_token_cross_attention_nocfg_training.sh
-  out_dir: ./experiments/20260410_gtca_nocfg
-
-  gpus: [0, 1]
-  fp16: false
-  bf16: true
-  batch_size: 2
-  accumulate_grad_batches: 4
-
-  unet_lr: 5e-6
-  cross_attn_lr: 1e-4
-  encoder_lr: 1e-4
-  proj_lr: 3e-4
-
-  cross_attention:
-    heads: 4
-    dim_per_head: 64
-    patch_size: 16
-
-  # THE key difference: zero conditioning is never seen during training.
-  # Model cannot produce coherent output without a real genomic cond vector.
-  cond_dropout_prob: 0.0
-  cond_feature_dropout: 0.05
-  xT_dropout_prob: 0.55
-
-  counterfactual_loss_weight: 0.5
-  counterfactual_margin: 0.05
-  counterfactual_monitor_every_n_steps: 200
-  counterfactual_zero_threshold: 1e-4
-
-  genomic_recon_loss_weight: 0.05
-
-  # Same duration as gtca_v2 — mopadi prior means convergence speed is identical.
-  epochs: 500
-  total_samples: 5000000
-
-gene_token_cross_attention_scratch_training:
-  # From-scratch variant of gtca: no mopadi UNet checkpoint, no unconditional path.
-  #
-  # Scientific purpose
-  # ------------------
-  # Tests whether the genomic conditioning signal alone can drive histology
-  # generation.  With a pre-trained UNet (gtca_v2), the model's histology prior
-  # does much of the reconstruction work; here the UNet starts random, so any
-  # coherent output must come from the genomic signal.
-  #
-  # Key behavioral property
-  # -----------------------
-  # cond_dropout_prob: 0.0  →  the model NEVER sees zero conditioning during
-  # training.  At inference, zero/ablated cond is out-of-distribution: the model
-  # cannot produce coherent histology without a real cond vector.
-  # This gives the desired ablation: real genomics → histology, zero → noise.
-  #
-  # IMPORTANT: guidance_scale MUST be 1.0 at inference.  There is no unconditional
-  # baseline (cond_dropout=0 means CFG is undefined — no unconditional path exists).
-  #
-  # CF loss / swap_gap metric note
-  # -------------------------------
-  # swap_gap logged by self.log(..., sync_dist=True) averages across GPUs.
-  # With batch_size=2 per GPU the per-GPU swap_gaps can cancel (high variance,
-  # small batch), so the synced mean is consistently near 0 even when CF is
-  # working.  cf_margin=0 (GOOD) is the reliable signal: it means the margin
-  # constraint is satisfied.  Do NOT interpret swap_gap≈0 as a CF failure.
-  #
-  # How to launch
-  # -------------
-  #   torchrun --nproc_per_node=2 src/gene_token_cross_attention_joint_training/train.py \
-  #     --config src/config.yaml \
-  #     --section gene_token_cross_attention_scratch_training
-  # Or submit: sbatch slurm/gene_token_cross_attention_scratch_training.sh
-  out_dir: ./experiments/20260410_gtca_scratch
-
-  # ── UNet initialisation ───────────────────────────────────────────────
-  # null overrides the diffusion_ckpt inherited from gtt base section.
-  # The UNet starts from random weights — no mopadi prior.
-  diffusion_ckpt: null
-
-  # ── No unconditional path ─────────────────────────────────────────────
-  # cond_dropout=0.0 removes the CFG unconditional training mode entirely.
-  # Model must always use genomic cond; zero cond at inference → incoherent output.
-  cond_dropout_prob: 0.0
-
-  # ── Learning rates ────────────────────────────────────────────────────
-  # UNet trains from scratch: needs a proper learning rate, not the conservative
-  # 5e-6 used when fine-tuning a pre-trained checkpoint.
-  unet_lr: 3e-5         # higher than fine-tuning (5e-6), lower than cross-attn
-  cross_attn_lr: 1e-4   # zero-init cross-attention wrapper layers
-  encoder_lr: 1e-4
-  proj_lr: 3e-4
-
-  # Longer warmup: UNet and encoder both start from scratch
-  warmup_steps: 2000
-
-  # ── Training duration ─────────────────────────────────────────────────
-  # From-scratch needs ~2× the samples of fine-tuning to converge.
-  # With batch_size=2/GPU × 2 GPUs × steps_per_epoch=5000 = 20K samples/epoch.
-  # 1000 epochs × 20K = 20M samples total.
-  epochs: 1000
-  total_samples: 20000000   # used for cosine schedule T_max; must match epochs
-
-  # ── Everything else identical to gtca_v2 for clean ablation ──────────
-  gpus: [0, 1]
-  fp16: false
-  bf16: true
-  batch_size: 2
-  accumulate_grad_batches: 4
-
-  cross_attention:
-    heads: 4
-    dim_per_head: 64
-    patch_size: 16
-
-  cond_feature_dropout: 0.05
-  xT_dropout_prob: 0.55         # xT forcing is the primary conditioning pressure
-
-  counterfactual_loss_weight: 0.5
-  counterfactual_margin: 0.05
-  counterfactual_monitor_every_n_steps: 200
-  counterfactual_zero_threshold: 1e-4
-
-  genomic_recon_loss_weight: 0.05
-
-gene_token_cross_attention_scratch_v2:
-  # Revised from-scratch variant — fixes the encoder-collapse / cf_swap_gap=0
-  # failure mode diagnosed in 20260410_gtca_scratch.
-  #
-  # Root cause of v1 failure
-  # ------------------------
-  # 1. UNet starts random + cond_norm ≈ 2 (encoder collapsed) →
-  #    L_swapped ≈ L_matched → cf_swap_gap = 0 the ENTIRE run.
-  # 2. CF loss never engaged because encoder collapse made all cond vectors
-  #    indistinguishable, so swapping them had no effect on the loss.
-  # 3. xT_dropout_prob=0.55 spent 55 % of training at near-pure-noise
-  #    timesteps where a random UNet has no signal → noisy gradients dominated.
-  # 4. genomic_recon_loss_weight=0.05 was far too weak to prevent collapse.
-  #
-  # Fix strategy: break the bootstrapping deadlock
-  # -----------------------------------------------
-  # Phase 1 (first ~5k steps, warmup_steps): encoder warm-up.
-  #   - High genomic_recon_loss_weight forces the encoder to produce
-  #     informative, non-collapsed cond vectors BEFORE the CF loss is used.
-  #   - No xT forcing (xT_dropout_prob=0.0) so gradients go to basic denoising.
-  #   - No CF loss (counterfactual_loss_weight=0.0) yet.
-  #
-  # Phase 2 (after warm-up): full training.
-  #   - xT_dropout_prob=0.20 (down from 0.55) — enough pressure without
-  #     drowning the conditioning gradient in pure-noise batches.
-  #   - CF loss re-enabled once encoder is healthy.
-  #   - genomic_recon_loss_weight kept high throughout to prevent re-collapse.
-  #
-  # NOTE: the warmup_steps knob only controls the LR warm-up schedule, not
-  # a two-phase loss schedule.  To implement phased loss weights you must
-  # either (a) start with the encoder-focused config and resume with the full
-  # config, or (b) implement a step-based ramp inside the training_step.
-  # The simplest safe approach: run with these settings from the start.
-  # genomic_recon at 0.3 dominates early, CF engages once encoder is healthy.
-  #
-  out_dir: ./experiments/20260413_gtca_scratch_v2
-
-  diffusion_ckpt: null   # UNet still from scratch — same scientific question
-
-  gpus: [0, 1]
-  fp16: false
-  bf16: true
-  batch_size: 2
-  accumulate_grad_batches: 4
-
-  # LR: UNet needs a proper rate from scratch; encoder/proj unchanged
-  unet_lr: 3e-5
-  cross_attn_lr: 1e-4
-  encoder_lr: 1e-4
-  proj_lr: 3e-4
-
-  # Longer LR warm-up: both UNet and encoder start from random
-  warmup_steps: 3000
-
-  cross_attention:
-    heads: 4
-    dim_per_head: 64
-    patch_size: 16
-
-  # ── Key changes vs v1 ────────────────────────────────────────────────────
-  # cond_dropout=0.0: model always receives a conditioning vector.
-  # No unconditional path → ablation at inference is real vs zero cond.
-  cond_dropout_prob: 0.0
-  cond_feature_dropout: 0.05
-
-  # xT forcing reduced: 0.55 → 0.20.
-  # 0.55 was too aggressive for a from-scratch UNet — 55 % of batches had
-  # near-pure-noise x_t where denoising gradient is too noisy to learn
-  # conditioning structure.  0.20 keeps meaningful pressure without drowning it.
-  xT_dropout_prob: 0.20
-
-  # CF loss: same weight as v1, but now has a chance to engage because the
-  # encoder is forced to be informative by the genomic_recon loss.
-  counterfactual_loss_weight: 0.5
-  counterfactual_margin: 0.05
-  counterfactual_monitor_every_n_steps: 200
-  counterfactual_zero_threshold: 1e-4
-
-  # genomic_recon_loss_weight: 0.05 → 0.30.
-  # This is the ONLY loss directly tied to encoder output magnitude.
-  # At 0.05 it was overwhelmed by the diffusion loss; at 0.30 it actively
-  # forces the encoder to preserve gene-level information and prevents
-  # the norm-collapse to ~2 seen in v1.
-  genomic_recon_loss_weight: 0.30
-
-  # Longer run: from-scratch needs more samples than fine-tuning
-  epochs: 1000
-  total_samples: 20000000
-
-sampling:
-  ckpt: ./experiments/20260306_FOXA1_finetuning/finetuning/genomic_finetune_v4/last.ckpt
-  proj_ckpt: null          # optional separate projection head checkpoint
-  genomic_h5_dir: ./experiments/20260306_FOXA1_finetuning/encoding
-  tiles_zip_dir: ./data/BRCA-tumor-tiles-corrected  # optional
-  out_dir: ./experiments/20260306_FOXA1_finetuning/sampling/random-noise
-  mode: random-noise       # choices: random-noise, encode-decode
-  patient: TCGA-A1-A0SM         # optional specific patient ID (TCGA-XX-YYYY)
-  tile_file: null          # optional single tile path (for encode-decode without zip dir)
-  n_samples: 4
-  img_size: 512
-  seed: 42
-  debug_save: true       # save intermediate frames and metrics
-  debug_n: 4
-  debug_steps: 6
-  proj_hidden_dim: 512
-  proj_layers: 4
-  proj_dropout: 0.1
-  device: null             # null = auto-detect cuda/cpu
-
 evaluation:
   # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
-  mode: random_noise       # choices: image_guided, random_noise
+  mode: image_guided       # choices: image_guided, random_noise
                             # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
                             # random_noise: no originals needed; skips metric computation
 
   # ── Directories for reconstruction quality assessment ─────────────────
-  original_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_random_noise_ablate_genomics/original_samples
+  original_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising/original_samples
                             # not required when mode=random_noise
-  reconstructed_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_random_noise_ablate_genomics/reconstructed_samples
+  reconstructed_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising/reconstructed_samples
                             # can point to a different reconstruction run for cross-condition evaluation
 
   # ── Output locations ──────────────────────────────────────────────────
-  output_dir: ./experiments/20260410_gtca_nocfg/evaluation_random_noise_ablate_genomics/ # where to save CSV/JSON results and plots
-  plot_dir: ./experiments/20260410_gtca_nocfg/evaluation_random_noise_ablate_genomics/plots  # where to save generated plots (can be same as output_dir)
+  output_dir: ./experiments/20260410_gtca_nocfg/evaluation_image_guided_investigate_noising/ # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260410_gtca_nocfg/evaluation_image_guided/plots  # where to save generated plots (can be same as output_dir)
 
   # ── Patient filtering ─────────────────────────────────────────────────
   # Leave as null to evaluate all matching patients
@@ -641,7 +385,7 @@ evaluation:
     - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
     - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
     - metric_correlation   # scatter plots of metric pairs (image_guided only)
-    - random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
     #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
 
 
@@ -775,18 +519,18 @@ reconstruction:
   csv_path: ../dataframes/brca_gene_expression.csv
   tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
   patient_col: Patient_ID
-  #patient_ids: [TCGA-A1-A0SJ]
-  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  patient_ids: [TCGA-A1-A0SJ]
+  #patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
   #conditioning_patients: [TCGA-A2-A04T]
   patient_splits_path: ./experiments/20260410_gtca_nocfg/patient_splits.json  # optional: required if patient_ids is a split name
   
   # ── Reconstruction Parameters ─────────────────────────────────────────
   n_tiles_per_patient: 2    # number of tiles to sample per patient
-  mode: random_noise       # choices: image_guided, random_noise
-  investigate: false         # save intermediate noising steps for visualization
+  mode: image_guided       # choices: image_guided, random_noise
+  investigate: true         # save intermediate noising steps for visualization
   
   # ── Output ────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260410_gtca_nocfg/reconstructions_random_noise  # Note: absolute path for remote mount compatibility
+  output_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising  # Note: absolute path for remote mount compatibility
   
   # ── Classifier-Free Guidance ──────────────────────────────────────────
   # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
@@ -805,3 +549,5 @@ reconstruction:
   # ── Execution ─────────────────────────────────────────────────────────
   device: null               # null = auto-detect cuda/cpu
   batch_size: 1              # reconstructions are single-tile (no batching needed)
+
+  

@@ -14,9 +14,14 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pathlib import Path
 
 try:
-    from joint_training.train import _count_genes, _resolve_config_paths
+    from joint_training.train import _count_genes
 except ImportError:  # pragma: no cover
-    from src.joint_training.train import _count_genes, _resolve_config_paths  # type: ignore[import-not-found]
+    from src.joint_training.train import _count_genes  # type: ignore[import-not-found]
+
+try:
+    from utils.config_utils import resolve_config_paths as _resolve_config_paths
+except ImportError:  # pragma: no cover
+    from src.utils.config_utils import resolve_config_paths as _resolve_config_paths  # type: ignore[import-not-found]
 
 try:
     from gene_token_transformer_joint_training.model import (

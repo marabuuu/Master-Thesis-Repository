@@ -54,60 +54,10 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import numpy as np
 
-
-def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
-    """
-    Recursively resolve relative paths in config relative to repo_root.
-    
-    Converts paths like "./data/..." or "experiments/..." to absolute paths
-    based on the repository root. Leaves absolute paths unchanged.
-    
-    Parameters
-    ----------
-    config_dict : Dict[str, Any]
-        Configuration dictionary (may contain nested dicts and lists)
-    repo_root : Path
-        Repository root directory to use as base for relative paths
-    
-    Returns
-    -------
-    Dict[str, Any]
-        Configuration with resolved paths
-    """
-    def _resolve_path(value: str) -> str:
-        repo_candidate = (repo_root / value).resolve()
-        normalized = value[2:] if value.startswith("./") else value
-
-        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
-        # are siblings of the repository root.
-        if normalized.startswith(("data/", "dataframes/", "experiments/")):
-            parent_candidate = (repo_root.parent / normalized).resolve()
-            if parent_candidate.exists() or not repo_candidate.exists():
-                return str(parent_candidate)
-
-        return str(repo_candidate)
-
-    if isinstance(config_dict, dict):
-        for key, value in config_dict.items():
-            if isinstance(value, dict):
-                resolve_config_paths(value, repo_root)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        resolve_config_paths(item, repo_root)
-            elif isinstance(value, str):
-                # Detect if this looks like a path:
-                # - starts with ./ or ../
-                # - contains path separators and common dir names, or is a relative path
-                # - is NOT already absolute
-                if not value.startswith('/') and (
-                    value.startswith('./') or 
-                    value.startswith('../') or
-                    any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
-                ):
-                    config_dict[key] = _resolve_path(value)
-    
-    return config_dict
+try:
+    from utils.config_utils import resolve_config_paths
+except ImportError:
+    from src.utils.config_utils import resolve_config_paths  # type: ignore[import-not-found]
 
 
 # ===================================================================

@@ -182,6 +182,13 @@ class GeneTokenTransformerJointLitModel(JointLitModel):  # type: ignore[misc]
             raise ValueError(f"Expected genomic shape [B, L], got {tuple(genomic.shape)}")
 
         batch_size, n_genes = genomic.shape
+        embedding_genes = int(self.gene_token_encoder.gene_embedding.num_embeddings)
+        if n_genes != embedding_genes:
+            raise ValueError(
+                f"Genomic vector length mismatch: input has {n_genes} genes but the "
+                f"checkpoint expects {embedding_genes}. This usually means the wrong gene list "
+                f"was used during extraction or the config paths were not resolved correctly."
+            )
         if self._cached_gene_ids is None or self._cached_gene_ids.numel() != n_genes:
             self._cached_gene_ids = torch.arange(n_genes, device=genomic.device, dtype=torch.long)
 

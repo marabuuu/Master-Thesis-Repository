@@ -20,8 +20,6 @@ Usage:
 from __future__ import annotations
 
 import logging
-import os
-import sys
 import time
 from pathlib import Path
 from typing import Optional, Tuple
@@ -34,57 +32,12 @@ from PIL import Image
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 logger = logging.getLogger(__name__)
 
-
-def _ensure_mopadi_import_path() -> None:
-    """Ensure local mopadi source is importable for checkpoint unpickling."""
-    env_path = os.getenv("MOPADI_SRC")
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        Path(env_path) if env_path else None,
-        repo_root / "mopadi" / "src",
-        repo_root.parent / "mopadi" / "src",
-    ]
-
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        candidate = candidate.resolve()
-        if (candidate / "mopadi").exists():
-            candidate_str = str(candidate)
-            if candidate_str not in sys.path:
-                sys.path.insert(0, candidate_str)
-                logger.info(f"Added mopadi import path: {candidate_str}")
-            break
-
-
-def _sanitize_joint_cfg_for_inference(joint_cfg: dict) -> dict:
-    """Disable constructor-side preload ckpts for inference-only checkpoint loading."""
-    cfg = dict(joint_cfg)
-    cfg["diffusion_ckpt"] = None
-    cfg["encoder_ckpt"] = None
-    return cfg
-
-
-def extract_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX from filename."""
-    stem = Path(name).stem.upper()
-    for sep in ("_", "."):
-        stem = stem.replace(sep, "-")
-    while "--" in stem:
-        stem = stem.replace("--", "-")
-    parts = stem.split("-")
-    if len(parts) >= 3 and parts[0].startswith("TCGA"):
-        return "-".join(parts[:3]).lower()
-    return stem.lower()
-
-
-def tensor_to_image(x: torch.Tensor) -> np.ndarray:
-    """Convert tensor (C, H, W) in [-1, 1] to uint8 RGB image."""
-    if x.ndim == 4:
-        x = x[0]
-    x = x.cpu().detach()
-    x = ((x + 1) / 2 * 255).clamp(0, 255).to(torch.uint8)
-    return x.permute(1, 2, 0).numpy()
+from .utils import (  # noqa: E402
+    extract_patient_id,
+    tensor_to_image,
+    _ensure_mopadi_import_path,
+    _sanitize_joint_cfg_for_inference,
+)
 
 
 def load_checkpoint_simple(

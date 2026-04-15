@@ -31,11 +31,11 @@ import hashlib
 import json
 import logging
 import os
-import sys
 import time
 import zipfile
 import io
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple, Union, cast
 
 import numpy as np
@@ -49,31 +49,57 @@ from torchvision.transforms import ToPILImage
 logging.basicConfig(level=logging.INFO, format="%(asctime)s  %(levelname)-8s  %(message)s")
 logger = logging.getLogger(__name__)
 
+from .utils import (  # noqa: E402
+    extract_patient_id,
+    tensor_to_image,
+    _ensure_mopadi_import_path,
+    _sanitize_joint_cfg_for_inference,
+)
+
 
 # ───────────────────────────────────────────────────────────────────────
 #  Utility Functions
 # ───────────────────────────────────────────────────────────────────────
 
-def extract_patient_id(name: str) -> str:
-    """Extract TCGA-XX-XXXX from filename."""
+def extract_sample_id(name: str) -> str:
+    """Extract TCGA sample-level prefix (typically first 4 tokens)."""
     stem = Path(name).stem.upper()
     for sep in ("_", "."):
         stem = stem.replace(sep, "-")
     while "--" in stem:
         stem = stem.replace("--", "-")
     parts = stem.split("-")
-    if len(parts) >= 3 and parts[0].startswith("TCGA"):
-        return "-".join(parts[:3])
-    return stem
+    if len(parts) >= 4 and parts[0].startswith("TCGA"):
+        return "-".join(parts[:4])
+    return extract_patient_id(stem)
 
 
-def tensor_to_image(x: torch.Tensor) -> np.ndarray:
-    """Convert tensor (C, H, W) in [-1, 1] to uint8 RGB image."""
-    if x.ndim == 4:
-        x = x[0]  # Remove batch dim
-    x = x.cpu().detach()
-    x = ((x + 1) / 2 * 255).clamp(0, 255).to(torch.uint8)
-    return x.permute(1, 2, 0).numpy()
+@dataclass
+class GeneExpressionStore:
+    gene_names: List[str]
+    patient_vectors: Dict[str, np.ndarray]
+    sample_vectors: Dict[str, np.ndarray]
+    sample_to_patient: Dict[str, str]
+    patient_to_samples: Dict[str, List[str]]
+
+    def has_patient(self, patient_id: str) -> bool:
+        return patient_id in self.patient_vectors or patient_id in self.patient_to_samples
+
+    def get_vector(self, patient_id: str, sample_hint: Optional[str] = None) -> Optional[np.ndarray]:
+        # Prefer exact sample-level match when available (training-consistent).
+        if sample_hint:
+            wanted = extract_sample_id(sample_hint)
+            for sample_key in self.patient_to_samples.get(patient_id, []):
+                if extract_sample_id(sample_key) == wanted:
+                    return self.sample_vectors[sample_key]
+
+        # Fallback to deterministic first sample for this patient.
+        samples = self.patient_to_samples.get(patient_id, [])
+        if samples:
+            return self.sample_vectors[samples[0]]
+
+        # Legacy fallback (single-vector path).
+        return self.patient_vectors.get(patient_id)
 
 
 def image_to_tensor(img: np.ndarray, device: torch.device) -> torch.Tensor:
@@ -277,6 +303,118 @@ def load_gene_expression(
     return gene_data, gene_cols
 
 
+def load_gene_expression_store(
+    csv_path: str,
+    patient_ids: Optional[List[str]] = None,
+    patient_col: str = "Patient_ID",
+    label_col: Optional[str] = None,
+    gene_list_path: Optional[str] = None,
+    norm_means: Optional[np.ndarray] = None,
+    norm_stds: Optional[np.ndarray] = None,
+    apply_log1p: Optional[bool] = None,
+) -> GeneExpressionStore:
+    """Load gene expression and keep sample-level mappings for robust conditioning."""
+    logger.info(f"Loading gene expression from {csv_path}")
+    df = pd.read_csv(csv_path)
+
+    if patient_col not in df.columns:
+        raise KeyError(f"Patient column '{patient_col}' not found in {csv_path}")
+
+    work = df.copy()
+    if label_col and label_col in work.columns:
+        work = work.drop(columns=[label_col])
+
+    metadata_cols = {patient_col, "label", "Label", "SubType", "subtype"}
+    gene_cols = [c for c in work.columns if c not in metadata_cols]
+    gene_df = work[gene_cols].apply(pd.to_numeric, errors="coerce")
+    gene_df = gene_df.dropna(axis=1, how="all")
+    gene_df = gene_df.fillna(0.0)
+
+    if gene_list_path and Path(gene_list_path).exists():
+        with open(gene_list_path) as f:
+            selected_genes = [line.strip() for line in f if line.strip()]
+        available = [g for g in selected_genes if g in gene_df.columns]
+        if available:
+            gene_df = gene_df[available]
+            logger.info(f"Using {len(available)} genes from gene list: {gene_list_path}")
+
+    gene_cols = list(gene_df.columns)
+    logger.info(f"Found {len(gene_cols)} gene columns after preprocessing")
+
+    values = gene_df.values.astype(np.float64)
+
+    if apply_log1p is not None:
+        if apply_log1p:
+            values = np.log1p(values)
+    else:
+        positive = values[values > 0]
+        if positive.size > 0 and float(np.median(positive)) > 2.0:
+            values = np.log1p(values)
+
+    if norm_means is not None and norm_stds is not None:
+        means = np.asarray(norm_means, dtype=np.float64)
+        stds = np.asarray(norm_stds, dtype=np.float64).copy()
+        stds[stds < 1e-8] = 1.0
+        logger.info("Using training-fitted normalization statistics for gene expression")
+    else:
+        means = values.mean(axis=0)
+        stds = values.std(axis=0)
+        stds[stds < 1e-8] = 1.0
+        logger.warning(
+            "No training normalization stats provided — computing from inference set. "
+            "This may introduce a distribution shift vs. training. "
+            "Pass norm_means/norm_stds from getattr(model, '_norm_stats', None)."
+        )
+    values = (values - means) / stds
+
+    patient_ids_canonical = {pid.upper() for pid in patient_ids} if patient_ids is not None else None
+
+    # Keep duplicate sample rows by disambiguating repeated IDs with _N suffix.
+    raw_ids = df[patient_col].astype(str).tolist()
+    seen: Dict[str, int] = {}
+    sample_keys: List[str] = []
+    for rid in raw_ids:
+        if rid in seen:
+            seen[rid] += 1
+            sample_keys.append(f"{rid}_{seen[rid]}")
+        else:
+            seen[rid] = 0
+            sample_keys.append(rid)
+
+    sample_vectors: Dict[str, np.ndarray] = {}
+    sample_to_patient: Dict[str, str] = {}
+    patient_to_samples: Dict[str, List[str]] = {}
+    patient_vectors: Dict[str, np.ndarray] = {}
+
+    for row_idx, sample_key in enumerate(sample_keys):
+        pid = extract_patient_id(str(df.iloc[row_idx][patient_col]))
+        if patient_ids_canonical is not None and pid not in patient_ids_canonical:
+            continue
+
+        vec = values[row_idx].astype(np.float32)
+        sample_vectors[sample_key] = vec
+        sample_to_patient[sample_key] = pid
+        patient_to_samples.setdefault(pid, []).append(sample_key)
+        # Deterministic patient-level fallback: first encountered sample.
+        if pid not in patient_vectors:
+            patient_vectors[pid] = vec
+
+    if patient_ids_canonical is not None:
+        logger.info(f"Filtered to {len(patient_vectors)} patients")
+
+    logger.info(
+        f"Loaded gene expression for {len(patient_vectors)} patients "
+        f"({len(sample_vectors)} sample rows)"
+    )
+    return GeneExpressionStore(
+        gene_names=gene_cols,
+        patient_vectors=patient_vectors,
+        sample_vectors=sample_vectors,
+        sample_to_patient=sample_to_patient,
+        patient_to_samples=patient_to_samples,
+    )
+
+
 def load_tiles_for_patients(
     tiles_dir: Path,
     patient_ids: List[str],
@@ -346,31 +484,6 @@ def load_tiles_for_patients(
 #  Model Loading
 # ───────────────────────────────────────────────────────────────────────
 
-def _ensure_mopadi_import_path() -> None:
-    """Ensure local mopadi source is importable for checkpoint unpickling.
-
-    Some checkpoints store objects under ``mopadi.configs`` in hyperparameters.
-    When loading outside SLURM, ``PYTHONPATH`` may miss the local mopadi source.
-    """
-    env_path = os.getenv("MOPADI_SRC")
-    repo_root = Path(__file__).resolve().parents[2]
-    candidates = [
-        Path(env_path) if env_path else None,
-        repo_root / "mopadi" / "src",
-        repo_root.parent / "mopadi" / "src",
-    ]
-
-    for candidate in candidates:
-        if candidate is None:
-            continue
-        candidate = candidate.resolve()
-        if (candidate / "mopadi").exists():
-            candidate_str = str(candidate)
-            if candidate_str not in sys.path:
-                sys.path.insert(0, candidate_str)
-                logger.info(f"Added mopadi import path: {candidate_str}")
-            break
-
 def _detect_joint_variant(hp: dict, joint_cfg: dict) -> str:
     """Infer which joint-training variant produced a checkpoint."""
     variant = hp.get("joint_variant")
@@ -434,18 +547,6 @@ def _resolve_joint_model_class(variant: str):
         "gene_token_transformer_joint_training, gene_token_cross_attention_joint_training"
     )
 
-
-def _sanitize_joint_cfg_for_inference(joint_cfg: dict) -> dict:
-    """Return a copy of joint_cfg with constructor-only preload ckpts disabled.
-
-    During reconstruction we load the full state dict from the target checkpoint,
-    so constructor-side optional preload checkpoints are unnecessary and can
-    stall if paths point to slow/unavailable network mounts.
-    """
-    cfg = dict(joint_cfg)
-    cfg["diffusion_ckpt"] = None
-    cfg["encoder_ckpt"] = None
-    return cfg
 
 def load_checkpoint(
     checkpoint_path: str,
@@ -1599,7 +1700,7 @@ def main(
         gene_patient_ids.update(conditioning_ids_list)
 
     _norm_stats = getattr(model, "_norm_stats", None)
-    gene_data, gene_names = load_gene_expression(
+    gene_store = load_gene_expression_store(
         gene_csv_path,
         sorted(gene_patient_ids),
         patient_col=joint_cfg_ckpt.get("patient_col", "Patient_ID"),
@@ -1626,7 +1727,7 @@ def main(
         logger.info(f"\nProcessing tile patient {patient_id} ({len(tiles_list)} tiles)")
 
         cond_ids_for_tiles = conditioning_ids_list if conditioning_ids_list is not None else [patient_id]
-        cond_ids_for_tiles = [pid for pid in cond_ids_for_tiles if pid in gene_data]
+        cond_ids_for_tiles = [pid for pid in cond_ids_for_tiles if gene_store.has_patient(pid)]
         if len(cond_ids_for_tiles) == 0:
             logger.warning(f"No matching gene data for conditioning patients (tile patient={patient_id}), skipping")
             continue
@@ -1637,7 +1738,19 @@ def main(
 
         with zipfile.ZipFile(orig_zip_path, 'w') as zf_orig:
             for cond_idx, cond_patient_id in enumerate(cond_ids_for_tiles):
-                genes_np = gene_data[cond_patient_id]
+                # For self-conditioning, use sample-level match from tile ZIP when available.
+                sample_hint_global: Optional[str] = None
+                if conditioning_ids_list is None and len(tiles_list) > 0:
+                    first_tile_path = tiles_list[0][0]
+                    if isinstance(first_tile_path, str) and "::" in first_tile_path:
+                        sample_hint_global = Path(first_tile_path.split("::", 1)[0]).name
+
+                genes_np = gene_store.get_vector(cond_patient_id, sample_hint=sample_hint_global)
+                if genes_np is None:
+                    logger.warning(
+                        f"No genomic vector found for conditioning patient {cond_patient_id}; skipping"
+                    )
+                    continue
                 genomic_tensor = torch.from_numpy(genes_np).to(device_obj, dtype=torch.float32)
 
                 if conditioning_ids_list is None:
@@ -1654,7 +1767,7 @@ def main(
                         if seed is not None:
                             tile_seed = int(
                                 hashlib.sha256(
-                                    f"{seed}_{patient_id}_{cond_patient_id}_{tile_name}".encode()
+                                    f"{seed}_{patient_id}_{tile_name}".encode()
                                 ).hexdigest(),
                                 16,
                             ) % (2**32)
@@ -1675,7 +1788,10 @@ def main(
                                 # inversion so that x_T is self-consistent with their
                                 # genomic prior.  The decoding step uses genomic_tensor
                                 # (the conditioning/target patient) to apply their style.
-                                tile_genes_np = gene_data.get(patient_id)
+                                sample_hint_tile: Optional[str] = None
+                                if isinstance(tile_path, str) and "::" in tile_path:
+                                    sample_hint_tile = Path(tile_path.split("::", 1)[0]).name
+                                tile_genes_np = gene_store.get_vector(patient_id, sample_hint=sample_hint_tile)
                                 genomic_tile_tensor = (
                                     torch.from_numpy(tile_genes_np).to(device_obj, dtype=torch.float32)
                                     if tile_genes_np is not None

@@ -5,7 +5,6 @@
 from __future__ import annotations
 
 import argparse
-import copy
 import os
 from pathlib import Path
 
@@ -30,47 +29,10 @@ except ImportError:  # pragma: no cover
         build_gene_token_cross_attention_conf,
     )
 
-
-def _deep_update(base: dict, overrides: dict) -> dict:
-    merged = copy.deepcopy(base)
-    for key, value in overrides.items():
-        if isinstance(value, dict) and isinstance(merged.get(key), dict):
-            merged[key] = _deep_update(merged[key], value)
-        else:
-            merged[key] = value
-    return merged
-
-
-def _resolve_config_paths(config_dict: dict, repo_root: Path) -> dict:
-    """Recursively resolve relative paths in config against repo_root."""
-    def _resolve_path(value: str) -> str:
-        repo_candidate = (repo_root / value).resolve()
-        normalized = value[2:] if value.startswith("./") else value
-
-        if normalized.startswith(("data/", "dataframes/", "experiments/")):
-            parent_candidate = (repo_root.parent / normalized).resolve()
-            if parent_candidate.exists() or not repo_candidate.exists():
-                return str(parent_candidate)
-
-        return str(repo_candidate)
-
-    if isinstance(config_dict, dict):
-        for key, value in config_dict.items():
-            if isinstance(value, dict):
-                _resolve_config_paths(value, repo_root)
-            elif isinstance(value, list):
-                for item in value:
-                    if isinstance(item, dict):
-                        _resolve_config_paths(item, repo_root)
-            elif isinstance(value, str):
-                if not value.startswith('/') and (
-                    value.startswith('./')
-                    or value.startswith('../')
-                    or any(part in value for part in ['data/', 'experiments/', 'dataframes/', 'slurm/', 'src/'])
-                ):
-                    config_dict[key] = _resolve_path(value)
-
-    return config_dict
+try:
+    from utils.config_utils import resolve_config_paths as _resolve_config_paths, deep_update as _deep_update
+except ImportError:  # pragma: no cover
+    from src.utils.config_utils import resolve_config_paths as _resolve_config_paths, deep_update as _deep_update  # type: ignore[import-not-found]
 
 
 def run_gene_token_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
@@ -185,8 +147,7 @@ def main() -> None:
         default="gene_token_cross_attention_joint_training",
         help=(
             "Config section name whose values override gene_token_transformer_joint_training. "
-            "Default: gene_token_cross_attention_joint_training. "
-            "Use 'gene_token_cross_attention_scratch_training' for the from-scratch variant."
+            "Default: gene_token_cross_attention_joint_training."
         ),
     )
     args = parser.parse_args()
