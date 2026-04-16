@@ -25,7 +25,7 @@ pip install numpy pillow scikit-image matplotlib seaborn
 Evaluate reconstruction quality for all matching patients:
 
 ```bash
-python -m quality_assurance.evaluate_reconstruction \
+python -m src.quality_assurance.evaluate_reconstruction \
     --original-zip-dir /path/to/original_tiles \
     --reconstructed-zip-dir /path/to/reconstructed_tiles \
     --output-dir ./evaluation_results \
@@ -35,7 +35,7 @@ python -m quality_assurance.evaluate_reconstruction \
 For specific patients:
 
 ```bash
-python -m quality_assurance.evaluate_reconstruction \
+python -m src.quality_assurance.evaluate_reconstruction \
     --original-zip-dir /path/to/original_tiles \
     --reconstructed-zip-dir /path/to/reconstructed_tiles \
     --patient-ids patient-id-number \
@@ -76,9 +76,11 @@ quality_assurance/
 ├── __init__.py              # Package exports
 ├── metrics.py               # MSE, PSNR, SSIM implementations
 ├── evaluate_reconstruction.py  # Main evaluation script
-├── visualization.py         # Plotting functions
+├── run_evaluation.py        # Config-driven evaluation entrypoint
 └── README.md               # This file
 ```
+
+Plotting functions are implemented in `src/visualization/reconstruction_eval.py`.
 
 # Reconstruction Quality Evaluation Guide
 
@@ -125,10 +127,10 @@ evaluation:
 source Master-Thesis-Repository/.venv/bin/activate
 
 # Run evaluation with config
-python src/quality_assurance/run_evaluation.py src/config.yaml
+python -m src.quality_assurance.run_evaluation src/config.yaml
 
 # Or with quiet mode
-python src/quality_assurance/run_evaluation.py src/config.yaml --quiet
+python -m src.quality_assurance.run_evaluation src/config.yaml --quiet
 ```
 
 ### 3. Check Results
@@ -181,7 +183,7 @@ The evaluation automatically handles **three matching strategies** for genomic r
 You can also run evaluation programmatically:
 
 ```python
-from quality_assurance import run_evaluation, load_config
+from src.quality_assurance import run_evaluation, load_config
 
 config = load_config("src/config.yaml")
 run_evaluation(config, verbose=True)
@@ -190,7 +192,7 @@ run_evaluation(config, verbose=True)
 Or use the evaluator directly:
 
 ```python
-from quality_assurance import ReconstructionEvaluator
+from src.quality_assurance import ReconstructionEvaluator
 
 evaluator = ReconstructionEvaluator(
     original_zip_dir="/path/to/original",
@@ -262,7 +264,7 @@ evaluation:
 ```
 
 ```bash
-python src/quality_assurance/run_evaluation.py src/config.yaml
+python -m src.quality_assurance.run_evaluation src/config.yaml
 ```
 
 Results:

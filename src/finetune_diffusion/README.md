@@ -26,52 +26,13 @@ Transform patient-level genomic feature vectors (e.g., RNA-seq embeddings) into 
 
 ---
 
-## 1. Projection Head Training
+## 1. Status and Scope
 
-**Script:** `projection_head_genomic.py`
+This module is maintained as a **legacy workflow**. The current repository keeps:
+- `finetune_diffusion_with_genomic.py` for diffusion fine-tuning
+- `sample_tiles_from_genomic.py` for sampling/inference
 
-### Purpose
-Train a learnable MLP to map genomic feature vectors into the conditioning space expected by the pretrained MoPaDi diffusion model. This alignment ensures genomic features can effectively guide image generation.
-
-### Training Objective
-**Distribution Matching** (recommended): The projection head learns to transform genomic features so their distribution matches the diffusion model's expected conditioning distribution (conds_mean, conds_std).
-
-Loss function:
-```
-L = L_mean + L_var + L_diversity
-  = MSE(batch_mean, conds_mean) 
-  + MSE(batch_var, conds_std)
-  + ReLU(τ - mean_pairwise_distance)
-```
-
-### Input / Output
-
-| Type | Description |
-|------|-------------|
-| **Input** | Genomic H5 files: `{patient_id}.h5` with `feats` dataset (512-dim vectors) |
-| **Input** | Pretrained diffusion checkpoint (to extract target mean/std) |
-| **Output** | `projection_head_best.pt` - trained projection head weights |
-| **Output** | `projection_head_config.json` - architecture configuration |
-
-### Example Commands
-
-```bash
-# Basic training with distribution matching
-python projection_head_genomic.py \
-    --mode distribution_matching \
-    --genomic-h5-dir ./genomic_features \
-    --lr 1e-4
-
-# With custom architecture
-python projection_head_genomic.py \
-    --mode distribution_matching \
-    --genomic-h5-dir ./genomic_features \
-    --epochs 100
-```
-
-### Expected Training Time
-- ~5-10 minutes for 50 epochs on a single GPU
-- Loss should converge to ~0.02-0.05
+Older references to a standalone `projection_head_genomic.py` script are obsolete in this repo.
 
 ---
 
@@ -104,14 +65,14 @@ where `cond = normalize(ProjectionHead(genomic))`.
 
 ```bash
 # Basic fine-tuning
-python finetune_diffusion_with_genomic.py \
+python -m src.finetune_diffusion.finetune_diffusion_with_genomic \
     --projection-head-ckpt ./projection_head_best.pt \
     --genomic-h5-dir ./genomic_features \
     --tiles-zip-dir ./tile_zips \
     --lr 5e-6
 
 # With more tiles per patient and gradient accumulation
-python finetune_diffusion_with_genomic.py \
+python -m src.finetune_diffusion.finetune_diffusion_with_genomic \
     --projection-head-ckpt ./projection_head_best.pt \
     --genomic-h5-dir ./genomic_features \
     --tiles-zip-dir ./tile_zips \
@@ -155,14 +116,14 @@ Generate synthetic tile images from genomic feature vectors using the fine-tuned
 
 ```bash
 # Mode 1: Random noise generation (fully synthetic)
-python sample_tiles_from_genomic.py \
+python -m src.finetune_diffusion.sample_tiles_from_genomic \
     --checkpoint ./diffusion_genomic_best.pt \
     --genomic-h5-dir ./genomic_features \
     --output-dir ./generated_tiles \
     --num-samples-per-patient 4
 
 # Mode 2: Encode-decode (preserve structure from real tiles)
-python sample_tiles_from_genomic.py \
+python -m src.finetune_diffusion.sample_tiles_from_genomic \
     --checkpoint ./diffusion_genomic_best.pt \
     --genomic-h5-dir ./genomic_features \
     --tiles-zip-dir ./tile_zips \
@@ -171,7 +132,7 @@ python sample_tiles_from_genomic.py \
     --num-samples-per-patient 4
 
 # Sample specific patients only
-python sample_tiles_from_genomic.py \
+python -m src.finetune_diffusion.sample_tiles_from_genomic \
     --checkpoint ./diffusion_genomic_best.pt \
     --genomic-h5-dir ./genomic_features \
     --output-dir ./generated_tiles \

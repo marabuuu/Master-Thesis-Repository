@@ -1,8 +1,10 @@
-# python run_pipeline.py --config src/config.yaml --stage joint_training
+# Unified pipeline config.
+# Example: python run_pipeline.py --config src/config.yaml --stage joint_training
+# Note: `encoding`, `training`, and `sampling` stages are currently placeholders in run_pipeline.py.
 preprocessing:
   zip_dir: ../data/TCGA           
   roi_dir: ../data/annotations-BRCA     
-  save_dir: ../data/BRCA-tumor-tiles-corrected  # Note: absolute paths for remote mount compatibility/ cou
+  save_dir: ../data/BRCA-tumor-tiles-corrected
   target_mpp: 0.5                        # scale annotations into this pixel space
   native_slide_mpp: 0.25                 # microns/pixel of original slide
   num_workers: 8
@@ -12,22 +14,22 @@ preprocessing:
   annotation_buffer: 0.0                 # expand annotation for center test
 
 encoding:
-  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
-  output_dir: ./experiments/20260306_FOXA1_finetuning/encoding  # Note: absolute path for remote mount compatibility
-  gene_list_path: ./experiments/20260302_gene_subselection/encoding/gene_list.txt  # Note: absolute path for remote mount compatibility
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  output_dir: ./experiments/20260306_FOXA1_finetuning/encoding
+  gene_list_path: ./experiments/20260302_gene_subselection/encoding/gene_list.txt
   target_genes: 512
   min_nonzero: 5
   corr_threshold: 0.90
   force_pam50: true
-  pam50_path: ../dataframes/PAM50_gene_list.txt  # Note: absolute path for remote mount compatibility
+  pam50_path: ../dataframes/PAM50_gene_list.txt
   patient_col: Patient_ID
   subtype_col: Majority_Subtype_mRNA
 
 training:
-  diffusion_ckpt: ./experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt  # Note: absolute path for remote mount compatibility
-  genomic_h5_dir: ./experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train  # Note: absolute path for remote mount compatibility
-  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected  # Note: absolute path for remote mount compatibility
-  out_dir: ./experiments/20260303_finetune_vae/try  # Note: absolute path for remote mount compatibility
+  diffusion_ckpt: ./experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
+  genomic_h5_dir: ./experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+  out_dir: ./experiments/20260303_finetune_vae/try
   epochs: 50
   batch_size: 2
   val_fraction: 0.1
@@ -134,14 +136,14 @@ cross_attention_joint_training:
   counterfactual_zero_threshold: 1e-4
 
 extract_joint_latents:
-  ckpt: ./experiments/20260410_gtca_nocfg/joint/last.ckpt  # Note: absolute path for remote mount compatibility
-  out_dir: ./experiments/20260410_gtca_nocfg/joint_latents  # Note: absolute path for remote mount compatibility
+  ckpt: ./experiments/20260410_gtca_nocfg/joint/last.ckpt
+  out_dir: ./experiments/20260410_gtca_nocfg/joint_latents
   split: all                              # train, val, test, or all
   section: gene_token_cross_attention_joint_training
 
 visualize_latents:
-  latent_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5  # Note: absolute path for remote mount compatibility
-  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
+  latent_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json  # optional: required if using split-specific latent_dir
   output_dir: ./experiments/20260416_mopadi_genomic_scratch/latent_plots
   patient_col: Patient_ID

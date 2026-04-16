@@ -353,9 +353,6 @@ python -m src.reconstruction.investigate_noising \
 
 ## Next Steps
 
-### Random Noise Mode
-Currently, the `--mode random_noise` is a placeholder. Once finalized, it will generate tiles purely from random noise + genomic conditioning (without requiring tile inputs).
-
 ### Enhanced Investigation
 Future improvements could include:
 - Step-by-step diffusion sampling visualization (not just interpolation)
@@ -366,6 +363,5 @@ Future improvements could include:
 
 ## References
 
-- **Joint Training**: See [JOINT_TRAINING_SUMMARY.md](../joint_training/JOINT_TRAINING_SUMMARY.md)
 - **Model Architecture**: See [model.py](../joint_training/model.py) `JointLitModel` class
 - **Dataset Format**: See [dataset.py](../joint_training/dataset.py) `GenomicTileDataset` class

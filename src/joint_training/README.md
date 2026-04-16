@@ -361,7 +361,7 @@ trainer.fit(model, ckpt_path="experiments/joint_training/joint/last.ckpt")
 
 **Load for inference**:
 ```python
-from joint_training.model import JointLitModel
+from src.joint_training.model import JointLitModel
 model = JointLitModel.load_from_checkpoint(
     "path/to/checkpoint.ckpt",
     conf=conf,
@@ -399,7 +399,7 @@ with torch.no_grad():
 ### Extract Latent Features
 
 ```python
-from joint_training.train import extract_latents
+from src.joint_training.train import extract_latents
 
 latent_dir = extract_latents(
     joint_cfg,

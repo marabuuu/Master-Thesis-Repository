@@ -332,7 +332,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "gtca_training", "gtca_nocfg", "gtca_scratch", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
