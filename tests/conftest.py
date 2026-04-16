@@ -3,11 +3,20 @@
 
 import os
 import tempfile
+import sys
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
 import pytest
 import torch
+
+
+# Ensure the workspace-local mopadi source tree is importable during tests.
+_repo_root = Path(__file__).resolve().parents[1]
+_mopadi_src = (_repo_root.parent / "mopadi" / "src").resolve()
+if _mopadi_src.exists() and str(_mopadi_src) not in sys.path:
+    sys.path.insert(0, str(_mopadi_src))
 
 
 # ---------------------------------------------------------------------------

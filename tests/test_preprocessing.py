@@ -53,7 +53,7 @@ class TestPreprocessFunctions:
     def test_log1p_zscore_produces_zero_mean_unit_var(self, raw_gene_expression_df):
         result = preprocess_log1p_zscore(raw_gene_expression_df)
         col_means = result.mean(axis=0)
-        col_stds = result.std(axis=0)
+        col_stds = result.std(axis=0, ddof=0)
         np.testing.assert_array_almost_equal(col_means.values, 0.0, decimal=5)
         # Columns with non-zero variance should have std ≈ 1
         mask = col_stds > 0

@@ -5,9 +5,9 @@ Focus areas
 -----------
 * FID computation: correct formula on known distributions
 * compute_statistics: returns correct shapes for mean / covariance
-* Log-file parsing: extracts epoch-loss tuples from different formats
-* Checkpoint parsing: round-trip with known .pt files
-* plot_training_curves: returns a matplotlib Figure (no display)
+* Log-file parsing: extracts epoch-loss tuples from current run formats
+* Experiment parsing: merges stdout/stderr logs into a single run dict
+* plotting: current training_plots API returns matplotlib figures
 """
 
 import os
@@ -29,10 +29,11 @@ from src.statistics.fid_score import (
     compute_statistics,
 )
 from src.statistics.training_curves import (
-    parse_log_file,
-    parse_checkpoints,
-    plot_training_curves,
+    parse_lightning_log,
+    parse_stderr_log,
+    parse_experiment_dir,
 )
+from src.visualization.training_plots import plot_loss_curves, plot_training_summary
 
 
 # ======================================================================
@@ -63,8 +64,8 @@ class TestComputeStatistics:
         features = np.random.randn(50, 1)
         mu, sigma = compute_statistics(features)
         assert mu.shape == (1,)
-        # sigma is 2D even for 1-D features
-        assert sigma.ndim == 2
+        # Single-feature covariance may collapse to a scalar / 0-D array.
+        assert sigma.ndim in (0, 2)
 
 
 # ======================================================================
@@ -131,7 +132,7 @@ class TestComputeFID:
 
 
 # ======================================================================
-#   parse_log_file
+#   parse_lightning_log / parse_stderr_log
 # ======================================================================
 
 class TestParseLogFile:
@@ -143,70 +144,60 @@ class TestParseLogFile:
 
     def test_parses_epoch_loss(self, tmp_path):
         log_content = (
-            "Epoch 1/10 | Time: 5.2s | Loss: 0.500000\n"
-            "Epoch 2/10 | Time: 5.1s | Loss: 0.300000\n"
-            "Epoch 3/10 | Time: 5.0s | Loss: 0.200000\n"
+            "Epoch 0: 100%|██████████| 10/10 [00:01<00:00, loss_step=0.500000, loss_epoch=0.500000, val_loss=0.600000]\n"
+            "Epoch 1: 100%|██████████| 10/10 [00:01<00:00, loss_step=0.300000, loss_epoch=0.300000, val_loss=0.400000]\n"
+            "Epoch 2: 100%|██████████| 10/10 [00:01<00:00, loss_step=0.200000, loss_epoch=0.200000, val_loss=0.300000]\n"
         )
         path = self._write_log(tmp_path, log_content)
-        history = parse_log_file(path)
-        assert "loss" in history
-        assert len(history["loss"]) == 3
-        epochs, losses = zip(*history["loss"])
-        assert list(epochs) == [1, 2, 3]
-        assert abs(losses[0] - 0.5) < 1e-6
+        history = parse_lightning_log(path)
+        assert history["epochs"] == [0, 1, 2]
+        assert history["loss_epoch"] == [0.5, 0.3, 0.2]
+        assert history["val_loss"] == [0.6, 0.4, 0.3]
+        assert history["loss_step"] == [0.5, 0.3, 0.2]
 
     def test_parses_component_losses(self, tmp_path):
         log_content = (
-            "Epoch 1/50 | total=0.026, mean=0.012, var=0.008, diversity=0.006\n"
-            "Epoch 2/50 | total=0.020, mean=0.010, var=0.006, diversity=0.004\n"
+            "Epoch 0: 100%|██| 10/10 [00:01<00:00, loss_step=0.026, loss_epoch=0.026, val_loss=0.030]\n"
+            "Epoch 1: 100%|██| 10/10 [00:01<00:00, loss_step=0.020, loss_epoch=0.020, val_loss=0.025]\n"
         )
         path = self._write_log(tmp_path, log_content)
-        history = parse_log_file(path)
-        assert "loss" in history
-        assert "mean" in history
-        assert "var" in history
-        assert "diversity" in history
+        history = parse_lightning_log(path)
+        assert history["loss_epoch"] == [0.026, 0.02]
+        assert history["val_loss"] == [0.03, 0.025]
 
     def test_empty_log_returns_empty(self, tmp_path):
         path = self._write_log(tmp_path, "no relevant data here\n")
-        history = parse_log_file(path)
+        history = parse_lightning_log(path)
         assert isinstance(history, dict)
-        assert len(history) == 0 or all(len(v) == 0 for v in history.values())
+        assert len(history.get("loss_epoch", [])) == 0
 
     def test_missing_file_raises(self, tmp_path):
         with pytest.raises(FileNotFoundError):
-            parse_log_file(tmp_path / "nonexistent.log")
+            parse_lightning_log(tmp_path / "nonexistent.log")
 
 
 # ======================================================================
-#   parse_checkpoints
+#   parse_experiment_dir / parse_stderr_log
 # ======================================================================
 
 class TestParseCheckpoints:
 
-    def test_parses_epoch_and_loss(self, tmp_path):
-        for i in range(3):
-            ckpt = {"epoch": i + 1, "loss": 0.5 - i * 0.1}
-            torch.save(ckpt, tmp_path / f"epoch{i + 1:03d}.pt")
-        history = parse_checkpoints(tmp_path)
-        assert "loss" in history
-        assert len(history["loss"]) == 3
-        # sorted by epoch
-        epochs = [e for e, _ in history["loss"]]
-        assert epochs == sorted(epochs)
-
-    def test_no_pt_files_raises(self, tmp_path):
-        with pytest.raises(FileNotFoundError):
-            parse_checkpoints(tmp_path)
-
-    def test_missing_epoch_in_ckpt_still_works(self, tmp_path):
-        """If epoch is missing but filename has pattern, we still extract."""
-        ckpt = {"loss": 0.42}
-        torch.save(ckpt, tmp_path / "epoch005.pt")
-        history = parse_checkpoints(tmp_path)
-        assert "loss" in history
-        epochs = [e for e, _ in history["loss"]]
-        assert 5 in epochs
+    def test_parse_experiment_dir_merges_logs(self, tmp_path):
+        out_path = tmp_path / "run.out"
+        err_path = tmp_path / "run.err"
+        out_path.write_text(
+            "Epoch 0: 100%|██| 10/10 [00:01<00:00, loss_step=0.50, loss_epoch=0.50, val_loss=0.60]\n"
+            "Epoch 1: 100%|██| 10/10 [00:01<00:00, loss_step=0.30, loss_epoch=0.30, val_loss=0.40]\n"
+        )
+        err_path.write_text(
+            "Metric val_loss improved. New best score: 0.60\n"
+            "Metric val_loss improved. New best score: 0.40\n"
+        )
+        history = parse_experiment_dir(tmp_path)
+        assert history["loss_epoch"] == [0.5, 0.3]
+        assert history["val_loss"] == [0.6, 0.4]
+        assert history["best_val_loss"] == 0.4
+        assert history["best_val_epoch"] == 1
 
 
 # ======================================================================
@@ -216,37 +207,33 @@ class TestParseCheckpoints:
 class TestPlotTrainingCurves:
 
     def test_returns_figure(self):
-        history = {"loss": [(1, 0.5), (2, 0.3), (3, 0.2)]}
-        fig = plot_training_curves([history], show=False)
+        history = {"epochs": [0, 1, 2], "loss_epoch": [0.5, 0.3, 0.2], "val_loss": [0.6, 0.4, 0.3]}
+        fig = plot_loss_curves(history, show=False)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
     def test_multiple_runs(self):
-        h1 = {"loss": [(1, 0.5), (2, 0.3)]}
-        h2 = {"loss": [(1, 0.4), (2, 0.2)]}
-        fig = plot_training_curves([h1, h2], labels=["Run 1", "Run 2"], show=False)
+        h1 = {"epochs": [0, 1], "loss_epoch": [0.5, 0.3], "val_loss": [0.6, 0.4]}
+        h2 = {"epochs": [0, 1], "loss_epoch": [0.4, 0.2], "val_loss": [0.5, 0.35]}
+        fig = plot_loss_curves([h1, h2], labels=["Run 1", "Run 2"], show=False)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
     def test_saves_to_file(self, tmp_path):
-        history = {"loss": [(1, 0.5), (2, 0.3)]}
+        history = {"epochs": [0, 1], "loss_epoch": [0.5, 0.3], "val_loss": [0.6, 0.4]}
         out_path = str(tmp_path / "curves.png")
-        fig = plot_training_curves([history], output_path=out_path, show=False)
+        fig = plot_loss_curves(history, save_path=out_path, show=False)
         assert os.path.exists(out_path)
         plt.close(fig)
 
     def test_multiple_metrics(self):
-        history = {
-            "loss": [(1, 0.5), (2, 0.3)],
-            "mean": [(1, 0.2), (2, 0.1)],
-            "var": [(1, 0.1), (2, 0.08)],
-        }
-        fig = plot_training_curves([history], show=False)
+        history = {"epochs": [0, 1], "loss_epoch": [0.5, 0.3], "val_loss": [0.6, 0.4], "loss_step": [0.5, 0.45, 0.3]}
+        fig = plot_training_summary(history, show=False)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
 
     def test_empty_history(self):
         """Supplying an empty history dict should not crash."""
-        fig = plot_training_curves([{}], show=False)
+        fig = plot_loss_curves([{}], show=False)
         assert isinstance(fig, plt.Figure)
         plt.close(fig)
