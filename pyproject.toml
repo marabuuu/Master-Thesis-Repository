@@ -28,15 +28,27 @@ dependencies = [
     "webdataset>=1.0.2",
     "dotenv>=0.9.9",
     "lpips>=0.1.4",
-    "transformers>=4.57.3",
-    "timm>=1.0.22",
+    "transformers>=4.48.1",
+    "timm>=1.0.14",
     "plotly>=6.5.0",
     "datasets>=4.4.2",
+    "mopadi",
+    "shapely>=2.1.2",
+    "openslide-python>=1.4.3",
+    "rtree>=1.4.1",
+    "pytest>=7.4.4",
+    "lifelines>=0.30.3",
+    "gudhi>=3.8.0",
+    "pot>=0.9.3",
 ]
 
 
 [tool.uv]
 package = true
+
+[tool.uv.sources]
+mopadi = { path = "../mopadi" }
+TopoCellGen = { path = "../TopoCellGen"}
 
 [build-system]
 requires = ["setuptools>=61.0", "wheel"]

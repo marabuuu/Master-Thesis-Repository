@@ -1,36 +1,655 @@
-data:
-  csv_path: '../../data/brca_gene_expression_with_subtypes.csv'
-  id_column: 'Patient_ID'
-  columns_to_drop: ['Patient_ID', 'Majority_Subtype_mRNA']
+# Unified pipeline config.
+# Example: python run_pipeline.py --config src/config.yaml --stage joint_training
+# Note: `encoding`, `training`, and `sampling` stages are currently placeholders in run_pipeline.py.
+preprocessing:
+  zip_dir: ../data/TCGA           
+  roi_dir: ../data/annotations-BRCA     
+  save_dir: ../data/BRCA-tumor-tiles-corrected
+  target_mpp: 0.5                        # scale annotations into this pixel space
+  native_slide_mpp: 0.25                 # microns/pixel of original slide
+  num_workers: 8
+  plots: true                            # produce diagnostic plots
+  area_threshold: 0.6                    # overlap threshold for selection
+  selection_mode: overlap                # choices: center, overlap, both
+  annotation_buffer: 0.0                 # expand annotation for center test
 
-model:
-  latent_dim: 1024
-  hidden_dim: [2048, 1024]
+encoding:
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  output_dir: ./experiments/20260306_FOXA1_finetuning/encoding
+  gene_list_path: ./experiments/20260302_gene_subselection/encoding/gene_list.txt
+  target_genes: 512
+  min_nonzero: 5
+  corr_threshold: 0.90
+  force_pam50: true
+  pam50_path: ../dataframes/PAM50_gene_list.txt
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
 
 training:
-  num_epochs: 100
-  batch_size: 128
-  learning_rate: 0.001
+  diffusion_ckpt: ./experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
+  genomic_h5_dir: ./experiments/20260126_trying_to_get_the_whole_picture_with_existing_diffusion_model_checkpoint_but_without_properly_handling_genomics/full_train_512/mopadi_features/train
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+  out_dir: ./experiments/20260303_finetune_vae/try
+  epochs: 50
+  batch_size: 2
+  val_fraction: 0.1
+  early_stopping_patience: 5
+  lr: 1e-5
 
-output:
-  encoded_data_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.npy'
-  training_log_path: '../../vae_output/vae_training_history.csv'
-  encoded_csv_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.csv'
-  encoded_h5ad_path: '../../vae_output/brca_gene_expression_with_subtypes_vae_encoded_data.h5ad'
+joint_training:
+  # ── Data ──────────────────────────────────────────────────────────────
+  csv_path: ../dataframes/brca_gene_expression.csv
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA       # non-numeric column to drop from gene data
+  gene_list_path: null                    # optional: path to .txt with one gene per line
+  max_tiles_per_patient: null             # null = use all tiles
+  val_fraction: 0.1
+  test_fraction: 0.1                      # held out entirely for later evaluation
 
-feature_selection:
-  feats_dir: "../../mopadi_features/train/"
-  mil_weights: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/fold_0/PMA_mil.pth"
-  clini_table: "../../mopadi_features/clinical_table.csv"
-  target_label: "Majority_Subtype_mRNA"
-  target_dict: {"LumA": 0, "Basal": 1}
-  n_top_features: 100
-  output_csv: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient.csv"
-  output_h5: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient_features.h5"
-  output_meta_csv: "../../mopadi/checkpoints/experiment_name/mil_classifier_Majority_Subtype_mRNA/crossval/top_features_per_patient_features_meta.csv"
-  fname_index: 3
-  device: "cuda:0"
-  classifier_params:
-    dim: 512
-    num_heads: 8
-    num_seeds: 4
+  # ── Output ────────────────────────────────────────────────────────────
+  out_dir: ./experiments/20260331_joint_training
+  latent_dir: null                        # where to save h5 latent features (default: out_dir/latents)
+
+  # ── Genomic Encoder ──────────────────────────────────────────────────
+  latent_dim: 512                         # encoder latent dimension
+  vae_hidden_dims: [2048, 1024]           # encoder hidden layers
+  vae_dropout: 0.2                        # dropout in encoder
+  encoder_ckpt: null                      # optional: pre-trained encoder checkpoint
+
+  # ── Projection Head ───────────────────────────────────────────────────
+  cond_dim: 512                           # must match UNet embed_channels
+  proj_hidden_dim: 512
+  proj_layers: 2
+  proj_dropout: 0.1
+
+  # ── Diffusion UNet (mopadi architecture) ──────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_num_res_blocks: 2
+  T: 1000                                 # diffusion timesteps
+  T_eval: 20                              # DDIM steps for sampling / visualization
+  sample_size: 8                          # images to generate for TensorBoard
+  diffusion_ckpt: null                    # optional: pre-trained mopadi checkpoint
+
+  # ── Training ──────────────────────────────────────────────────────────
+  batch_size: 2
+  lr: 1e-4                                # default LR for all components
+  encoder_lr: 1e-4                        # separate LR for VAE encoder (if using pre-trained ckpt)
+  proj_lr: 3e-4                           # projection head LR
+  unet_lr: 1e-4                           # UNet LR (lower to e.g. 1e-5 if using a pre-trained diffusion ckpt)
+  optimizer: adam                          # adam | adamw
+  weight_decay: 0.0
+  warmup_steps: 500
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  accumulate_grad_batches: 1
+  num_workers: 4
+  prefetch_factor: 2
+  val_batch_size: 4
+  val_num_workers: 6
+  val_prefetch_factor: 2
+  fp16: false
+  seed: 42
+  gpus: [0]
+
+  # ── Scheduling (mopadi-style: sample-count based) ─────────────────────
+  epochs: 100                             # max epochs (safety cap)
+  total_samples: 200000000                # training duration in total samples seen
+  steps_per_epoch: 5000                   # batches per PL epoch
+  save_every_samples: 200000              # checkpoint frequency
+  save_top_k: 3                           # keep top-k periodic checkpoints + last.ckpt
+  reconstruct_every_samples: 50000        # sample visualization frequency
+
+  # ── Validation Frequency Tuning ───────────────────────────────────────
+  # Reduce validation overhead for faster training with more epochs
+  val_check_interval: 5                   # validate every N epochs (1=every epoch, 5=every 5 epochs)
+  limit_val_batches: 0.3                  # fraction of val set to use (1.0=full, 0.3=30%)
+
+cross_attention_joint_training:
+  # Override-only section: values are merged on top of
+  # joint_training by src/cross_attention_joint_training/train.py.
+  out_dir: ./experiments/20260331_cross_attention_training
+
+  # LR ratio tuning: UNet lower than cross-attn so zero-init layers warm up first
+  unet_lr: 5e-6
+  cross_attn_lr: 1e-4    # patch_proj / k_proj / v_proj / attn / out_proj (zero-init, need higher LR)
+  encoder_lr: 1e-4
+  proj_lr: 3e-4
+  accumulate_grad_batches: 4   # effective batch: 2 x 4 = 8
+
+  cross_attention:
+    heads: 4
+    dim_per_head: 64
+    patch_size: 16        # non-overlapping patch side (must divide img_size evenly)
+
+  # Dropouts to force conditioning reliance (training only)
+  xT_dropout_prob: 0.3
+  cond_dropout_prob: 0.05
+  cond_feature_dropout: 0.05
+
+  # Counterfactual conditioning objective
+  counterfactual_loss_weight: 0.2
+  counterfactual_margin: 0.1   # ~10-30% of typical diffusion loss range (0.05-0.3)
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
+
+extract_joint_latents:
+  ckpt: ./experiments/20260410_gtca_nocfg/joint/last.ckpt
+  out_dir: ./experiments/20260410_gtca_nocfg/joint_latents
+  split: all                              # train, val, test, or all
+  section: gene_token_cross_attention_joint_training
+
+visualize_latents:
+  latent_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json  # optional: required if using split-specific latent_dir
+  output_dir: ./experiments/20260416_mopadi_genomic_scratch/latent_plots
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA
+
+dataset_statistics:
+  # ── Input ─────────────────────────────────────────────────────────────────
+  # Clinical CSV containing patient-level metadata and survival endpoints.
+  # brca_subtypes.csv has: ajcc_pathologic_tumor_stage, menopause_status,
+  # Majority_Subtype_mRNA, OS, OS.time, and other TCGA clinical columns.
+  clinical_csv: ../dataframes/brca_subtypes.csv
+  patient_col: bcr_patient_barcode
+  subtype_col: Majority_Subtype_mRNA
+  stage_col: ajcc_pathologic_tumor_stage
+  menopause_col: menopause_status
+  os_time_col: OS.time            # overall survival time in days
+  os_event_col: OS                # 1 = event (death), 0 = censored
+
+  # ── Output ────────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260408_dataset_statistics
+
+  # ── Plots to generate ─────────────────────────────────────────────────────
+  plots:
+    - tumor_stage_distribution    # AJCC stage horizontal bar chart
+    - menopause_distribution      # menopause status horizontal bar chart
+    - subtype_distribution        # PAM50 subtype pie chart
+    - kaplan_meier_by_subtype     # KM overall survival curves per subtype
+
+  # ── Styling ───────────────────────────────────────────────────────────────
+  # cmap_categorical must match the latent-space pipeline (romaO) so that
+  # PAM50 subtype colours are identical across all pipeline figures.
+  cmap_categorical: romaO
+  cmap_sequential: batlow
+  figsize_distributions: [10, 6]  # bar charts
+  figsize_pie: [8, 8]             # subtype pie
+  figsize_km: [10, 7]             # Kaplan-Meier
+  dpi: 200
+  min_patients_km: 10             # skip subtypes with fewer patients in KM
+
+training_stats:
+  logdir: ./experiments/20260410_gtca_nocfg/joint  # where TensorBoard logs are saved during training
+  output_dir: ./experiments/20260410_gtca_nocfg/training_stats
+  plots:
+    - loss_curves          # epoch-level train & val loss
+    - batch_trajectory     # per-step loss across all epochs
+    - train_val_comparison # train vs val with gap shading
+    - early_stopping       # val loss with best-epoch marker
+    - summary              # multi-panel figure
+  figsize: [16, 12]        # for summary, individual plots auto-size
+  cmap_categorical: batlowS   # Crameri colormap for categorical
+  cmap_sequential: batlow     # Crameri colormap for sequential
+
+gene_token_transformer_joint_training:
+  # Data
+  csv_path: ../dataframes/brca_gene_expression.csv
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA
+  gene_list_path: ./experiments/20260302_gene_subselection/encoding/gene_list.txt
+  max_tiles_per_patient: null
+  val_fraction: 0.1
+  test_fraction: 0.1
+
+  # Output
+  out_dir: ./experiments/20260407_gene_token_transformer_training
+
+  # Diffusion / UNet — warm-start from pre-trained mopadi checkpoint.
+  # The UNet already knows histology; only the conditioning pathway trains
+  # from scratch, so unet_lr is kept very low to avoid catastrophic forgetting.
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_num_res_blocks: 2
+  T: 1000
+  T_eval: 20
+  sample_size: 8
+  diffusion_ckpt: ./experiments/20260218_projection_head/split_ckpts/diffusion_without_encoder.ckpt
+
+  # Training
+  batch_size: 4                           # H100 can handle 4× 512px images comfortably
+  lr: 1e-4
+  unet_lr: 5e-6                           # very low: UNet is pre-trained, avoid forgetting
+  encoder_lr: 1e-4                        # transformer encoder trains from scratch
+  proj_lr: 3e-4                           # projection head trains from scratch
+  optimizer: adam
+  weight_decay: 0.0
+  warmup_steps: 1000                      # longer warmup since UNet is warm-started
+  grad_clip: 1.0
+  ema_decay: 0.9999
+  accumulate_grad_batches: 2              # effective batch: 4 x 2 x 2 GPUs = 16
+  num_workers: 8                          # 8 per GPU process (16 CPUs total)
+  prefetch_factor: 2
+  val_batch_size: 8
+  val_num_workers: 8
+  val_prefetch_factor: 2
+  fp16: false
+  seed: 42
+  gpus: [0, 1]                            # 2× H100 via DDP
+
+  # Three mutually exclusive training modes — drawn per sample each step:
+  #
+  #   mode             prob    purpose
+  #   ─────────────────────────────────────────────────────────────────────
+  #   cond dropout     0.15    zeros genomic cond → trains unconditional
+  #                            distribution; required for CFG at inference
+  #   xT forcing       0.55    overrides t to near-T (t ∈ [0.8T, T)) so
+  #                            x_t ≈ N(0,I) and model must use genomic cond
+  #                            to predict noise direction → trains Goals 2+3
+  #   normal           0.30    real image + real cond → trains Goal 1
+  #   ─────────────────────────────────────────────────────────────────────
+  #   Over 5M samples: 750K cond-drop / 2.75M xT-force / 1.5M normal
+  cond_dropout_prob: 0.15                 # 15 % of samples train unconditionally (CFG)
+  xt_zero_prob: 0.55                      # raised from 0.30 — encoder is diverse, UNet needs forcing
+  cond_feature_dropout: 0.05             # per-dimension dropout on cond vector
+
+  # Counterfactual margin loss — same objective as gtca for a clean ablation.
+  # Both passes share the same noise tensor so x_t is identical; the loss gap
+  # is purely due to the conditioning vector, not noise variance.
+  counterfactual_loss_weight: 0.5
+  counterfactual_margin: 0.05
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
+
+  # Schedule — pragmatic 5M-sample target on 2× H100 (~40–60 h).
+  # Resume and extend with the same script if conditioning looks promising.
+  epochs: 500                             # safety cap; training stops at total_samples
+  total_samples: 5000000                  # 5M samples — first real evaluation point
+  steps_per_epoch: 5000
+  save_every_samples: 500000             # checkpoint every 500K samples (~10 saves)
+  save_top_k: 3
+  reconstruct_every_samples: 100000      # visualise conditioning every 100K samples
+
+  # Validation
+  val_check_interval: 5
+  limit_val_batches: 0.3
+
+  # Gene-token transformer
+  gene_token_transformer:
+    gene_list_path: null              # null = use top-level gene_list_path
+    seq_len: 512
+    value_embedding: mlp
+    d_model: 256
+    n_heads: 8                        # 256/8 = 32 dims/head
+    n_layers: 4
+    ff_mult: 4
+    dropout: 0.1
+    pooling: mean
+    cond_dim: 512
+    freeze_transformer_steps: 0
+    transformer_lr: 1e-4
+
+gene_token_cross_attention_joint_training:
+  # Override-only section: values are merged on top of
+  # gene_token_transformer_joint_training by the hybrid train entrypoint.
+  #
+  # FRESH START (2026-04-10): restarted from diffusion_without_encoder.ckpt
+  # after diagnosing that the CF loss was silently disabled for 154 epochs
+  # (epochs 100-254) because save_hyperparameters() was restoring an old
+  # cross_cfg from the checkpoint that predated CF loss.  Fix: all CF params
+  # are now read from joint_cfg (live config) not self.cross_cfg (checkpoint).
+  out_dir: ./experiments/20260410_gtca_v2
+
+  # Must be explicit — inheritance from base section is unreliable in the
+  # deep-merge path, and a missing gpus key would silently fall back to [0].
+  gpus: [0, 1]
+
+  # bf16 instead of fp16: same memory footprint but float32 dynamic range —
+  # avoids precision floor that kills CF swap_gap at low loss scales (~1e-5).
+  fp16: false
+  bf16: true
+
+  # batch_size=2 for double-forward headroom; accumulate_grad_batches=4 keeps
+  # effective global batch at 2 × 4 × 2 GPUs = 16 (same as base run).
+  batch_size: 2
+  accumulate_grad_batches: 4
+
+  # LR schedule: UNet learns slowly (pre-trained), conditioning path faster.
+  unet_lr: 5e-6
+  cross_attn_lr: 1e-4    # zero-init layers need higher LR
+  encoder_lr: 1e-4
+  proj_lr: 3e-4
+
+  cross_attention:
+    heads: 4
+    dim_per_head: 64
+    patch_size: 16        # must divide img_size (512 / 16 = 32 patches per side)
+
+  cond_dropout_prob: 0.15       # classifier-free guidance training
+  cond_feature_dropout: 0.05
+  xT_dropout_prob: 0.55         # force model to rely on genomic cond at high noise
+
+  # Counterfactual margin loss — forces UNet to use conditioning.
+  # Both CF passes share the same noise tensor so x_t is identical and
+  # (swapped_loss - main_loss) reflects only the conditioning difference.
+  # Params read from joint_cfg at every step (not self.cross_cfg) to avoid
+  # checkpoint-restore silently overwriting them.
+  counterfactual_loss_weight: 0.5
+  counterfactual_margin: 0.05
+  counterfactual_monitor_every_n_steps: 200
+  counterfactual_zero_threshold: 1e-4
+
+  # Genomic auto-reconstruction: keeps cond vector informationally rich.
+  genomic_recon_loss_weight: 0.05
+
+evaluation:
+  # ── Reconstruction mode (must match what was used in the reconstruction stage) ──
+  mode: image_guided       # choices: image_guided, random_noise
+                            # image_guided: requires original_zip_dir; computes MSE/PSNR/SSIM
+                            # random_noise: no originals needed; skips metric computation
+
+  # ── Directories for reconstruction quality assessment ─────────────────
+  original_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising/original_samples
+                            # not required when mode=random_noise
+  reconstructed_zip_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising/reconstructed_samples
+                            # can point to a different reconstruction run for cross-condition evaluation
+
+  # ── Output locations ──────────────────────────────────────────────────
+  output_dir: ./experiments/20260410_gtca_nocfg/evaluation_image_guided_investigate_noising/ # where to save CSV/JSON results and plots
+  plot_dir: ./experiments/20260410_gtca_nocfg/evaluation_image_guided/plots  # where to save generated plots (can be same as output_dir)
+
+  # ── Patient filtering ─────────────────────────────────────────────────
+  # Leave as null to evaluate all matching patients
+  #patient_ids: [TCGA-A1-A0SJ]
+  patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]
+  #conditioning_patients: [TCGA-A2-A04T]  # optional subset of patients to analyze for conditioning effects (image_guided mode only)
+
+  # ── Subtype metadata ──────────────────────────────────────────────────
+  # Point to the same gene-expression CSV used for training/reconstruction.
+  # The subtype_col value is shown in every plot as a coloured annotation.
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
+  subtype_col: Majority_Subtype_mRNA   # column holding the histological subtype
+  patient_col: Patient_ID              # column holding the patient identifier
+
+  # ── Metrics and results ───────────────────────────────────────────────
+  save_csv: true           # save per-tile and per-patient CSV summaries
+  save_json: true          # save evaluation summary to JSON
+
+  # ── Visualization options ─────────────────────────────────────────────
+  plot_types:              # which plots to generate
+    - metrics_summary      # 2×3 histograms & box plots for MSE/PSNR/SSIM (image_guided only)
+    - per_patient_metrics  # bar charts per patient, coloured by subtype (image_guided only)
+    - comparison_grid      # Original | Reconstructed | SSIM-diff triptychs with subtype labels
+    - metric_correlation   # scatter plots of metric pairs (image_guided only)
+    #- random_noise_grid  # grid of generated tiles labelled by patient + subtype (random_noise)
+    #- cross_patient      # Original | Recon (other patient) | SSIM diff, both subtypes shown
+
+
+  num_comparison_samples: 16  # max tile pairs to visualize in comparison grid / random_noise_grid
+  include_diff_heatmap: true  # include SSIM difference map in comparisons (Crameri vik colormap)
+
+  # ── Plot styling ──────────────────────────────────────────────────────
+  figsize_metrics_summary: [14, 10]
+  figsize_per_patient: null   # auto-size based on patient count
+  figsize_comparison_grid: null  # auto-size based on num_cols × num_pairs
+  num_cols_comparison: 2      # columns in comparison grid
+
+  # ── Colormaps (from Fabio Crameri scientific colormaps) ───────────────
+  cmap_categorical: batlowS
+  cmap_sequential: batlow
+  cmap_diverging: vik         # for SSIM difference maps
+  cmap_heatmap: lajolla       # for fallback tile difference images
+
+segmentation:
+  # Cell segmentation and topological analysis pipeline
+  # Step 1: Segment original (reference) tiles using DeepCMorph
+  # Step 2: Segment reconstructed tiles using the same model
+  # Step 3: Compute Topological Fréchet Distance (TopoFD) between the two sets
+  
+  reference_tiles_dir: ./experiments/20260316_joint_training/sampling_image_guided/original_samples
+  synthetic_tiles_dir: ./experiments/20260316_joint_training/sampling_image_guided/reconstructed_samples
+  
+  # Output directories for segmentation masks (one .npy per tile)
+  reference_masks_dir: ./experiments/20260316_joint_training/segmentation/reference_masks
+  synthetic_masks_dir: ./experiments/20260316_joint_training/segmentation/synthetic_masks
+  
+  # DeepCMorph configuration
+  num_classes: 32              # TCGA pre-trained model has 32 cell types
+  weights_dataset: TCGA        # use TCGA pre-trained weights
+  device: null                 # null = auto-detect cuda/cpu
+  batch_size: 4                # inference batch size (adjust based on GPU memory)
+  num_workers: 4               # parallel tile loading
+  
+  # Segmentation options
+  input_format: zip            # choices: zip (STAMP archives) or images (flat directory)
+  save_nuclei_seg: true        # save global nuclei segmentation mask
+  per_patient_dirs: true       # organize outputs by patient subdirectories
+  max_tiles_per_zip: null      # null = process all tiles per ZIP; else cap at N
+  
+  # Optional cell-type grouping (reduces 32 classes to fewer categories)
+  # Set to null to keep all 32 classes, or point to a JSON file like:
+  #   {"immune_cells": [0,1,2], "cancer_cells": [3,4,5], ...}
+  grouping_json: null
+  
+  # Segmentation Visualization
+  # Creates comparison grids showing reference vs synthetic tiles with overlaid masks
+  save_visualizations: true                          # create visual comparison plots
+  num_visualization_samples: 1                       # how many tiles per patient to visualize
+  output_dir: ./experiments/20260316_joint_training/segmentation/visualizations  # where to save plots
+  
+  # Topological Fréchet Distance (TopoFD) computation
+  topofd:
+    enabled: true                      # compute TopoFD after segmentation
+    use_alpha_complex: true            # use Alpha complex (faster) vs Rips
+    n_landscape_bins: 100              # persistence landscape resolution
+    n_landscape_layers: 1              # number of landscape layers
+    min_cells_per_image: 3             # skip images with fewer cells
+    
+    # Output
+    output_dir: ./experiments/20260316_joint_training/segmentation/topofd_results
+    save_detailed_report: true         # save per-channel and summary JSON
+    save_visualizations: false         # (requires persim + matplotlib)
+
+# ─── Subtype Classifier on Virchow2 Features ───────────────────────────
+
+subtype_classifier:
+  mode: evaluate   # train | evaluate | both
+  # Virchow2 H5 feature directory (one .h5/.hdf5 per patient)
+  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  # Use the same patient splits as the diffusion run
+  patient_splits_path: ./experiments/20260320_joint_training_encoder_only_slurm/patient_splits.json
+  # Optional override (defaults to encoding.csv_path in config)
+  # label_csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  # Cap tiles per patient to prevent large-WSI patients from dominating training.
+  # 100 tiles/patient gives ~80K training tiles for ~800 train patients — more
+  # than enough for a linear probe on 1280-dim Virchow2 features.
+  max_tiles_per_patient: 100
+  seed: 42
+  output_dir: ./experiments/20260326_cross_subtype_classifier
+  train:
+    solver: liblinear
+    Cs: [0.01, 0.1, 1.0, 10.0, 100.0]  # searched via 5-fold CV on train set
+    cv_folds: 5
+    max_iter: 2000
+    class_weight: balanced
+  evaluate:
+    # null -> auto-uses <output_dir>/train/subtype_linear_model.joblib
+    model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
+
+# ─── Virchow2 Feature Extraction from Generated Tiles ───────────────────
+#
+# Extracts Virchow2 patch embeddings from per-patient ZIP archives produced
+# by the reconstruction stage and writes per-patient H5 files that the
+# subtype_classifier pipeline consumes directly.
+#
+# Typical workflow:
+#   1. run_pipeline.py --stage reconstruction     -> per-patient ZIPs
+#   2. run_pipeline.py --stage virchow2_extraction -> per-patient H5 files
+#   3. run_pipeline.py --stage subtype_classifier  -> predictions on synthetic tiles
+#      (set features_dir below to the same output_dir)
+
+virchow2_extraction:
+  # Input: directory produced by the reconstruction stage
+  # Contains <patient_id>.zip archives with PNG tiles.
+  tiles_dir: ./experiments/20260325_cross_attention_training/reconstructed
+
+  # Output: one <patient_id>.h5 per patient, dataset "features" (N, 1280) float32
+  output_dir: ./experiments/20260325_cross_attention_training/synthetic_virchow2_features
+
+  # Number of tiles per GPU forward pass (reduce if running out of memory)
+  batch_size: 32
+
+  # null = auto-detect (cuda if available, else cpu)
+  device: null
+
+  # Skip patients whose .h5 already exists (useful for resuming interrupted runs)
+  skip_existing: true
+
+# ─── Tile Reconstruction from Genomic Features ──────────────────────────
+
+reconstruction:
+  # ── Model Checkpoint ──────────────────────────────────────────────────
+  checkpoint_path: ./experiments/20260410_gtca_nocfg/joint/last.ckpt  # Note: absolute path for remote mount compatibility
+  
+  # ── Data Input ────────────────────────────────────────────────────────
+  csv_path: ../dataframes/brca_gene_expression.csv
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+  patient_col: Patient_ID
+  patient_ids: [TCGA-A1-A0SJ]
+  #patient_ids: [TCGA-3C-AALJ, TCGA-A1-A0SJ, TCGA-A2-A04R, TCGA-A2-A04T, TCGA-A2-A0CT, TCGA-A2-A0T0, TCGA-A2-A0YI, TCGA-A2-A1FZ]     # null = all from CSV | list: [TCGA-XX-XX, ...] | split name: "train"/"val"/"test" (requires patient_splits_path)
+  #conditioning_patients: [TCGA-A2-A04T]
+  patient_splits_path: ./experiments/20260410_gtca_nocfg/patient_splits.json  # optional: required if patient_ids is a split name
+  
+  # ── Reconstruction Parameters ─────────────────────────────────────────
+  n_tiles_per_patient: 2    # number of tiles to sample per patient
+  mode: image_guided       # choices: image_guided, random_noise
+  investigate: true         # save intermediate noising steps for visualization
+  
+  # ── Output ────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260410_gtca_nocfg/reconstructions_image_guided_investigate_noising  # Note: absolute path for remote mount compatibility
+  
+  # ── Classifier-Free Guidance ──────────────────────────────────────────
+  # Amplifies the conditioning signal at inference: ε_guided = ε_uncond + scale*(ε_cond−ε_uncond)
+  # 1.0 = no guidance (standard DDIM).  Try 2.0–5.0 for cross-conditioning experiments.
+  # Requires the model to have been trained with cond_dropout_prob > 0.
+  guidance_scale: 1.0
+  seed: 42
+
+  # ── Ablation: zero conditioning ───────────────────────────────────────
+  # Replace the genomic conditioning vector with zeros before passing it to
+  # the diffusion model.  Measures how much reconstruction changes without
+  # any genomic information — baseline for comparing conditioned vs. unconditioned.
+  # Works in both image_guided and random_noise modes.
+  zero_conditioning: false
+
+  # ── Execution ─────────────────────────────────────────────────────────
+  device: null               # null = auto-detect cuda/cpu
+  batch_size: 1              # reconstructions are single-tile (no batching needed)
+
+
+# ─── MoPaDi Genomic Scratch Training ────────────────────────────────────────
+#
+# Two-stage pipeline:
+#   Stage 1 (run once):  python run_pipeline.py --stage build_genomic_features
+#   Stage 2 (training):  python run_pipeline.py --stage mopadi_genomic_training
+#
+# MoPaDi is used purely as a library — zero changes to its source.
+# The 512-dim gene-expression vector slots directly into MoPaDi's style
+# conditioning pathway (embed_channels = style_ch = 512 = n_genes).
+
+mopadi_genomic_training:
+
+  # ── Stage 1: Preprocessing inputs ────────────────────────────────────────
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+  gene_selection:
+    target_genes: 512          # number of genes to select
+    min_nonzero: 5             # min samples expressing a gene to keep it
+    corr_threshold: 0.90       # drop genes with Pearson r > threshold with a selected gene
+    force_pam50: true          # always include PAM50 marker genes
+    pam50_path: ../dataframes/PAM50_gene_list.txt
+    wanted_subtypes: [Basal, LumA]   # binary phenotype for OLS gene ranking
+
+  split:
+    train: 0.80
+    val: 0.10
+    test: 0.10
+    seed: 42
+
+  # ── Shared paths (used by both stages) ───────────────────────────────────
+  output_dir: ./experiments/20260416_mopadi_genomic_scratch
+  # H5 files are written to output_dir/genomic_h5/ automatically.
+  # The paths below are derived from output_dir; override if needed.
+  genomic_feature_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5
+  patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json
+
+  # ── Stage 2: Training inputs ──────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-corrected
+
+  # Per-subtype tile cap (tiles per patient).  Ensures all subtypes contribute
+  # roughly equal total tiles.  Set to null to remove a cap.
+  # Values below are computed from the dataset; run build_genomic_features first
+  # and check experiments/mopadi_genomic_scratch/suggested_tile_caps.json.
+  max_tiles_by_subtype:
+    LumA: 45        # 514 patients × 45 ≈ 23k tiles
+    LumB: 120       # 195 patients × 120 ≈ 23k tiles
+    Basal: 135      # 175 patients × 135 ≈ 24k tiles
+    Her2: 300       # 74 patients × 300 ≈ 22k tiles
+    Normal: null    # 38 patients — keep all tiles (too few to cap)
+
+  # ── Model architecture ───────────────────────────────────────────────────
+  img_size: 256              # tile resolution; change if tiles are 512px
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]             # attention at 16×16 resolution
+  net_num_res_blocks: 2
+  style_ch: 512              # MUST equal the number of selected genes
+  feat_dim: 512              # MUST equal style_ch
+  T: 1000
+  T_eval: 20
+
+  # ── Training schedule ────────────────────────────────────────────────────
+  batch_size: 4
+  accumulate_grad_batches: 1
+  total_samples: 200000000   # training stops after this many samples seen
+  steps_per_epoch: 5000
+  save_every_samples: 200000
+  reconstruct_every_samples: 50000
+  sample_size: 16            # tiles to render per TensorBoard log
+
+  # ── Optimiser ────────────────────────────────────────────────────────────
+  lr: 0.0001
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: false
+
+  # ── Validation ───────────────────────────────────────────────────────────
+  # Run validation every N training steps (step-based, independent of epoch size).
+  # 100 val batches × batch_size = 400 samples — fast but statistically stable.
+  val_every_steps: 5000
+  limit_val_batches: 100
+  # TensorBoard scalars written during validation:
+  #   loss/train        — training loss (grouped with val on same chart)
+  #   loss/val          — val loss with correct genomic conditioning
+  #   loss/val_shuffled — val loss with randomly permuted conditioning
+  #   cond/gap          — (shuffled − val): near 0 early, grows positive when
+  #                       the model starts exploiting genomic signal.
+  #                       If flat at 0 after ~100k steps → consider scancel.
+
+  # ── Infrastructure ───────────────────────────────────────────────────────
+  seed: 42
+  num_workers: 4
+  gpus: [0]
+  base_dir: ./experiments/20260416_mopadi_genomic_scratch/training
+  save_top_k: 3
+  val_check_interval: 1      # validate every N epochs
+  limit_val_batches: 1.0     # fraction of val set to evaluate each time
