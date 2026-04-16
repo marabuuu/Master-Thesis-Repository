@@ -12,7 +12,7 @@ import os
 from pathlib import Path
 import yaml
 import pytorch_lightning as pl
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor
 
 try:
     from joint_training.train import _count_genes
@@ -34,6 +34,21 @@ try:
 except ImportError:  # pragma: no cover
     from src.utils.config_utils import resolve_config_paths as _resolve_config_paths, deep_update as _deep_update  # type: ignore[import-not-found]
 
+try:
+    from utils.training_utils import (
+        build_checkpoint_callback,
+        choose_ddp_strategy,
+        ensure_logdir,
+        find_resume_checkpoint,
+    )
+except ImportError:  # pragma: no cover
+    from src.utils.training_utils import (  # type: ignore[import-not-found]
+        build_checkpoint_callback,
+        choose_ddp_strategy,
+        ensure_logdir,
+        find_resume_checkpoint,
+    )
+
 
 def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
     seed = joint_cfg.get("seed", 42)
@@ -48,47 +63,28 @@ def run_cross_attention_training(joint_cfg: dict, verbose: bool = True) -> None:
 
     gpus = joint_cfg.get("gpus", [0])
 
-    if not os.path.exists(conf.logdir):
-        os.makedirs(conf.logdir)
+    ensure_logdir(conf.logdir)
 
     check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))
     limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
 
-    save_top_k = int(joint_cfg.get("save_top_k", 3))
-    every_n_train_steps = max(1, int(conf.save_every_samples // conf.batch_size_effective))
-    if save_top_k > 0:
-        checkpoint = ModelCheckpoint(
-            dirpath=conf.logdir,
-            save_last=True,
-            save_top_k=save_top_k,
-            monitor="val_loss",
-            mode="min",
-            filename="epoch{epoch:03d}-step{step:08d}",
-            every_n_epochs=max(1, check_val_every_n_epoch),
-        )
-    else:
-        checkpoint = ModelCheckpoint(
-            dirpath=conf.logdir,
-            save_last=True,
-            save_top_k=save_top_k,
-            filename="epoch{epoch:03d}-step{step:08d}",
-            every_n_train_steps=every_n_train_steps,
-        )
+    checkpoint = build_checkpoint_callback(
+        conf=conf,
+        joint_cfg=joint_cfg,
+        check_val_every_n_epoch=check_val_every_n_epoch,
+        filename="epoch{epoch:03d}-step{step:08d}",
+    )
 
-    ckpt_path = os.path.join(conf.logdir, 'last.ckpt')
-    if os.path.exists(ckpt_path):
-        if verbose:
-            print(f"[CrossJoint] Resuming from {ckpt_path}")
-    else:
-        ckpt_path = None
+    ckpt_path = find_resume_checkpoint(conf.logdir, verbose=verbose, prefix="[CrossJoint]")
 
     active_loggers = build_robust_loggers(conf.logdir, joint_cfg, verbose=verbose)
 
-    if len(gpus) > 1:
-        from pytorch_lightning.strategies import DDPStrategy
-        strategy = DDPStrategy(find_unused_parameters=True)
-    else:
-        strategy = 'auto'
+    strategy = choose_ddp_strategy(
+        gpus=gpus,
+        devices=gpus,
+        find_unused_parameters=True,
+        use_local_rank=False,
+    )
 
     if verbose:
         if check_val_every_n_epoch > 1:

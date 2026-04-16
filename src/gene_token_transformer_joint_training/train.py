@@ -5,11 +5,10 @@
 from __future__ import annotations
 
 import argparse
-import os
 import yaml
 import pytorch_lightning as pl
 from pytorch_lightning import loggers as pl_loggers
-from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
+from pytorch_lightning.callbacks import LearningRateMonitor
 
 from pathlib import Path
 
@@ -22,6 +21,23 @@ try:
     from utils.config_utils import resolve_config_paths as _resolve_config_paths
 except ImportError:  # pragma: no cover
     from src.utils.config_utils import resolve_config_paths as _resolve_config_paths  # type: ignore[import-not-found]
+
+try:
+    from utils.training_utils import (
+        build_checkpoint_callback,
+        choose_ddp_strategy,
+        ensure_logdir,
+        find_resume_checkpoint,
+        resolve_devices_for_launch,
+    )
+except ImportError:  # pragma: no cover
+    from src.utils.training_utils import (  # type: ignore[import-not-found]
+        build_checkpoint_callback,
+        choose_ddp_strategy,
+        ensure_logdir,
+        find_resume_checkpoint,
+        resolve_devices_for_launch,
+    )
 
 try:
     from gene_token_transformer_joint_training.model import (
@@ -48,63 +64,32 @@ def run_gene_token_transformer_training(joint_cfg: dict, verbose: bool = True) -
 
     gpus = joint_cfg.get("gpus", [0])
 
-    # When launched via torchrun each OS process already owns one GPU.
-    # Passing devices=[0,1] in that context causes PL to re-spawn subprocesses
-    # → only 1/1 DDP processes. With LOCAL_RANK set, use devices=1 instead.
-    import os as _os
-    if _os.environ.get("LOCAL_RANK") is not None:
-        # Launched via torchrun: PL is in TorchElastic mode and does NOT
-        # re-spawn processes. It validates: devices * num_nodes == WORLD_SIZE,
-        # so we must pass the total GPU count, not 1.
-        devices = int(_os.environ.get("WORLD_SIZE", len(gpus)))
-    else:
-        devices = gpus
+    devices = resolve_devices_for_launch(gpus)
 
-    if not os.path.exists(conf.logdir):
-        os.makedirs(conf.logdir)
+    ensure_logdir(conf.logdir)
 
     check_val_every_n_epoch = int(joint_cfg.get("val_check_interval", 1))
     limit_val_batches = float(joint_cfg.get("limit_val_batches", 1.0))
 
-    save_top_k = int(joint_cfg.get("save_top_k", 3))
-    every_n_train_steps = max(1, int(conf.save_every_samples // conf.batch_size_effective))
-    if save_top_k > 0:
-        checkpoint = ModelCheckpoint(
-            dirpath=conf.logdir,
-            save_last=True,
-            save_top_k=save_top_k,
-            monitor="val_loss",
-            mode="min",
-            filename="epoch{epoch:03d}-step{step:08d}",
-            every_n_epochs=max(1, check_val_every_n_epoch),
-        )
-    else:
-        checkpoint = ModelCheckpoint(
-            dirpath=conf.logdir,
-            save_last=True,
-            save_top_k=save_top_k,
-            filename="epoch{epoch:03d}-step{step:08d}",
-            every_n_train_steps=every_n_train_steps,
-        )
+    checkpoint = build_checkpoint_callback(
+        conf=conf,
+        joint_cfg=joint_cfg,
+        check_val_every_n_epoch=check_val_every_n_epoch,
+        filename="epoch{epoch:03d}-step{step:08d}",
+    )
 
-    ckpt_path = os.path.join(conf.logdir, "last.ckpt")
-    if os.path.exists(ckpt_path):
-        if verbose:
-            print(f"[GeneTokenJoint] Resuming from {ckpt_path}")
-    else:
-        ckpt_path = None
+    ckpt_path = find_resume_checkpoint(conf.logdir, verbose=verbose, prefix="[GeneTokenJoint]")
 
     tb_logger = pl_loggers.TensorBoardLogger(
         save_dir=conf.logdir, name=None, version="",
     )
 
-    from pytorch_lightning.strategies import DDPStrategy
-    if isinstance(devices, list) and len(devices) > 1:
-        strategy = DDPStrategy(find_unused_parameters=False)
-    elif _os.environ.get("LOCAL_RANK") is not None:
-        strategy = DDPStrategy(find_unused_parameters=False)
-    else:
-        strategy = "auto"
+    strategy = choose_ddp_strategy(
+        gpus=gpus,
+        devices=devices,
+        find_unused_parameters=False,
+        use_local_rank=True,
+    )
 
     if verbose:
         if check_val_every_n_epoch > 1:
