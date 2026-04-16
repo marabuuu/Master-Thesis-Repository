@@ -2,7 +2,7 @@
 preprocessing:
   zip_dir: ../data/TCGA           
   roi_dir: ../data/annotations-BRCA     
-  save_dir: ../data/BRCA-tumor-tiles-corrected  # Note: absolute paths for remote mount compatibility
+  save_dir: ../data/BRCA-tumor-tiles-corrected  # Note: absolute paths for remote mount compatibility/ cou
   target_mpp: 0.5                        # scale annotations into this pixel space
   native_slide_mpp: 0.25                 # microns/pixel of original slide
   num_workers: 8
@@ -140,10 +140,10 @@ extract_joint_latents:
   section: gene_token_cross_attention_joint_training
 
 visualize_latents:
-  latent_dir: ./experiments/20260410_gtca_nocfg/joint_latents  # Note: absolute path for remote mount compatibility
+  latent_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5  # Note: absolute path for remote mount compatibility
   csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv  # Note: absolute path for remote mount compatibility
-  patient_splits_path: ./experiments/20260410_gtca_nocfg/patient_splits.json  # optional: required if using split-specific latent_dir
-  output_dir: ./experiments/20260410_gtca_nocfg/latent_plots
+  patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json  # optional: required if using split-specific latent_dir
+  output_dir: ./experiments/20260416_mopadi_genomic_scratch/latent_plots
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
@@ -550,4 +550,104 @@ reconstruction:
   device: null               # null = auto-detect cuda/cpu
   batch_size: 1              # reconstructions are single-tile (no batching needed)
 
-  
+
+# ─── MoPaDi Genomic Scratch Training ────────────────────────────────────────
+#
+# Two-stage pipeline:
+#   Stage 1 (run once):  python run_pipeline.py --stage build_genomic_features
+#   Stage 2 (training):  python run_pipeline.py --stage mopadi_genomic_training
+#
+# MoPaDi is used purely as a library — zero changes to its source.
+# The 512-dim gene-expression vector slots directly into MoPaDi's style
+# conditioning pathway (embed_channels = style_ch = 512 = n_genes).
+
+mopadi_genomic_training:
+
+  # ── Stage 1: Preprocessing inputs ────────────────────────────────────────
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+  gene_selection:
+    target_genes: 512          # number of genes to select
+    min_nonzero: 5             # min samples expressing a gene to keep it
+    corr_threshold: 0.90       # drop genes with Pearson r > threshold with a selected gene
+    force_pam50: true          # always include PAM50 marker genes
+    pam50_path: ../dataframes/PAM50_gene_list.txt
+    wanted_subtypes: [Basal, LumA]   # binary phenotype for OLS gene ranking
+
+  split:
+    train: 0.80
+    val: 0.10
+    test: 0.10
+    seed: 42
+
+  # ── Shared paths (used by both stages) ───────────────────────────────────
+  output_dir: ./experiments/20260416_mopadi_genomic_scratch
+  # H5 files are written to output_dir/genomic_h5/ automatically.
+  # The paths below are derived from output_dir; override if needed.
+  genomic_feature_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5
+  patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json
+
+  # ── Stage 2: Training inputs ──────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-corrected
+
+  # Per-subtype tile cap (tiles per patient).  Ensures all subtypes contribute
+  # roughly equal total tiles.  Set to null to remove a cap.
+  # Values below are computed from the dataset; run build_genomic_features first
+  # and check experiments/mopadi_genomic_scratch/suggested_tile_caps.json.
+  max_tiles_by_subtype:
+    LumA: 45        # 514 patients × 45 ≈ 23k tiles
+    LumB: 120       # 195 patients × 120 ≈ 23k tiles
+    Basal: 135      # 175 patients × 135 ≈ 24k tiles
+    Her2: 300       # 74 patients × 300 ≈ 22k tiles
+    Normal: null    # 38 patients — keep all tiles (too few to cap)
+
+  # ── Model architecture ───────────────────────────────────────────────────
+  img_size: 256              # tile resolution; change if tiles are 512px
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]             # attention at 16×16 resolution
+  net_num_res_blocks: 2
+  style_ch: 512              # MUST equal the number of selected genes
+  feat_dim: 512              # MUST equal style_ch
+  T: 1000
+  T_eval: 20
+
+  # ── Training schedule ────────────────────────────────────────────────────
+  batch_size: 4
+  accumulate_grad_batches: 1
+  total_samples: 200000000   # training stops after this many samples seen
+  steps_per_epoch: 5000
+  save_every_samples: 200000
+  reconstruct_every_samples: 50000
+  sample_size: 16            # tiles to render per TensorBoard log
+
+  # ── Optimiser ────────────────────────────────────────────────────────────
+  lr: 0.0001
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: false
+
+  # ── Validation ───────────────────────────────────────────────────────────
+  # Run validation every N training steps (step-based, independent of epoch size).
+  # 100 val batches × batch_size = 400 samples — fast but statistically stable.
+  val_every_steps: 5000
+  limit_val_batches: 100
+  # TensorBoard scalars written during validation:
+  #   loss/train        — training loss (grouped with val on same chart)
+  #   loss/val          — val loss with correct genomic conditioning
+  #   loss/val_shuffled — val loss with randomly permuted conditioning
+  #   cond/gap          — (shuffled − val): near 0 early, grows positive when
+  #                       the model starts exploiting genomic signal.
+  #                       If flat at 0 after ~100k steps → consider scancel.
+
+  # ── Infrastructure ───────────────────────────────────────────────────────
+  seed: 42
+  num_workers: 4
+  gpus: [0]
+  base_dir: ./experiments/20260416_mopadi_genomic_scratch/training
+  save_top_k: 3
+  val_check_interval: 1      # validate every N epochs
+  limit_val_batches: 1.0     # fraction of val set to evaluate each time

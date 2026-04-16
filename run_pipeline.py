@@ -242,6 +242,18 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         cfg.setdefault("config_path", config_path)
         run_subtype_classifier(cfg, verbose=verbose)
 
+    elif stage == "build_genomic_features":
+        from src.preprocessing.build_genomic_features import run_build_genomic_features
+        if "mopadi_genomic_training" not in config:
+            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
+        run_build_genomic_features(config["mopadi_genomic_training"], verbose=verbose)
+
+    elif stage == "mopadi_genomic_training":
+        from src.mopadi_genomic.run_genomic_training import run_genomic_training
+        if "mopadi_genomic_training" not in config:
+            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
+        run_genomic_training(config["mopadi_genomic_training"], verbose=verbose)
+
     elif stage in ("gtca_training", "gtca_nocfg", "gtca_scratch"):
         # Gene-token cross-attention training — three variants sharing one train function.
         #   gtca_training : mopadi init, cond_dropout=0.15 (CFG, for guidance experiments)
@@ -288,7 +300,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, build_genomic_features, mopadi_genomic_training, evaluation, all"
         )
 
 
@@ -320,7 +332,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
