@@ -171,6 +171,8 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         # Pass process_only_zips=True so MoPaDi's scanner reads tile names
         # from inside ZIP files without extraction.
         # max_tiles_per_patient=None → collect all tiles; we apply our own caps.
+        self._img_size = img_size
+
         super().__init__(
             root_dirs=[zip_dir],
             split="none",               # we do our own split filtering below
@@ -239,7 +241,13 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     # ------------------------------------------------------------------
 
     def __getitem__(self, index: int) -> Dict:
-        item = super().__getitem__(index)          # img, coords, filename
+        # Some edge tiles in ZIPs are non-square (e.g. 480×640). Skip them by
+        # walking forward until we find a tile with the expected square size.
+        for offset in range(len(self.tile_paths)):
+            item = super().__getitem__((index + offset) % len(self.tile_paths))
+            img = item["img"]
+            if img.shape[-2] == self._img_size and img.shape[-1] == self._img_size:
+                break
         pid = patient_id_from_tile_path(item["filename"])
         item["feat"] = self._genomic_cache[pid]    # (n_genes,) float32 tensor
         return item

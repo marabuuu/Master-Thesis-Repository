@@ -12,6 +12,7 @@ from __future__ import annotations
 
 import logging
 import os
+import traceback
 from pathlib import Path
 from typing import Any, Dict
 
@@ -136,7 +137,12 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         max_steps, conf.batch_size, conf.batch_size_effective, devices,
     )
 
-    trainer.fit(model, ckpt_path=resume_ckpt)
+    try:
+        trainer.fit(model, ckpt_path=resume_ckpt)
+    except Exception as e:
+        log.error("trainer.fit raised %s: %r", type(e).__name__, str(e))
+        traceback.print_exc()
+        raise
     log.info("Training complete.  Last checkpoint: %s", checkpoint_cb.last_model_path)
 
 
@@ -205,6 +211,7 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
         style_ch=style_ch,
         feat_dim=feat_dim,
         net_beatgans_embed_channels=style_ch,
+        net_beatgans_resnet_two_cond=True,   # required: autoenc forward path raises NotImplementedError() otherwise
         # No projection layer needed: the 512-dim gene vector is used as-is.
         # enc_transform_dim left at default (1024) but is not used in the
         # genomic path since no image feature extractor is active.
@@ -232,6 +239,7 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
         tile_sampling_seed=int(cfg.get("tile_sampling_seed", 42)),
         do_normalize=bool(cfg.get("do_normalize", True)),
         do_resize=bool(cfg.get("do_resize", False)),
+        val_limit_batches=int(cfg.get("limit_val_batches", 100)),
     )
 
     return GenomicTrainConfig(**fields)

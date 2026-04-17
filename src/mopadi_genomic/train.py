@@ -111,6 +111,31 @@ class GenomicLitModel(LitModel):
             )
 
     # ------------------------------------------------------------------
+    # Val dataloader (parent only defines train_dataloader)
+    # ------------------------------------------------------------------
+
+    def val_dataloader(self):
+        """Return a DataLoader for the validation split, capped at val_limit_batches.
+
+        MoPaDi's parent ``LitModel`` only defines ``train_dataloader``;
+        without this method Lightning silently skips the entire val loop.
+
+        Lightning's ``limit_val_batches`` is unreliable with integer
+        ``val_check_interval`` in 2.5.x, so we cap the dataset directly.
+        """
+        import torch.utils.data as tud
+
+        limit = self.conf.val_limit_batches * self.batch_size
+        dataset = (
+            tud.Subset(self.val_data, list(range(limit)))
+            if len(self.val_data) > limit
+            else self.val_data
+        )
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(dataset, shuffle=False, drop_last=False)
+
+    # ------------------------------------------------------------------
     # TensorBoard logging — grouped train / val loss curves
     # ------------------------------------------------------------------
 
@@ -129,6 +154,11 @@ class GenomicLitModel(LitModel):
             self.logger.experiment.add_scalar(
                 "loss/train", loss_val.item(), self.num_samples
             )
+            if self.global_step % 500 == 0:
+                log.info(
+                    "step %6d | samples %10d | loss/train %.4f",
+                    self.global_step, self.num_samples, loss_val.item(),
+                )
         return out
 
     def validation_step(self, batch, batch_idx):
@@ -152,6 +182,13 @@ class GenomicLitModel(LitModel):
             zero after tens of thousands of steps, the genomic conditioning
             is not being learned — a reliable signal to cancel the run.
         """
+        # Lightning runs a brief sanity check (2 batches) before training to
+        # validate the val loop.  We skip it here because on_fit_start() already
+        # does a dedicated sanity check, and logging during the sanity phase
+        # can cause issues with partially initialised trainer state.
+        if self.trainer.sanity_checking:
+            return None
+
         imgs = batch["img"].to(self.device)
         feats = batch["feat"].to(self.device, dtype=torch.float32)
 
@@ -166,7 +203,7 @@ class GenomicLitModel(LitModel):
                 t=t,
                 model_kwargs={"cond": feats},
             )
-            loss_cond = self.all_gather(losses_cond["loss"]).mean()
+            loss_cond = losses_cond["loss"].mean()
 
             # ── Loss with shuffled conditioning ──────────────────────────
             # Permute genomic vectors within the batch so each image is
@@ -180,7 +217,7 @@ class GenomicLitModel(LitModel):
                 t=t,                    # same noise timesteps for fair comparison
                 model_kwargs={"cond": feats_shuffled},
             )
-            loss_shuffled = self.all_gather(losses_shuffled["loss"]).mean()
+            loss_shuffled = losses_shuffled["loss"].mean()
 
         if self.global_rank == 0:
             gap = (loss_shuffled - loss_cond).item()
@@ -188,7 +225,32 @@ class GenomicLitModel(LitModel):
             self.logger.experiment.add_scalar("loss/val_shuffled", loss_shuffled.item(), self.num_samples)
             self.logger.experiment.add_scalar("cond/gap",          gap,                  self.num_samples)
 
+        # Accumulate for on_validation_epoch_end summary log line.
+        if not hasattr(self, "_val_losses"):
+            self._val_losses: list = []
+        self._val_losses.append(loss_cond.item())
+        if not hasattr(self, "_val_gaps"):
+            self._val_gaps: list = []
+        self._val_gaps.append((loss_shuffled - loss_cond).item())
+
         return loss_cond
+
+    def on_validation_epoch_end(self) -> None:
+        """Log a one-line summary of the completed validation pass."""
+        if self.trainer.sanity_checking:
+            return
+        if not getattr(self, "_val_losses", None):
+            return
+        if self.global_rank == 0:
+            mean_loss = sum(self._val_losses) / len(self._val_losses)
+            mean_gap  = sum(self._val_gaps)   / len(self._val_gaps)
+            log.info(
+                "step %6d | samples %10d | loss/val %.4f | cond/gap %.4f  (%d batches)",
+                self.global_step, self.num_samples,
+                mean_loss, mean_gap, len(self._val_losses),
+            )
+        self._val_losses = []
+        self._val_gaps   = []
 
     # ------------------------------------------------------------------
     # Sanity check (replaces parent's WebDataset-specific check)

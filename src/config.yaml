@@ -606,7 +606,7 @@ mopadi_genomic_training:
     Normal: null    # 38 patients — keep all tiles (too few to cap)
 
   # ── Model architecture ───────────────────────────────────────────────────
-  img_size: 256              # tile resolution; change if tiles are 512px
+  img_size: 512              # native TCGA tile resolution (matches tcga_brca_autoenc template)
   net_ch: 128
   net_ch_mult: [1, 1, 2, 2, 4, 4]
   net_attn: [16]             # attention at 16×16 resolution
@@ -617,11 +617,11 @@ mopadi_genomic_training:
   T_eval: 20
 
   # ── Training schedule ────────────────────────────────────────────────────
-  batch_size: 4
+  batch_size: 16             # H100 96GB easily fits 16× 512px tiles in bf16
   accumulate_grad_batches: 1
-  total_samples: 200000000   # training stops after this many samples seen
+  total_samples: 10000000    # ~2 days at ~56 samples/sec (bf16 + batch 16)
   steps_per_epoch: 5000
-  save_every_samples: 200000
+  save_every_samples: 500000 # checkpoint every 500K samples (~20 saves total)
   reconstruct_every_samples: 50000
   sample_size: 16            # tiles to render per TensorBoard log
 
@@ -630,11 +630,11 @@ mopadi_genomic_training:
   ema_decay: 0.9999
   grad_clip: 1.0
   fp16: false
-  bf16: false
+  bf16: true                 # bf16-mixed: H100 Tensor Cores, ~2× faster than fp32
 
   # ── Validation ───────────────────────────────────────────────────────────
   # Run validation every N training steps (step-based, independent of epoch size).
-  # 100 val batches × batch_size = 400 samples — fast but statistically stable.
+  # 100 val batches × batch_size = 1600 samples — fast but statistically stable.
   val_every_steps: 5000
   limit_val_batches: 100
   # TensorBoard scalars written during validation:
@@ -647,9 +647,7 @@ mopadi_genomic_training:
 
   # ── Infrastructure ───────────────────────────────────────────────────────
   seed: 42
-  num_workers: 4
+  num_workers: 8             # 8 CPUs allocated → use all for data loading
   gpus: [0]
   base_dir: ./experiments/20260416_mopadi_genomic_scratch/training
   save_top_k: 3
-  val_check_interval: 1      # validate every N epochs
-  limit_val_batches: 1.0     # fraction of val set to evaluate each time

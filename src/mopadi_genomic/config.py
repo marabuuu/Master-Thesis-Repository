@@ -55,6 +55,11 @@ class GenomicTrainConfig(TrainConfig):
     max_tiles_by_subtype: Optional[Dict[str, Optional[int]]] = None
     tile_sampling_seed: int = 42
 
+    # ── Validation ───────────────────────────────────────────────────────
+    # Cap val batches in val_dataloader() directly (Lightning's limit_val_batches
+    # is unreliable with integer val_check_interval in 2.5.x).
+    val_limit_batches: int = 100
+
     # ── Image pre-processing overrides ───────────────────────────────────
     # No image feature extractor → no forced resize.
     # do_normalize stays True (diffusion training requires [-1, 1] images).
