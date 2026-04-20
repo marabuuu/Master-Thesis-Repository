@@ -154,7 +154,8 @@ class GenomicLitModel(LitModel):
             self.logger.experiment.add_scalar(
                 "loss/train", loss_val.item(), self.num_samples
             )
-            if self.global_step % 500 == 0:
+            if self.global_step % 500 == 0 and self.global_step != getattr(self, "_last_train_log_step", -1):
+                self._last_train_log_step = self.global_step
                 log.info(
                     "step %6d | samples %10d | loss/train %.4f",
                     self.global_step, self.num_samples, loss_val.item(),
@@ -251,6 +252,15 @@ class GenomicLitModel(LitModel):
             )
         self._val_losses = []
         self._val_gaps   = []
+
+    # ------------------------------------------------------------------
+    # Disable LPIPS/FID evaluation (requires feat_extractor which is None)
+    # ------------------------------------------------------------------
+
+    def evaluate_scores(self) -> None:
+        """No-op: parent's LPIPS/FID evaluation calls feat_extractor.extract_feats()
+        which is None in genomic mode.  We use loss/val and cond/gap instead."""
+        pass
 
     # ------------------------------------------------------------------
     # Sanity check (replaces parent's WebDataset-specific check)

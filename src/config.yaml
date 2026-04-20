@@ -617,11 +617,11 @@ mopadi_genomic_training:
   T_eval: 20
 
   # ── Training schedule ────────────────────────────────────────────────────
-  batch_size: 16             # H100 96GB easily fits 16× 512px tiles in bf16
-  accumulate_grad_batches: 1
-  total_samples: 10000000    # ~2 days at ~56 samples/sec (bf16 + batch 16)
+  batch_size: 4              # bf16-mixed keeps fp32 master weights → same peak as fp32
+  accumulate_grad_batches: 2 # effective batch=8 without doubling activation memory
+  total_samples: 10000000    # ~2 days at ~18 samples/sec (bf16 + effective batch 8)
   steps_per_epoch: 5000
-  save_every_samples: 500000 # checkpoint every 500K samples (~20 saves total)
+  save_every_samples: 100000 # checkpoint every 100K samples (~3h) — resume after crashes
   reconstruct_every_samples: 50000
   sample_size: 16            # tiles to render per TensorBoard log
 
@@ -634,7 +634,7 @@ mopadi_genomic_training:
 
   # ── Validation ───────────────────────────────────────────────────────────
   # Run validation every N training steps (step-based, independent of epoch size).
-  # 100 val batches × batch_size = 1600 samples — fast but statistically stable.
+  # 100 val batches × batch_size = 800 samples — fast but statistically stable.
   val_every_steps: 5000
   limit_val_batches: 100
   # TensorBoard scalars written during validation:

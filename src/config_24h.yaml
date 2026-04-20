@@ -1,0 +1,64 @@
+# Config for the 24-hour auto-resuming training job.
+# Contains only the mopadi_genomic_training section — all other pipeline
+# stages (build_genomic_features etc.) reuse the main config.yaml.
+#
+# Checkpoints land in a separate base_dir so this job never collides with
+# the long-running 6-day job that uses config.yaml.
+#
+# To start the chain:
+#   sbatch slurm/mopadi_genomic_24h.sh
+# The script resubmits itself on clean exit, resuming from last.ckpt each time.
+
+mopadi_genomic_training:
+
+  # ── Preprocessing outputs (shared with main config) ───────────────────────
+  genomic_feature_dir: ./experiments/20260416_mopadi_genomic_scratch/genomic_h5
+  patient_splits_path: ./experiments/20260416_mopadi_genomic_scratch/patient_splits.json
+
+  # ── Dataset ───────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-corrected
+
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  # ── Model architecture ───────────────────────────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+
+  # ── Training schedule ────────────────────────────────────────────────────
+  batch_size: 4
+  accumulate_grad_batches: 2        # effective batch=8
+  total_samples: 10000000
+  steps_per_epoch: 5000
+  save_every_samples: 100000        # checkpoint every ~3h — safe resume window
+  reconstruct_every_samples: 50000
+  sample_size: 16
+
+  # ── Optimiser ────────────────────────────────────────────────────────────
+  lr: 0.0001
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Validation ───────────────────────────────────────────────────────────
+  val_every_steps: 5000
+  limit_val_batches: 100
+
+  # ── Infrastructure ───────────────────────────────────────────────────────
+  seed: 42
+  num_workers: 8
+  gpus: [0]
+  base_dir: ./experiments/20260416_mopadi_genomic_24h/training  # separate from 6-day job
+  save_top_k: 3
