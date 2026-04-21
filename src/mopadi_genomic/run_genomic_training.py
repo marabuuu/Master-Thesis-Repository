@@ -61,18 +61,29 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     autoenc_dir = logdir / "autoenc"
     autoenc_dir.mkdir(parents=True, exist_ok=True)
 
+    # ── Validation cadence ───────────────────────────────────────────────
+    # Validate every N *training steps* (not epochs) so the interval is
+    # predictable regardless of dataset size.  A small batch cap keeps
+    # each validation pass fast without hiding meaningful signal.
+    val_every_steps = cfg.get("val_every_steps", 5_000)
+    # 100 batches × batch_size gives a stable loss estimate while staying fast.
+    limit_val_batches = cfg.get("limit_val_batches", 100)
+
     # ── Callbacks ───────────────────────────────────────────────────────
+    # When monitoring a validation metric, avoid checkpoint attempts before the
+    # first validation pass by saving no more frequently than val_every_steps.
+    ckpt_every_steps = max(
+        max(1, conf.save_every_samples // conf.batch_size_effective),
+        int(val_every_steps),
+    )
     checkpoint_cb = ModelCheckpoint(
         dirpath=str(autoenc_dir),
         filename="{epoch}-{step}",
         save_last=True,
         save_top_k=cfg.get("save_top_k", 3),
-        monitor="loss",
+        monitor=cfg.get("monitor_metric", "loss/val"),
         mode="min",
-        every_n_train_steps=max(
-            1,
-            conf.save_every_samples // conf.batch_size_effective,
-        ),
+        every_n_train_steps=ckpt_every_steps,
     )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
@@ -91,14 +102,6 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
 
     # ── Max steps from total_samples ────────────────────────────────────
     max_steps = conf.total_samples // conf.batch_size_effective
-
-    # ── Validation cadence ───────────────────────────────────────────────
-    # Validate every N *training steps* (not epochs) so the interval is
-    # predictable regardless of dataset size.  A small batch cap keeps
-    # each validation pass fast without hiding meaningful signal.
-    val_every_steps = cfg.get("val_every_steps", 5_000)
-    # 100 batches × batch_size gives a stable loss estimate while staying fast.
-    limit_val_batches = cfg.get("limit_val_batches", 100)
 
     # ── Trainer ─────────────────────────────────────────────────────────
     trainer = pl.Trainer(

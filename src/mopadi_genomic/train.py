@@ -149,8 +149,13 @@ class GenomicLitModel(LitModel):
         the first ``/``).
         """
         out = super().training_step(batch, batch_idx)
+        # Expose a Lightning-native metric key for ModelCheckpoint(monitor="loss").
+        # add_scalar writes only to TensorBoard and is invisible to callbacks.
+        loss_val = out["loss"] if isinstance(out, dict) else out
+        self.log("loss", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        self.log("loss/train", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
         if self.global_rank == 0:
-            loss_val = out["loss"] if isinstance(out, dict) else out
             self.logger.experiment.add_scalar(
                 "loss/train", loss_val.item(), self.num_samples
             )
@@ -225,6 +230,11 @@ class GenomicLitModel(LitModel):
             self.logger.experiment.add_scalar("loss/val",          loss_cond.item(),     self.num_samples)
             self.logger.experiment.add_scalar("loss/val_shuffled", loss_shuffled.item(), self.num_samples)
             self.logger.experiment.add_scalar("cond/gap",          gap,                  self.num_samples)
+
+        # Lightning-native logs for callbacks (e.g. ModelCheckpoint monitor).
+        self.log("loss/val", loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log("loss/val_shuffled", loss_shuffled, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log("cond/gap", loss_shuffled - loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True)
 
         # Accumulate for on_validation_epoch_end summary log line.
         if not hasattr(self, "_val_losses"):

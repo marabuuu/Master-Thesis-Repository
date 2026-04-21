@@ -672,41 +672,38 @@ mopadi_genomic_training:
   T_eval: 20
 
   # ── Training schedule ────────────────────────────────────────────────────
-  batch_size: 2              # lower micro-batch to fit 48 GB during backward
-  accumulate_grad_batches: 4 # keep effective batch=8
-  total_samples: 10000000    # ~2 days at ~18 samples/sec (bf16 + effective batch 8)
+  # 4-GPU DDP: global_batch = batch_size × n_gpus × accum = 2 × 4 × 1 = 8
+  # (identical to single-GPU: 2 × 1 × 4 = 8).  accum_batches=1 because the
+  # 4 GPUs work in parallel — no serial micro-batch overhead.
+  # total_samples is divided by 4 so max_steps = 2.5M/2 = 1.25M (unchanged),
+  # but each of those steps now processes 8 global samples in parallel.
+  batch_size: 2
+  accumulate_grad_batches: 1 # 4 GPUs replace the 4 serial accum steps
+  total_samples: 2500000     # 10M global ÷ 4 GPUs = 2.5M local; max_steps=1.25M
   steps_per_epoch: 5000
-  save_every_samples: 8000   # checkpoint about every 1.2-1.5h at current throughput
+  save_every_samples: 8000
   reconstruct_every_samples: 50000
-  sample_size: 8             # lighter periodic sampling memory footprint
+  sample_size: 8
 
-  # Reduce activation memory in the UNet by recomputing block activations
-  # during backward pass (trades speed for memory headroom).
-  net_beatgans_gradient_checkpoint: true
+  net_beatgans_gradient_checkpoint: false  # 96 GB VRAM on jupiter — no memory pressure
 
   # ── Optimiser ────────────────────────────────────────────────────────────
   lr: 0.0001
   ema_decay: 0.9999
   grad_clip: 1.0
-  fp16: false
-  bf16: true                 # bf16-mixed: H100 Tensor Cores, ~2× faster than fp32
+  fp16: false                # fp16 overflows in UNet forward pass (max ~65k exceeded)
+  bf16: true                 # bf16 has fp32 exponent range — numerically stable, no overflow
 
   # ── Validation ───────────────────────────────────────────────────────────
-  # Run validation every N training steps (step-based, independent of epoch size).
-  # 100 val batches × batch_size = 800 samples — fast but statistically stable.
   val_every_steps: 5000
   limit_val_batches: 100
-  # TensorBoard scalars written during validation:
-  #   loss/train        — training loss (grouped with val on same chart)
-  #   loss/val          — val loss with correct genomic conditioning
-  #   loss/val_shuffled — val loss with randomly permuted conditioning
-  #   cond/gap          — (shuffled − val): near 0 early, grows positive when
-  #                       the model starts exploiting genomic signal.
-  #                       If flat at 0 after ~100k steps → consider scancel.
+  # TensorBoard scalars:
+  #   loss/train, loss/val, loss/val_shuffled
+  #   cond/gap — near 0 early; grows positive once model exploits genomic signal.
 
   # ── Infrastructure ───────────────────────────────────────────────────────
   seed: 42
-  num_workers: 8             # 8 CPUs allocated → use all for data loading
-  gpus: [0]
+  num_workers: 8             # 8 CPUs per task × 4 tasks = 32 total
+  gpus: [0, 1, 2, 3]
   base_dir: ./experiments/20260416_mopadi_genomic_scratch/training
   save_top_k: 3
