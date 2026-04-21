@@ -228,6 +228,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'segmentation' section in config.yaml")
         run_segmentation(config["segmentation"], verbose=verbose)
 
+    elif stage == "tfd_separability":
+        from src.quality_assurance.tfd_separability import run_tfd_separability
+        if "tfd_separability" not in config:
+            raise ValueError("No 'tfd_separability' section in config.yaml")
+        run_tfd_separability(config["tfd_separability"], verbose=verbose)
+
     elif stage == "virchow2_extraction":
         from src.classifier import run_virchow2_extraction
         if "virchow2_extraction" not in config:
@@ -300,7 +306,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, build_genomic_features, mopadi_genomic_training, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, subtype_classifier, build_genomic_features, mopadi_genomic_training, evaluation, all"
         )
 
 
@@ -332,7 +338,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "gtca_training", "gtca_nocfg", "gtca_scratch", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "gtca_training", "gtca_nocfg", "gtca_scratch", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

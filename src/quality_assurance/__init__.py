@@ -36,6 +36,13 @@ from .topological_frechet_distance import (
     compute_topofd,
     compute_topofd_from_folders,
     TopoFDResult,
+    ClassDistribution,
+    compute_class_distribution,
+)
+from .tfd_separability import (
+    TFDSeparabilityResult,
+    compute_tfd_separability,
+    run_tfd_separability,
 )
 from .run_evaluation import (
     run_evaluation,
@@ -60,8 +67,14 @@ __all__ = [
     "plot_metric_correlation",
     "plot_single_comparison",
     "save_figure",
-    # Topological Fréchet Distance
+    # Topological Fréchet Distance (ref vs gen)
     "compute_topofd",
     "compute_topofd_from_folders",
     "TopoFDResult",
+    # TFD Class Separability
+    "ClassDistribution",
+    "compute_class_distribution",
+    "TFDSeparabilityResult",
+    "compute_tfd_separability",
+    "run_tfd_separability",
 ]

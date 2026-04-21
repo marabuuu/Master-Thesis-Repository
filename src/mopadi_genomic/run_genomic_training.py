@@ -208,6 +208,7 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
         net_ch_mult=net_ch_mult,
         net_attn=net_attn,
         net_num_res_blocks=int(_get("net_num_res_blocks", 2)),
+        net_beatgans_gradient_checkpoint=bool(_get("net_beatgans_gradient_checkpoint", False)),
         style_ch=style_ch,
         feat_dim=feat_dim,
         net_beatgans_embed_channels=style_ch,

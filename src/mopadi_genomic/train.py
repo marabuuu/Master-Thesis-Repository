@@ -262,6 +262,17 @@ class GenomicLitModel(LitModel):
         which is None in genomic mode.  We use loss/val and cond/gap instead."""
         pass
 
+    def log_sample(self, x_start, cond):
+        """Skip reconstruction logging at sample 0 to avoid startup OOM.
+
+        MoPaDi's timing helper treats ``num_samples == 0`` as an active logging
+        window. In large 512x512 runs, that triggers an expensive model+EMA
+        reconstruction pass immediately at startup, which can exceed GPU memory.
+        """
+        if self.num_samples <= 0:
+            return
+        return super().log_sample(x_start, cond)
+
     # ------------------------------------------------------------------
     # Sanity check (replaces parent's WebDataset-specific check)
     # ------------------------------------------------------------------

@@ -406,6 +406,61 @@ evaluation:
   cmap_diverging: vik         # for SSIM difference maps
   cmap_heatmap: lajolla       # for fallback tile difference images
 
+tfd_separability:
+  # ── Input tiles ───────────────────────────────────────────────────────────
+  # These are the already-filtered tiles from preprocessing.
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-corrected
+
+  # ── Patient → subtype mapping ─────────────────────────────────────────────
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+  # ── Classes to analyse (null = all present in CSV) ────────────────────────
+  # Start with the two most biologically distinct subtypes as a proof-of-concept.
+  # Expand to all 5 once validated.
+  classes: [Basal, LumA]
+
+  # ── Tile balancing (mirrors mopadi_genomic_training caps) ─────────────────
+  # Caps tiles drawn *per patient* so all classes contribute comparable totals.
+  # Matched to mopadi_genomic_training.max_tiles_by_subtype for consistency.
+  max_tiles_by_subtype:
+    LumA: 45       # 514 patients × 45 ≈ 23k tiles
+    LumB: 120      # 195 patients × 120 ≈ 23k tiles
+    Basal: 135     # 175 patients × 135 ≈ 24k tiles
+    Her2: 300      # 74 patients × 300 ≈ 22k tiles
+    Normal: null   # 38 patients — keep all tiles
+
+  # ── Segmentation ──────────────────────────────────────────────────────────
+  # Where per-patient mask ZIPs are saved / loaded from.
+  masks_dir: ./experiments/tfd_separability/masks
+  auto_segment: true          # run DeepCMorph if masks_dir is empty
+  force_resegment: false      # set true to re-segment even when masks exist
+  num_classes: 32             # TCGA pre-trained DeepCMorph model
+  weights_dataset: TCGA
+  device: null                # null = auto-detect cuda/cpu
+  batch_size: 4
+  # Optional cell-type grouping JSON; null keeps all 32 channels.
+  # Recommended for interpretability: group into cancer / stroma / immune.
+  grouping_json: null
+
+  # ── TDA parameters ────────────────────────────────────────────────────────
+  use_alpha_complex: true     # Alpha complex (exact, faster than Rips)
+  n_landscape_bins: 100       # persistence landscape resolution
+  n_landscape_layers: 1       # number of landscape layers
+  min_cells_per_image: 3      # skip tiles with fewer cell centres
+
+  # ── Noise floor (intra-class sanity check) ────────────────────────────────
+  # Splits each class randomly in half and computes TFD between the halves.
+  # Inter-class TFD should substantially exceed this floor.
+  compute_noise_floor: true
+  n_noise_floor_splits: 5
+
+  # ── Output ────────────────────────────────────────────────────────────────
+  output_dir: ./experiments/tfd_separability/results
+  save_heatmap: true
+  figsize: null               # null = auto-size based on number of classes
+
 segmentation:
   # Cell segmentation and topological analysis pipeline
   # Step 1: Segment original (reference) tiles using DeepCMorph
@@ -617,13 +672,17 @@ mopadi_genomic_training:
   T_eval: 20
 
   # ── Training schedule ────────────────────────────────────────────────────
-  batch_size: 4              # bf16-mixed keeps fp32 master weights → same peak as fp32
-  accumulate_grad_batches: 2 # effective batch=8 without doubling activation memory
+  batch_size: 2              # lower micro-batch to fit 48 GB during backward
+  accumulate_grad_batches: 4 # keep effective batch=8
   total_samples: 10000000    # ~2 days at ~18 samples/sec (bf16 + effective batch 8)
   steps_per_epoch: 5000
-  save_every_samples: 100000 # checkpoint every 100K samples (~3h) — resume after crashes
+  save_every_samples: 8000   # checkpoint about every 1.2-1.5h at current throughput
   reconstruct_every_samples: 50000
-  sample_size: 16            # tiles to render per TensorBoard log
+  sample_size: 8             # lighter periodic sampling memory footprint
+
+  # Reduce activation memory in the UNet by recomputing block activations
+  # during backward pass (trades speed for memory headroom).
+  net_beatgans_gradient_checkpoint: true
 
   # ── Optimiser ────────────────────────────────────────────────────────────
   lr: 0.0001
