@@ -125,7 +125,10 @@ class GenomicLitModel(LitModel):
         """
         import torch.utils.data as tud
 
-        limit = self.conf.val_limit_batches * self.batch_size
+        # self.conf.batch_size is global batch size in MoPaDi's TrainConfig.
+        # Using local self.batch_size here would shrink validation by world_size
+        # under DDP (e.g. 4x fewer val batches on 4 GPUs).
+        limit = self.conf.val_limit_batches * self.conf.batch_size
         dataset = (
             tud.Subset(self.val_data, list(range(limit)))
             if len(self.val_data) > limit
@@ -294,14 +297,31 @@ class GenomicLitModel(LitModel):
         shards and would raise an error with our ZIP-based dataset.  We
         replace it with a single-batch check that verifies shape and dtype.
         """
+        actual_world_size = get_world_size()
+        expected_world_size = int(getattr(self, "expected_world_size", 1))
+        if expected_world_size > 1 and actual_world_size != expected_world_size:
+            raise RuntimeError(
+                "Distributed world-size mismatch: requested "
+                f"{expected_world_size} GPU ranks but got world_size={actual_world_size}. "
+                "This usually means Lightning fell back to single-GPU execution. "
+                "Check SLURM env and trainer strategy before launching a long run."
+            )
+
         if self.global_rank != 0:
             return
+
+        log.info(
+            "Distributed setup: world_size=%d, global_rank=%d, local_rank=%d",
+            actual_world_size,
+            self.global_rank,
+            self.local_rank,
+        )
 
         loader = self.conf.make_loader(
             self.train_data,
             shuffle=False,
             batch_size=min(4, len(self.train_data)),
-            num_worker=0,
+            num_worker=1,
         )
         try:
             batch = next(iter(loader))

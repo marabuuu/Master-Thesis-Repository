@@ -11,7 +11,6 @@ Or standalone:
 from __future__ import annotations
 
 import logging
-import os
 import traceback
 from pathlib import Path
 from typing import Any, Dict
@@ -21,7 +20,6 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 
 from mopadi.configs.choices import ModelName
-from mopadi.configs.config import PretrainConfig
 
 from .config import GenomicTrainConfig
 from .train import GenomicLitModel
@@ -100,6 +98,16 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     devices = gpus if isinstance(gpus, list) else [gpus]
     strategy = "ddp_find_unused_parameters_false" if len(devices) > 1 else "auto"
 
+    # MoPaDi's LitModel treats conf.batch_size as GLOBAL batch size and
+    # computes per-rank batch as conf.batch_size // world_size.
+    if len(devices) > 1 and conf.batch_size % len(devices) != 0:
+        raise ValueError(
+            "Invalid multi-GPU batch configuration: conf.batch_size must be "
+            "divisible by number of devices. "
+            f"Got batch_size={conf.batch_size}, devices={devices}. "
+            "Set batch_size to GLOBAL batch size (e.g. local_batch_per_gpu * n_gpus)."
+        )
+
     # ── Max steps from total_samples ────────────────────────────────────
     max_steps = conf.total_samples // conf.batch_size_effective
 
@@ -135,9 +143,17 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     if resume_ckpt:
         log.info("Resuming from checkpoint: %s", resume_ckpt)
 
+    # Guard against silent single-GPU fallback when multi-GPU was requested.
+    model.expected_world_size = max(1, len(devices))
+
     log.info(
-        "Starting training: max_steps=%d, batch_size=%d (effective=%d), gpus=%s",
-        max_steps, conf.batch_size, conf.batch_size_effective, devices,
+        "Starting training: max_steps=%d, global_batch=%d (effective=%d), "
+        "local_batch_per_rank=%d, gpus=%s",
+        max_steps,
+        conf.batch_size,
+        conf.batch_size_effective,
+        conf.batch_size // max(1, len(devices)),
+        devices,
     )
 
     try:

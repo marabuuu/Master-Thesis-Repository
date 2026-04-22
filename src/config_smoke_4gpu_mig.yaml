@@ -661,7 +661,7 @@ mopadi_genomic_training:
     Normal: null    # 38 patients — keep all tiles (too few to cap)
 
   # ── Model architecture ───────────────────────────────────────────────────
-  img_size: 512              # native TCGA tile resolution (matches tcga_brca_autoenc template)
+  img_size: 256
   net_ch: 128
   net_ch_mult: [1, 1, 2, 2, 4, 4]
   net_attn: [16]             # attention at 16×16 resolution
@@ -676,12 +676,12 @@ mopadi_genomic_training:
   # With 4-GPU DDP and accumulate_grad_batches=1, each rank sees
   # local_batch = global_batch / 4. Choose a global batch divisible by 4.
   # Here: global_batch=8 -> local_batch=2 per GPU.
-  batch_size: 8
+  batch_size: 4
   accumulate_grad_batches: 1 # 4 GPUs replace the 4 serial accum steps
-  total_samples: 2500000     # 10M global ÷ 4 GPUs = 2.5M local; max_steps=1.25M
+  total_samples: 80          # smoke run: 20 steps with global_batch=4
   steps_per_epoch: 5000
-  save_every_samples: 8000
-  reconstruct_every_samples: 50000
+  save_every_samples: 1000000
+  reconstruct_every_samples: 1000000
   sample_size: 8
 
   net_beatgans_gradient_checkpoint: false  # 96 GB VRAM on jupiter — no memory pressure
@@ -694,15 +694,17 @@ mopadi_genomic_training:
   bf16: true                 # bf16 has fp32 exponent range — numerically stable, no overflow
 
   # ── Validation ───────────────────────────────────────────────────────────
-  val_every_steps: 5000
-  limit_val_batches: 100
+  val_every_steps: 10
+  limit_val_batches: 2
   # TensorBoard scalars:
   #   loss/train, loss/val, loss/val_shuffled
   #   cond/gap — near 0 early; grows positive once model exploits genomic signal.
 
   # ── Infrastructure ───────────────────────────────────────────────────────
   seed: 42
-  num_workers: 8             # 8 CPUs per task × 4 tasks = 32 total
+  num_workers: 1
   gpus: [0, 1, 2, 3]
-  base_dir: ./experiments/20260421_mopadi_genomic_scratch/training
+  base_dir: ./experiments/20260421_mopadi_genomic_scratch/smoke_4gpu_mig
   save_top_k: 3
+  resume_from: null
+  do_resize: true
