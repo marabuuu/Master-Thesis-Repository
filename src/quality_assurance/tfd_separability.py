@@ -48,6 +48,9 @@ from .topological_frechet_distance import (
     ClassDistribution,
     _calculate_frechet_distance,
     compute_class_distribution,
+    compute_persistence_diagram_1d,
+    extract_centres_multichannel,
+    vectorise_persistence_landscape,
 )
 from .utils import extract_patient_id
 
@@ -375,6 +378,101 @@ def _iter_masks_for_class(
 
 
 # ===================================================================
+# § 3b  Landscape-vector collection helpers (memory-efficient noise floor)
+# ===================================================================
+
+def _collect_landscape_vectors(
+    mask_iter: Iterable[np.ndarray],
+    *,
+    use_alpha: bool = True,
+    n_landscape_bins: int = 100,
+    n_landscape_layers: int = 1,
+    min_cells: int = 3,
+) -> Dict[int, np.ndarray]:
+    """Stream masks and collect per-tile persistence landscape vectors per channel.
+
+    Stores ~100 floats per channel per tile (≈5.6 KB/tile) rather than the raw
+    mask (≈256 KB/tile), keeping peak RAM below ~200 MB for 21k tiles.
+
+    Returns
+    -------
+    dict[int, np.ndarray]
+        Channel index → float64 array of shape (N_tiles, vec_dim).
+    """
+    vec_dim = n_landscape_bins * n_landscape_layers
+    n_channels: Optional[int] = None
+    vectors_per_ch: Dict[int, List[np.ndarray]] = {}
+
+    for mask in mask_iter:
+        mask = np.asarray(mask)
+        centres_per_ch = extract_centres_multichannel(mask)
+
+        if n_channels is None:
+            n_channels = len(centres_per_ch)
+            vectors_per_ch = {c: [] for c in range(n_channels)}
+
+        for ch, centres in enumerate(centres_per_ch):
+            if centres.shape[0] < min_cells:
+                vec = np.zeros(vec_dim, dtype=np.float64)
+            else:
+                diagram = compute_persistence_diagram_1d(centres, use_alpha=use_alpha)
+                vec = vectorise_persistence_landscape(
+                    diagram,
+                    n_bins=n_landscape_bins,
+                    n_layers=n_landscape_layers,
+                )
+            vectors_per_ch[ch].append(vec)
+
+    if n_channels is None:
+        return {}
+    return {ch: np.array(vecs, dtype=np.float64) for ch, vecs in vectors_per_ch.items()}
+
+
+def _fit_gaussian_from_vectors(
+    vectors_per_ch: Dict[int, np.ndarray],
+    class_name: str = "",
+) -> ClassDistribution:
+    """Fit a multivariate Gaussian per channel from stored landscape vectors.
+
+    Parameters
+    ----------
+    vectors_per_ch : dict[int, np.ndarray]
+        Channel index → array of shape (N_tiles, vec_dim).
+    """
+    if not vectors_per_ch:
+        raise ValueError(f"No vectors for class '{class_name}'")
+
+    n_channels = len(vectors_per_ch)
+    vec_dim = next(iter(vectors_per_ch.values())).shape[1]
+
+    mean_dict: Dict[int, np.ndarray] = {}
+    cov_dict: Dict[int, np.ndarray] = {}
+    n_dict: Dict[int, int] = {}
+
+    for ch, vecs in vectors_per_ch.items():
+        n = len(vecs)
+        n_dict[ch] = n
+        if n == 0:
+            mean_dict[ch] = np.zeros(vec_dim)
+            cov_dict[ch] = np.eye(vec_dim)
+        elif n == 1:
+            mean_dict[ch] = vecs[0]
+            cov_dict[ch] = np.eye(vec_dim)
+        else:
+            mean_dict[ch] = vecs.mean(axis=0)
+            cov_dict[ch] = np.cov(vecs.T)
+
+    return ClassDistribution(
+        class_name=class_name,
+        n_channels=n_channels,
+        vec_dim=vec_dim,
+        mean=mean_dict,
+        cov=cov_dict,
+        n_samples=n_dict,
+    )
+
+
+# ===================================================================
 # § 4  Pipeline entry point
 # ===================================================================
 
@@ -528,6 +626,7 @@ def run_tfd_separability(cfg: Dict, verbose: bool = True) -> None:
     min_cells = cfg.get("min_cells_per_image", 3)
 
     distributions: Dict[str, ClassDistribution] = {}
+    class_vectors: Dict[str, Dict[int, np.ndarray]] = {}
     n_samples: Dict[str, int] = {}
     for cls in classes:
         pids = class_to_patients[cls]
@@ -536,19 +635,23 @@ def run_tfd_separability(cfg: Dict, verbose: bool = True) -> None:
             cap_str = str(max_per_patient) if max_per_patient is not None else "all"
             print(f"  [{cls}] Streaming masks for {len(pids)} patients (≤{cap_str} tiles/patient)…")
 
-        dist = compute_class_distribution(
+        tda_kw = dict(
+            use_alpha=use_alpha,
+            n_landscape_bins=n_landscape_bins,
+            n_landscape_layers=n_landscape_layers,
+            min_cells=min_cells,
+        )
+        vecs = _collect_landscape_vectors(
             _iter_masks_for_class(
                 masks_dir,
                 pids,
                 max_tiles_per_patient=max_per_patient,
                 seed=42,
             ),
-            class_name=cls,
-            use_alpha=use_alpha,
-            n_landscape_bins=n_landscape_bins,
-            n_landscape_layers=n_landscape_layers,
-            min_cells=min_cells,
+            **tda_kw,
         )
+        class_vectors[cls] = vecs
+        dist = _fit_gaussian_from_vectors(vecs, class_name=cls)
         distributions[cls] = dist
         n_cls = dist.n_samples.get(0, 0)
         n_samples[cls] = n_cls
@@ -598,10 +701,52 @@ def run_tfd_separability(cfg: Dict, verbose: bool = True) -> None:
 
     noise_floor: Optional[Dict[str, float]] = None
     if cfg.get("compute_noise_floor", True):
-        logger.warning(
-            "Noise-floor estimation is disabled in streaming mode to avoid excessive RAM usage. "
-            "Set compute_noise_floor: false in config to silence this warning."
-        )
+        n_splits = cfg.get("n_noise_floor_splits", 5)
+        rng = np.random.default_rng(42)
+        noise_floor = {}
+        if verbose:
+            print("\n[TopoFD-Sep] Computing intra-class noise floor…")
+
+        for cls in sorted(classes):
+            vecs = class_vectors[cls]
+            if not vecs:
+                noise_floor[cls] = float("nan")
+                continue
+            n = next(iter(vecs.values())).shape[0]
+            if n < 4:
+                logger.warning("%s: only %d tiles — skipping noise floor", cls, n)
+                noise_floor[cls] = float("nan")
+                continue
+
+            split_fds: List[float] = []
+            for _ in range(n_splits):
+                idx = np.arange(n)
+                rng.shuffle(idx)
+                half = n // 2
+                idx_a, idx_b = idx[:half], idx[half:]
+
+                vecs_a = {ch: v[idx_a] for ch, v in vecs.items()}
+                vecs_b = {ch: v[idx_b] for ch, v in vecs.items()}
+                da_nf = _fit_gaussian_from_vectors(vecs_a)
+                db_nf = _fit_gaussian_from_vectors(vecs_b)
+
+                per_ch_nf: Dict[int, float] = {}
+                for ch in range(da_nf.n_channels):
+                    if da_nf.n_samples.get(ch, 0) < 2 or db_nf.n_samples.get(ch, 0) < 2:
+                        per_ch_nf[ch] = float("nan")
+                        continue
+                    per_ch_nf[ch] = _calculate_frechet_distance(
+                        da_nf.mean[ch], da_nf.cov[ch],
+                        db_nf.mean[ch], db_nf.cov[ch],
+                    )
+                valid_nf = [v for v in per_ch_nf.values() if np.isfinite(v)]
+                if valid_nf:
+                    split_fds.append(float(np.mean(valid_nf)))
+
+            noise_floor[cls] = float(np.mean(split_fds)) if split_fds else float("nan")
+            if verbose:
+                nf_str = f"{noise_floor[cls]:.4f}" if np.isfinite(noise_floor[cls]) else "—"
+                print(f"  Noise floor ({cls}) = {nf_str}")
 
     result = TFDSeparabilityResult(
         class_names=sorted(classes),

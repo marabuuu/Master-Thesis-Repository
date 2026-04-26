@@ -49,6 +49,24 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     conf = _build_train_config(cfg)
     log.info("GenomicTrainConfig built: img_size=%d, feat_dim=%d, style_ch=%d",
              conf.img_size, conf.feat_dim, conf.style_ch)
+    cf_weight = float(getattr(conf, "counterfactual_loss_weight", 0.0))
+    cf_margin = float(getattr(conf, "counterfactual_margin", 0.0))
+    cf_every = int(getattr(conf, "counterfactual_every_n_steps", 1))
+    cf_warmup = int(getattr(conf, "counterfactual_warmup_steps", 0))
+    if cf_weight <= 0.0:
+        log.warning(
+            "Counterfactual objective is DISABLED (weight=%.4f). "
+            "Set mopadi_genomic_training.counterfactual_loss_weight > 0 in config to enable it.",
+            cf_weight,
+        )
+    else:
+        log.info(
+            "Counterfactual objective ENABLED: weight=%.4f margin=%.4f every_n_steps=%d warmup_steps=%d",
+            cf_weight,
+            cf_margin,
+            cf_every,
+            cf_warmup,
+        )
 
     # ── Model ───────────────────────────────────────────────────────────
     conf.make_model_conf()   # populates conf.model_conf
@@ -260,6 +278,11 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
         do_normalize=bool(cfg.get("do_normalize", True)),
         do_resize=bool(cfg.get("do_resize", False)),
         val_limit_batches=int(cfg.get("limit_val_batches", 100)),
+        # ── Counterfactual conditioning objective ─────────────────────
+        counterfactual_loss_weight=float(cfg.get("counterfactual_loss_weight", 0.0)),
+        counterfactual_margin=float(cfg.get("counterfactual_margin", 0.0)),
+        counterfactual_every_n_steps=int(cfg.get("counterfactual_every_n_steps", 1)),
+        counterfactual_warmup_steps=int(cfg.get("counterfactual_warmup_steps", 0)),
     )
 
     return GenomicTrainConfig(**fields)

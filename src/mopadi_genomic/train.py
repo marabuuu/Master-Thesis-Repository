@@ -55,6 +55,14 @@ class GenomicLitModel(LitModel):
         # already stored conf as self.conf — this just re-annotates the type.
         self.conf: GenomicTrainConfig = conf
 
+    @staticmethod
+    def _non_identity_permutation(n: int, device: torch.device) -> torch.Tensor:
+        """Return a permutation where no element maps to itself (if n > 1)."""
+        perm = torch.randperm(n, device=device)
+        if n > 1 and torch.equal(perm, torch.arange(n, device=device)):
+            perm = torch.roll(perm, shifts=1)
+        return perm
+
     # ------------------------------------------------------------------
     # Dataset creation (overrides parent)
     # ------------------------------------------------------------------
@@ -152,16 +160,82 @@ class GenomicLitModel(LitModel):
         the first ``/``).
         """
         out = super().training_step(batch, batch_idx)
+
+        # Optional counterfactual objective to force genomic conditioning use.
+        # Uses real patient vectors from other samples in the same batch.
+        cf_weight = float(getattr(self.conf, "counterfactual_loss_weight", 0.0))
+        cf_margin = float(getattr(self.conf, "counterfactual_margin", 0.0))
+        cf_every = max(1, int(getattr(self.conf, "counterfactual_every_n_steps", 1)))
+        cf_warmup = max(0, int(getattr(self.conf, "counterfactual_warmup_steps", 0)))
+
+        loss_val = out["loss"] if isinstance(out, dict) else out
+        if (
+            cf_weight > 0.0
+            and self.global_step >= cf_warmup
+            and (self.global_step % cf_every == 0)
+            and batch["feat"].shape[0] > 1
+        ):
+            imgs = batch["img"].to(self.device)
+            feats = batch["feat"].to(self.device, dtype=torch.float32)
+
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+            shared_noise = torch.randn_like(imgs)
+
+            losses_cond = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats,
+                t=t,
+                noise=shared_noise,
+                model_kwargs={"cond": feats},
+            )
+            loss_cond = losses_cond["loss"].mean()
+
+            perm = self._non_identity_permutation(feats.size(0), feats.device)
+            feats_shuffled = feats[perm]
+            losses_shuffled = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats_shuffled,
+                t=t,
+                noise=shared_noise,
+                model_kwargs={"cond": feats_shuffled},
+            )
+            loss_shuffled = losses_shuffled["loss"].mean()
+
+            gap = loss_shuffled - loss_cond
+            cf_penalty = torch.relu(gap.new_tensor(cf_margin) - gap)
+            cf_term = cf_weight * cf_penalty
+            loss_val = loss_val + cf_term
+
+            if isinstance(out, dict):
+                out["loss"] = loss_val
+            else:
+                out = loss_val
+
+            self.log(
+                "cond/gap_train",
+                gap,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+            self.log(
+                "loss/counterfactual",
+                cf_term,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+
         # Expose a Lightning-native metric key for ModelCheckpoint(monitor="loss").
         # add_scalar writes only to TensorBoard and is invisible to callbacks.
-        loss_val = out["loss"] if isinstance(out, dict) else out
         self.log("loss", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
         self.log("loss/train", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
 
         if self.global_rank == 0:
-            self.logger.experiment.add_scalar(
-                "loss/train", loss_val.item(), self.num_samples
-            )
             if self.global_step % 500 == 0 and self.global_step != getattr(self, "_last_train_log_step", -1):
                 self._last_train_log_step = self.global_step
                 log.info(
@@ -217,7 +291,7 @@ class GenomicLitModel(LitModel):
             # ── Loss with shuffled conditioning ──────────────────────────
             # Permute genomic vectors within the batch so each image is
             # paired with a random (likely wrong) patient's features.
-            perm = torch.randperm(feats.size(0), device=feats.device)
+            perm = self._non_identity_permutation(feats.size(0), feats.device)
             feats_shuffled = feats[perm]
             losses_shuffled = self.sampler.training_losses(
                 model=self.ema_model,
@@ -235,9 +309,9 @@ class GenomicLitModel(LitModel):
             self.logger.experiment.add_scalar("cond/gap",          gap,                  self.num_samples)
 
         # Lightning-native logs for callbacks (e.g. ModelCheckpoint monitor).
-        self.log("loss/val", loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log("loss/val_shuffled", loss_shuffled, on_step=False, on_epoch=True, prog_bar=False, logger=True)
-        self.log("cond/gap", loss_shuffled - loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True)
+        self.log("loss/val", loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("loss/val_shuffled", loss_shuffled, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("cond/gap", loss_shuffled - loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
 
         # Accumulate for on_validation_epoch_end summary log line.
         if not hasattr(self, "_val_losses"):
@@ -259,7 +333,7 @@ class GenomicLitModel(LitModel):
             mean_loss = sum(self._val_losses) / len(self._val_losses)
             mean_gap  = sum(self._val_gaps)   / len(self._val_gaps)
             log.info(
-                "step %6d | samples %10d | loss/val %.4f | cond/gap %.4f  (%d batches)",
+                "step %6d | samples %10d | loss/val %.4f | cond/gap %.6e  (%d batches)",
                 self.global_step, self.num_samples,
                 mean_loss, mean_gap, len(self._val_losses),
             )

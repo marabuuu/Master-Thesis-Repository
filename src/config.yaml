@@ -417,8 +417,8 @@ tfd_separability:
   subtype_col: Majority_Subtype_mRNA
 
   # ── Classes to analyse (null = all present in CSV) ────────────────────────
-  # Start with the two most biologically distinct subtypes as a proof-of-concept.
-  # Expand to all 5 once validated.
+  # Full 5×5 separability matrix. Basal + LumA masks already exist in masks_dir
+  # and will be reused; only LumB, Her2, Normal will be segmented fresh.
   classes: [Basal, LumA]
 
   # ── Tile balancing (mirrors mopadi_genomic_training caps) ─────────────────
@@ -457,7 +457,7 @@ tfd_separability:
   n_noise_floor_splits: 5
 
   # ── Output ────────────────────────────────────────────────────────────────
-  output_dir: ./experiments/tfd_separability/results
+  output_dir: ./experiments/tfd_separability/results_basal_luma
   save_heatmap: true
   figsize: null               # null = auto-size based on number of classes
 
@@ -640,11 +640,11 @@ mopadi_genomic_training:
     seed: 42
 
   # ── Shared paths (used by both stages) ───────────────────────────────────
-  output_dir: ./experiments/20260421_mopadi_genomic_scratch
+  output_dir: ./experiments/20260424_genomic_counterfactual_loss_72h
   # H5 files are written to output_dir/genomic_h5/ automatically.
   # The paths below are derived from output_dir; override if needed.
-  genomic_feature_dir: ./experiments/20260421_mopadi_genomic_scratch/genomic_h5
-  patient_splits_path: ./experiments/20260421_mopadi_genomic_scratch/patient_splits.json
+  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
 
   # ── Stage 2: Training inputs ──────────────────────────────────────────────
   zip_dir: ../data/BRCA-tumor-tiles-corrected
@@ -672,16 +672,26 @@ mopadi_genomic_training:
   T_eval: 20
 
   # ── Training schedule ────────────────────────────────────────────────────
+  # 72h PROFILE: long run on jupiter with production-style cadence.
+  # Keep architecture fixed; train long enough to measure sustained cond/gap.
   # In this codepath, batch_size is GLOBAL across all GPUs.
   # With 4-GPU DDP and accumulate_grad_batches=1, each rank sees
   # local_batch = global_batch / 4. Choose a global batch divisible by 4.
   # Here: global_batch=8 -> local_batch=2 per GPU.
   batch_size: 8
   accumulate_grad_batches: 1 # 4 GPUs replace the 4 serial accum steps
-  total_samples: 2500000     # 10M global ÷ 4 GPUs = 2.5M local; max_steps=1.25M
+  # max_steps is computed as:
+  #   total_samples // batch_size_effective
+  # where batch_size_effective = batch_size * accumulate_grad_batches = 8.
+  # Long-run target: 2.5M samples => 312,500 steps at effective batch 8.
+  total_samples: 2500000
   steps_per_epoch: 5000
-  save_every_samples: 8000
-  reconstruct_every_samples: 50000
+  # Checkpoint cadence in code is:
+  #   every_n_train_steps = max(save_every_samples // batch_size_effective,
+  #                             val_every_steps)
+  # Long-run cadence: reduce validation/checkpoint overhead.
+  save_every_samples: 80000
+  reconstruct_every_samples: 100000
   sample_size: 8
 
   net_beatgans_gradient_checkpoint: false  # 96 GB VRAM on jupiter — no memory pressure
@@ -694,15 +704,121 @@ mopadi_genomic_training:
   bf16: true                 # bf16 has fp32 exponent range — numerically stable, no overflow
 
   # ── Validation ───────────────────────────────────────────────────────────
+  # Long-run: validate every 5k steps to keep throughput high.
   val_every_steps: 5000
   limit_val_batches: 100
   # TensorBoard scalars:
   #   loss/train, loss/val, loss/val_shuffled
   #   cond/gap — near 0 early; grows positive once model exploits genomic signal.
 
+  # ── Counterfactual conditioning objective ───────────────────────────────
+  # Natural next step: keep architecture fixed and add a margin objective
+  # that forces shuffled (wrong) real-patient genomic vectors to perform
+  # worse than matched vectors.
+  counterfactual_loss_weight: 0.2
+  counterfactual_margin: 0.02
+  counterfactual_every_n_steps: 2
+  counterfactual_warmup_steps: 2000
+
   # ── Infrastructure ───────────────────────────────────────────────────────
   seed: 42
   num_workers: 8             # 8 CPUs per task × 4 tasks = 32 total
   gpus: [0, 1, 2, 3]
-  base_dir: ./experiments/20260421_mopadi_genomic_scratch/training
+  # Fresh run: do not auto-resume from the previous completed 72h checkpoint.
+  resume_from: null
+  base_dir: ./experiments/20260426_genomic_counterfactual_loss_72h_fresh/training
+  save_top_k: 3
+
+
+# ─── MoPaDi Genomic + Cross-Attention (dual loss) ───────────────────────────
+#
+# Extends mopadi_genomic_training with two additions:
+#   1. CrossAttentionUNetWrapper: image patches attend to the genomic vector
+#      as a single K/V token; zero-init residual added before the UNet.
+#      Style conditioning (AdaGN) is kept — cross-attention adds spatial specificity.
+#   2. Genomic-guided high-t loss: denoising at t ∈ [0.8T, T) forces the model
+#      to use genomic conditioning when x_t ≈ N(0,I) (no image information left).
+#
+# Reuses the same H5 features and patient splits as mopadi_genomic_training
+# (no encoder training — this is the key difference from gtca/cross_attention_joint).
+#
+# Run:
+#   python run_pipeline.py --config src/config.yaml --stage mopadi_genomic_crossattn
+
+mopadi_genomic_crossattn:
+
+  # ── Dataset (reuse from mopadi_genomic_training — same H5 features) ──────────
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+
+  zip_dir: ../data/BRCA-tumor-tiles-corrected
+  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  # ── Model architecture ────────────────────────────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+
+  # ── Cross-attention ───────────────────────────────────────────────────────
+  cross_attention:
+    heads: 4
+    dim_per_head: 64
+    patch_size: 16        # 512 / 16 = 32 patches per side → 1024 tokens
+
+  # ── Per-component learning rates ──────────────────────────────────────────
+  lr: 0.0001             # fallback if unet_lr / cross_attn_lr are not set
+  unet_lr: 0.0001        # UNet trains from scratch — same as main LR
+  cross_attn_lr: 0.0001  # wrapper is zero-init: same LR is fine from scratch
+
+  # ── Dual loss ─────────────────────────────────────────────────────────────
+  # L_total = L_diffusion + genomic_guided_loss_weight * L_high_t
+  # L_high_t: denoising at t ∈ [high_t_frac*T, T) where x_t ≈ N(0,I)
+  genomic_guided_loss_weight: 0.3
+  genomic_guided_high_t_frac: 0.8
+
+  # ── Training schedule ─────────────────────────────────────────────────────
+  # global_batch=8 across 4 GPUs → local_batch=2 per rank (same as CF run).
+  # The dual loss runs two forward passes per step, so effective compute per
+  # step is ~2x — keep batch_size and total_samples the same as the CF run
+  # for a fair wall-clock comparison.
+  batch_size: 8
+  accumulate_grad_batches: 1 # 4 GPUs replace accumulation; effective batch = 8
+  total_samples: 2500000
+  steps_per_epoch: 5000
+  save_every_samples: 80000
+  reconstruct_every_samples: 100000
+  sample_size: 8
+
+  net_beatgans_gradient_checkpoint: false  # 96 GB VRAM — no memory pressure
+
+  # ── Optimiser ─────────────────────────────────────────────────────────────
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Validation ────────────────────────────────────────────────────────────
+  val_every_steps: 5000
+  limit_val_batches: 100
+
+  # ── Infrastructure ────────────────────────────────────────────────────────
+  seed: 42
+  num_workers: 8             # 8 CPUs per task × 4 tasks = 32 total
+  gpus: [0, 1, 2, 3]         # 4 GPUs on Jupiter via DDP
+  base_dir: ./experiments/20260426_genomic_crossattn/training
   save_top_k: 3

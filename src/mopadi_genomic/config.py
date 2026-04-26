@@ -66,6 +66,13 @@ class GenomicTrainConfig(TrainConfig):
     do_normalize: bool = True
     do_resize: bool = False
 
+    # ── Counterfactual conditioning objective ─────────────────────────
+    # These are optional; when loss weight is 0 the objective is disabled.
+    counterfactual_loss_weight: float = 0.0
+    counterfactual_margin: float = 0.0
+    counterfactual_every_n_steps: int = 1
+    counterfactual_warmup_steps: int = 0
+
     def __post_init__(self):
         super().__post_init__()
         # Genomic conditioning uses the full embed_channels width directly.
