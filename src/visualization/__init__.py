@@ -83,6 +83,13 @@ from .training_plots import (
     plot_train_val_comparison,
     plot_training_summary,
 )
+from .tfd_separability import (
+    plot_channel_contributions,
+    plot_radar_channel_contributions,
+    plot_cell_type_boxplots,
+    plot_ternary_composition,
+    run_tfd_separability_viz,
+)
 
 __all__ = [
     # core
@@ -125,4 +132,10 @@ __all__ = [
     "plot_early_stopping",
     "plot_training_summary",
     "plot_run_comparison",
+    # tfd separability
+    "plot_channel_contributions",
+    "plot_radar_channel_contributions",
+    "plot_cell_type_boxplots",
+    "plot_ternary_composition",
+    "run_tfd_separability_viz",
 ]

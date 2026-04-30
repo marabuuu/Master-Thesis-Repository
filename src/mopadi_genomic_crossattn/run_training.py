@@ -31,6 +31,11 @@ except ImportError:
     from src.mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
     from src.mopadi_genomic_crossattn.model import GenomicCrossAttnLitModel
 
+try:
+    from mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
+except ImportError:
+    from src.mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
+
 log = logging.getLogger(__name__)
 
 
@@ -118,15 +123,28 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
         max(1, conf.save_every_samples // conf.batch_size_effective),
         int(val_every_steps),
     )
-    checkpoint_cb = ModelCheckpoint(
-        dirpath=str(autoenc_dir),
-        filename="{epoch}-{step}",
-        save_last=True,
-        save_top_k=cfg.get("save_top_k", 3),
-        monitor=cfg.get("monitor_metric", "loss/val"),
-        mode="min",
-        every_n_train_steps=ckpt_every_steps,
-    )
+    
+    # Use composite metric checkpoint if configured, else standard
+    use_composite_ckpt = cfg.get("use_composite_metric_checkpoint", False)
+    if use_composite_ckpt:
+        checkpoint_cb = CompositeMetricCheckpoint(
+            monitor_loss=cfg.get("monitor_loss", "loss/val"),
+            monitor_gap=cfg.get("monitor_gap", "cond/gap"),
+            alpha=cfg.get("composite_alpha", 1.0),
+            dirpath=str(autoenc_dir),
+            window_size=cfg.get("composite_window_size", 20),
+            save_top_k=cfg.get("save_top_k", 3),
+        )
+    else:
+        checkpoint_cb = ModelCheckpoint(
+            dirpath=str(autoenc_dir),
+            filename="{epoch}-{step}",
+            save_last=True,
+            save_top_k=cfg.get("save_top_k", 3),
+            monitor=cfg.get("monitor_metric", "loss/val"),
+            mode="min",
+            every_n_train_steps=ckpt_every_steps,
+        )
     lr_monitor = LearningRateMonitor(logging_interval="step")
 
     tb_logger = pl_loggers.TensorBoardLogger(
@@ -159,14 +177,20 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
     # the temporary flat buffers it allocates crash on destruction with
     # "CUDA illegal memory access" in TensorImpl::~TensorImpl/destroyEvent.
     # Disabling the sync eliminates the crash with no correctness impact.
+    # This model has a more dynamic backward graph than the base MoPaDi run
+    # (multi-stage conditioning + extra CF pass), so we keep DDP in the safer
+    # unused-parameter mode instead of forcing static_graph.
+    use_static_graph = False
     strategy = (
         _DefaultStreamDDPStrategy(
-            find_unused_parameters=False,
+            find_unused_parameters=True,
             init_sync=False,
             broadcast_buffers=False,
+            static_graph=use_static_graph,
         )
         if len(devices) > 1 else "auto"
     )
+    log.info("DDP static_graph=%s (gradient_checkpoint=%s)", use_static_graph, conf.net_beatgans_gradient_checkpoint)
 
     if len(devices) > 1 and conf.batch_size % len(devices) != 0:
         raise ValueError(
@@ -220,7 +244,8 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
         log.error("trainer.fit raised %s: %r", type(e).__name__, str(e))
         traceback.print_exc()
         raise
-    log.info("Training complete. Last checkpoint: %s", checkpoint_cb.last_model_path)
+    last_ckpt_path = getattr(checkpoint_cb, "last_model_path", None) or getattr(checkpoint_cb, "dirpath", "unknown")
+    log.info("Training complete. Last checkpoint dir/path: %s", last_ckpt_path)
 
 
 def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
@@ -271,7 +296,12 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         net_ch_mult=net_ch_mult,
         net_attn=net_attn,
         net_num_res_blocks=int(_get("net_num_res_blocks", 2)),
-        net_beatgans_gradient_checkpoint=bool(_get("net_beatgans_gradient_checkpoint", False)),
+        # MOPADI_GRADIENT_CHECKPOINT=1 lets the SLURM launcher override this for
+        # nodes with <96 GB VRAM (e.g. titan gpu48) without editing config.yaml.
+        net_beatgans_gradient_checkpoint=bool(
+            os.environ.get("MOPADI_GRADIENT_CHECKPOINT", "") == "1"
+            or _get("net_beatgans_gradient_checkpoint", False)
+        ),
         style_ch=style_ch,
         feat_dim=feat_dim,
         net_beatgans_embed_channels=style_ch,
@@ -284,7 +314,7 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         grad_clip=float(_get("grad_clip", 1.0)),
         fp16=bool(_get("fp16", False)),
         accum_batches=int(_get("accumulate_grad_batches", 1)),
-        num_workers=int(_get("num_workers", 4)),
+        num_workers=int(os.environ.get("MOPADI_NUM_WORKERS", "") or _get("num_workers", 4)),
         total_samples=int(_get("total_samples", 2_500_000)),
         steps_per_epoch=int(_get("steps_per_epoch", 5000)),
         save_every_samples=int(_get("save_every_samples", 200_000)),
@@ -307,6 +337,13 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         # Genomic-guided loss
         genomic_guided_loss_weight=float(cfg.get("genomic_guided_loss_weight", 0.3)),
         genomic_guided_high_t_frac=float(cfg.get("genomic_guided_high_t_frac", 0.8)),
+        # Genomic reconstruction loss
+        genomic_recon_weight=float(cfg.get("genomic_recon_weight", 0.05)),
+        # Counterfactual conditioning loss
+        counterfactual_loss_weight=float(cfg.get("counterfactual_loss_weight", 0.0)),
+        counterfactual_temperature=float(cfg.get("counterfactual_temperature", 0.05)),
+        counterfactual_every_n_steps=int(cfg.get("counterfactual_every_n_steps", 1)),
+        counterfactual_warmup_steps=int(cfg.get("counterfactual_warmup_steps", 0)),
     )
 
     return GenomicCrossAttnConfig(**fields)

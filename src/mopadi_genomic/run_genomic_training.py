@@ -50,9 +50,10 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     log.info("GenomicTrainConfig built: img_size=%d, feat_dim=%d, style_ch=%d",
              conf.img_size, conf.feat_dim, conf.style_ch)
     cf_weight = float(getattr(conf, "counterfactual_loss_weight", 0.0))
-    cf_margin = float(getattr(conf, "counterfactual_margin", 0.0))
+    cf_temperature = float(getattr(conf, "counterfactual_temperature", 0.05))
     cf_every = int(getattr(conf, "counterfactual_every_n_steps", 1))
     cf_warmup = int(getattr(conf, "counterfactual_warmup_steps", 0))
+    cond_dropout = float(getattr(conf, "cond_dropout_prob", 0.0))
     if cf_weight <= 0.0:
         log.warning(
             "Counterfactual objective is DISABLED (weight=%.4f). "
@@ -61,11 +62,13 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         )
     else:
         log.info(
-            "Counterfactual objective ENABLED: weight=%.4f margin=%.4f every_n_steps=%d warmup_steps=%d",
+            "Counterfactual objective ENABLED: weight=%.4f temperature=%.4f "
+            "every_n_steps=%d warmup_steps=%d cond_dropout=%.2f",
             cf_weight,
-            cf_margin,
+            cf_temperature,
             cf_every,
             cf_warmup,
+            cond_dropout,
         )
 
     # ── Model ───────────────────────────────────────────────────────────
@@ -281,8 +284,11 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
         # ── Counterfactual conditioning objective ─────────────────────
         counterfactual_loss_weight=float(cfg.get("counterfactual_loss_weight", 0.0)),
         counterfactual_margin=float(cfg.get("counterfactual_margin", 0.0)),
+        counterfactual_temperature=float(cfg.get("counterfactual_temperature", 0.05)),
         counterfactual_every_n_steps=int(cfg.get("counterfactual_every_n_steps", 1)),
         counterfactual_warmup_steps=int(cfg.get("counterfactual_warmup_steps", 0)),
+        # ── CFG dropout ───────────────────────────────────────────────
+        cond_dropout_prob=float(cfg.get("cond_dropout_prob", 0.0)),
     )
 
     return GenomicTrainConfig(**fields)

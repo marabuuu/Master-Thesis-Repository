@@ -63,6 +63,8 @@ class GenomicCrossAttnConfig(GenomicTrainConfig):
     # ── Genomic-guided high-t loss ────────────────────────────────────────
     genomic_guided_loss_weight: float = 0.3
     genomic_guided_high_t_frac: float = 0.8
+    # ── Optional genomic reconstruction loss (MSE from pooled mid features)
+    genomic_recon_weight: float = 0.05
 
     @classmethod
     def from_dict(cls, cfg: Dict[str, Any]) -> "GenomicCrossAttnConfig":

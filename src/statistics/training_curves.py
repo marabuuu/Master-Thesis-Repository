@@ -72,6 +72,7 @@ def _empty_run() -> TrainingRun:
         "epochs": [],
         "loss_epoch": [],
         "val_loss": [],
+        "val_loss_shuffled": [],
         # Actual epoch indices where each val_loss entry was logged.
         # Populated by parse_tensorboard_events when val_check_interval > 1.
         # Avoids mapping val_loss[i] → epoch i (wrong) instead of epoch 5i (right).
@@ -81,9 +82,24 @@ def _empty_run() -> TrainingRun:
         "epoch_step_boundaries": [],
         "lr": [],
         "lr_steps": [],
+        "genomic_guided_loss": [],
+        "genomic_guided_steps": [],
+        "genomic_train_loss": [],
+        "genomic_train_steps": [],
+        "genomic_val_loss": [],
+        "genomic_val_steps": [],
+        "counterfactual_loss": [],
+        "counterfactual_steps": [],
+        "cond_gap": [],
+        "cond_gap_steps": [],
+        "cond_gap_train": [],
+        "cond_gap_train_steps": [],
+        "val_loss_shuffled": [],
+        "val_loss_shuffled_steps": [],
         "improved_epochs": [],
         "best_val_epoch": None,
         "best_val_loss": None,
+        "series": {},
         "meta": {},
     }
 
@@ -148,6 +164,22 @@ def parse_tensorboard_events(
 
     run = _empty_run()
 
+    def _store_series(tag_name: str, steps: List[int], values: List[float]) -> None:
+        series = run.setdefault("series", {})
+        series[tag_name] = {"tag": tag_name, "steps": steps, "values": values}
+
+    def _set_if_empty(key: str, values: List[float], steps: List[int]) -> None:
+        if not run[key]:
+            run[key] = values
+            step_key = f"{key}_steps"
+            if step_key in run:
+                run[step_key] = steps
+
+    # Keep track of epoch numbers if available
+    epoch_values = []
+    epoch_steps = []
+    has_epoch_tag = False
+
     for tag in tags:
         if tag not in available_tags:
             continue
@@ -157,65 +189,132 @@ def parse_tensorboard_events(
 
         # Map tag → TrainingRun key
         tag_lower = tag.lower().replace("/", "_").replace("-", "_")
+        _store_series(tag_lower, steps, values)
 
-        if tag_lower in ("loss_epoch", "train_loss", "train_loss_epoch", "train_loss_epoch"):
+        # Special: the "epoch" tag tells us the epoch counter at each step
+        if tag == "epoch":
+            has_epoch_tag = True
+            epoch_values = values
+            epoch_steps = steps
+            if values:
+                unique_epochs = sorted(set(int(e) for e in values))
+                run["epochs"] = unique_epochs
+
+        if tag_lower in ("loss_epoch", "train_loss_epoch"):
             run["loss_epoch"] = values
-            run["epoch_step_boundaries"] = steps  # global_step at the end of each epoch
-            # Derive epoch indices (Lightning logs once per epoch for
-            # on_epoch=True metrics)
+            run["epoch_step_boundaries"] = steps
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
-        elif tag_lower in ("val_loss", "val_loss_epoch", "valid_loss", "val_loss_epoch"):
+        elif tag_lower in ("val_loss", "val_loss_epoch", "valid_loss", "loss_val"):
             run["val_loss"] = values
-            run["_val_loss_steps"] = steps  # keep raw steps for epoch-alignment below
+            run["_val_loss_steps"] = steps
             if not run["epochs"]:
                 run["epochs"] = list(range(len(values)))
-        elif tag_lower in ("loss", "loss_step", "train_loss_step"):
-            run["loss_step"] = values
-            run["step_numbers"] = steps
+        elif tag_lower in ("loss", "loss_step", "train_loss", "loss_train", "train_loss_step", "loss_train"):
+            if not run["loss_step"] or len(values) < len(run["loss_step"]):
+                # Prefer loss/train over generic "loss" if both exist
+                if tag in ("loss/train", "loss_train") or "train" in tag:
+                    run["loss_step"] = values
+                    run["step_numbers"] = steps
+                elif not run["loss_step"]:
+                    run["loss_step"] = values
+                    run["step_numbers"] = steps
+        elif tag_lower in ("loss_genomic_guided", "genomic_guided_loss"):
+            _set_if_empty("genomic_guided_loss", values, steps)
+        elif tag_lower in ("loss_counterfactual", "counterfactual_loss"):
+            _set_if_empty("counterfactual_loss", values, steps)
+        elif tag_lower in ("cond_gap",):
+            _set_if_empty("cond_gap", values, steps)
+        elif tag_lower in ("cond_gap_train",):
+            _set_if_empty("cond_gap_train", values, steps)
+        elif tag_lower in ("loss_val_shuffled", "val_loss_shuffled"):
+            _set_if_empty("val_loss_shuffled", values, steps)
         elif "lr" in tag_lower:
             run["lr"] = values
             run["lr_steps"] = steps
 
     # Ensure epochs list length matches
     max_len = max(len(run["loss_epoch"]), len(run["val_loss"]))
-    if max_len and not run["epochs"]:
-        run["epochs"] = list(range(max_len))
-    elif len(run["epochs"]) < max_len:
-        run["epochs"] = list(range(max_len))
+    if not has_epoch_tag:
+        # Only auto-generate epochs if we don't have the explicit epoch tag
+        if max_len and not run["epochs"]:
+            run["epochs"] = list(range(max_len))
+        elif len(run["epochs"]) < max_len:
+            run["epochs"] = list(range(max_len))
 
-    # Compute val_epochs: the actual epoch index (into run["epochs"]) for each
-    # val_loss entry.  Without this, val_loss[i] would be plotted at epoch i
-    # instead of the epoch when validation actually ran.
-    # Example: val_check_interval=5, 100 epochs → 20 val entries at epochs
-    # 5,10,…,100 but without correction they'd appear at epochs 0–19.
-    val_steps = run.pop("_val_loss_steps", [])
-    epoch_boundaries = run["epoch_step_boundaries"]
-    if val_steps and epoch_boundaries and len(run["val_loss"]) < len(run["epochs"]):
-        import bisect
-        val_epochs = []
-        for vs in val_steps:
-            # epoch_boundaries[i] = global_step at end of epoch i+1.
-            # bisect_left gives the first boundary >= vs, i.e. epoch index.
-            idx = bisect.bisect_left(epoch_boundaries, vs)
-            idx = min(idx, len(run["epochs"]) - 1)
-            val_epochs.append(run["epochs"][idx])
-        run["val_epochs"] = val_epochs
-    elif val_steps and run["epochs"] and len(run["val_loss"]) < len(run["epochs"]):
-        # Fallback when TensorBoard lacks epoch-boundary steps for loss_epoch.
-        # We still know validation was logged throughout training, so distribute
-        # the available val points across the full epoch span.
-        n_val = len(run["val_loss"])
-        n_epochs = len(run["epochs"])
-        if n_val == 1:
-            run["val_epochs"] = [run["epochs"][-1]]
-        else:
-            step = max(1.0, (n_epochs - 1) / float(n_val - 1))
-            mapped = [run["epochs"][min(int(round(i * step)), n_epochs - 1)] for i in range(n_val)]
-            run["val_epochs"] = mapped
+    # If we have the epoch tag, use it to bucket step-level metrics accurately.
+    if epoch_values and epoch_steps and len(run["epochs"]) > 1:
+        # Create a mapping from step to epoch number
+        step_to_epoch = dict(zip(epoch_steps, [int(e) for e in epoch_values]))
+
+        # Bucket cond_gap by epoch
+        if run.get("cond_gap") and run.get("cond_gap_steps"):
+            buckets: Dict[int, List[float]] = {}
+            for step, loss in zip(run.get("cond_gap_steps", []), run.get("cond_gap", [])):
+                epoch_id = step_to_epoch.get(step)
+                if epoch_id is not None:
+                    buckets.setdefault(epoch_id, []).append(loss)
+            if buckets:
+                epochs_sorted = sorted(buckets.keys())
+                cond_gap_aggregated = [float(np.mean(buckets[e])) for e in epochs_sorted]
+                run["cond_gap"] = cond_gap_aggregated
+                # Don't set cond_gap_steps anymore since we aggregated to epochs
+
+        # Bucket cond_gap_train by epoch  
+        if run.get("cond_gap_train") and run.get("cond_gap_train_steps"):
+            buckets = {}
+            for step, loss in zip(run.get("cond_gap_train_steps", []), run.get("cond_gap_train", [])):
+                epoch_id = step_to_epoch.get(step)
+                if epoch_id is not None:
+                    buckets.setdefault(epoch_id, []).append(loss)
+            if buckets:
+                epochs_sorted = sorted(buckets.keys())
+                run["cond_gap_train"] = [float(np.mean(buckets[e])) for e in epochs_sorted]
+
+        # Bucket loss_step by epoch
+        if run["loss_step"] and run["step_numbers"]:
+            buckets: Dict[int, List[float]] = {}
+            for step, loss in zip(run["step_numbers"], run["loss_step"]):
+                epoch_id = step_to_epoch.get(step)
+                if epoch_id is not None:
+                    buckets.setdefault(epoch_id, []).append(loss)
+            if buckets:
+                epochs_sorted = sorted(buckets.keys())
+                run["loss_epoch"] = [float(np.mean(buckets[e])) for e in epochs_sorted]
+                # Ensure epochs list covers all epochs we have data for
+                if max(epochs_sorted) >= len(run["epochs"]):
+                    run["epochs"] = list(range(max(epochs_sorted) + 1))
+
+        # Bucket val_loss by epoch
+        val_steps = run.pop("_val_loss_steps", [])
+        if run["val_loss"] and val_steps:
+            buckets = {}
+            for step, loss in zip(val_steps, run["val_loss"]):
+                epoch_id = step_to_epoch.get(step)
+                if epoch_id is not None:
+                    buckets.setdefault(epoch_id, []).append(loss)
+            if buckets:
+                epochs_sorted = sorted(buckets.keys())
+                run["val_loss"] = [float(np.mean(buckets[e])) for e in epochs_sorted]
+                run["val_epochs"] = epochs_sorted
+                if max(epochs_sorted) >= len(run["epochs"]):
+                    run["epochs"] = list(range(max(epochs_sorted) + 1))
     else:
-        # 1:1 mapping (val_check_interval=1) or no step info available
-        run["val_epochs"] = list(run["epochs"][: len(run["val_loss"])])
+        # Fallback: epoch-alignment without the epoch tag
+        val_steps = run.pop("_val_loss_steps", [])
+        if val_steps and run["epochs"]:
+            if len(run["val_loss"]) < len(run["epochs"]):
+                n_val = len(run["val_loss"])
+                n_epochs = len(run["epochs"])
+                if n_val == 1:
+                    run["val_epochs"] = [run["epochs"][-1]]
+                else:
+                    step = max(1.0, (n_epochs - 1) / float(n_val - 1))
+                    run["val_epochs"] = [run["epochs"][min(int(round(i * step)), n_epochs - 1)] for i in range(n_val)]
+            else:
+                run["val_epochs"] = list(run["epochs"][: len(run["val_loss"])])
+        elif run["epochs"]:
+            run["val_epochs"] = list(run["epochs"][: len(run["val_loss"])])
 
     run["meta"]["source"] = "tensorboard"
     run["meta"]["event_file"] = str(event_files[0])
@@ -231,24 +330,20 @@ def parse_tensorboard_events(
 def parse_lightning_log(
     log_path: str | Path,
 ) -> TrainingRun:
-    """Parse a PyTorch Lightning stdout log (tqdm progress bars).
+    """Parse a PyTorch Lightning log stream.
 
-    Extracts ``loss_step``, ``loss_epoch``, and ``val_loss`` from lines
-    such as::
+    This parser is intentionally tolerant because the current training run
+    writes useful information in both ``.out`` and ``.err``:
 
-        Epoch 0: 100%|██| 4210/4210 [..., loss_step=0.047, val_loss=0.033, loss_epoch=0.037]
+    - ``.out`` contains epoch/progress-bar lines such as ``Epoch 0: 0/24661``
+      from which we infer epoch boundaries and steps-per-epoch.
+    - ``.err`` contains the human-readable metric summaries we care about,
+      e.g. ``step 500 | samples 4000 | loss/train 0.0030``.
 
-    The parser picks the **last** occurrence of each metric per epoch
-    (the authoritative 100% tqdm update).
-
-    Parameters
-    ----------
-    log_path : str | Path
-        Path to the ``.out`` log file.
-
-    Returns
-    -------
-    TrainingRun
+    Rather than assume Lightning is printing ``loss_epoch=...`` and
+    ``val_loss=...`` in the tqdm suffix, we recover the actual step metrics
+    that are present and aggregate them into epoch-level series only when we
+    have enough information to do so.
     """
     log_path = Path(log_path)
     if not log_path.exists():
@@ -256,71 +351,179 @@ def parse_lightning_log(
 
     text = log_path.read_text(errors="replace")
     run = _empty_run()
+    lines = text.splitlines()
 
-    # --- epoch-level metrics (last report per epoch) ---
-    # We collect all values per epoch and keep the last one.
-    epoch_loss: Dict[int, float] = {}
-    epoch_val: Dict[int, float] = {}
+    epoch_re = re.compile(r"Epoch\s+(\d+):")
+    epoch_progress_re = re.compile(r"Epoch\s+\d+:.*?\|\s*0/(\d+)")
+    step_re = re.compile(r"\bstep\s+(\d+)\b")
+    metric_re = re.compile(
+        r"(loss/train|loss/val|loss/val_shuffled|loss/genomic_guided|loss/genomic_train|loss/genomic_val|"
+        r"loss/counterfactual|cond/gap_train|cond/gap|val_loss|"
+        r"val_loss_shuffled|loss_step|train_loss_step|train_loss|loss)"
+        r"\s*[:=]?\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)"
+    )
 
-    # Patterns for the tqdm suffix
-    epoch_re = re.compile(r"Epoch\s+(\d+)")
-    loss_epoch_re = re.compile(r"loss_epoch\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
-    val_loss_re = re.compile(r"val_loss\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
+    # Keep raw samples so we can aggregate them into epoch-level metrics later.
+    step_samples: Dict[str, List[Tuple[int, float]]] = {
+        "loss_step": [],
+        "val_loss": [],
+        "val_loss_shuffled": [],
+        "genomic_guided_loss": [],
+        "counterfactual_loss": [],
+        "cond_gap": [],
+        "cond_gap_train": [],
+    }
+    epoch_seen: List[int] = []
+    current_step: Optional[int] = None
+    steps_per_epoch: Optional[int] = None
 
-    current_epoch: Optional[int] = None
-    for line in text.splitlines():
-        m_ep = epoch_re.search(line)
-        if m_ep:
-            current_epoch = int(m_ep.group(1))
+    def _record(metric_key: str, step_num: int, value: float) -> None:
+        if metric_key in step_samples:
+            step_samples[metric_key].append((step_num, value))
+        series = run.setdefault("series", {})
+        series.setdefault(metric_key, {"tag": metric_key, "steps": [], "values": []})
+        series[metric_key]["steps"].append(step_num)
+        series[metric_key]["values"].append(value)
 
-        if current_epoch is None:
-            continue
+    metric_aliases = {
+        "loss": "loss_step",
+        "train_loss": "loss_step",
+        "loss_step": "loss_step",
+        "train_loss_step": "loss_step",
+        "loss/train": "loss_step",
+        "loss/val": "val_loss",
+        "val_loss": "val_loss",
+        "loss/val_shuffled": "val_loss_shuffled",
+        "val_loss_shuffled": "val_loss_shuffled",
+        "loss/genomic_guided": "genomic_guided_loss",
+        "loss/genomic_train": "genomic_train_loss",
+        "loss/genomic_val": "genomic_val_loss",
+        "loss/counterfactual": "counterfactual_loss",
+        "cond/gap": "cond_gap",
+        "cond/gap_train": "cond_gap_train",
+    }
 
-        m_le = loss_epoch_re.search(line)
-        if m_le:
-            epoch_loss[current_epoch] = float(m_le.group(1))
+    for line in lines:
+        m_epoch = epoch_re.search(line)
+        if m_epoch:
+            epoch_seen.append(int(m_epoch.group(1)))
 
-        m_vl = val_loss_re.search(line)
-        if m_vl:
-            epoch_val[current_epoch] = float(m_vl.group(1))
+        m_steps = epoch_progress_re.search(line)
+        if m_steps:
+            steps_per_epoch = int(m_steps.group(1))
 
-    # Build sorted epoch-level lists
-    all_epochs = sorted(set(epoch_loss.keys()) | set(epoch_val.keys()))
-    run["epochs"] = all_epochs
-    run["loss_epoch"] = [epoch_loss.get(e, float("nan")) for e in all_epochs]
-    run["val_loss"] = [epoch_val.get(e, float("nan")) for e in all_epochs]
+        m_step = step_re.search(line)
+        if m_step:
+            current_step = int(m_step.group(1))
 
-    # Remove trailing NaNs
-    for key in ("loss_epoch", "val_loss"):
-        while run[key] and (run[key][-1] != run[key][-1]):  # NaN check
-            run[key].pop()
+        for m in metric_re.finditer(line):
+            raw_metric = m.group(1)
+            metric_key = metric_aliases.get(raw_metric, raw_metric)
+            value = float(m.group(2))
+            step_num = current_step if current_step is not None else len(run.get(metric_key, []))
+            _record(metric_key, step_num, value)
 
-    # --- per-step loss ---
-    step_loss_re = re.compile(r"loss_step\s*=\s*([0-9]*\.?[0-9]+(?:[eE][+-]?\d+)?)")
-    step_losses: List[float] = []
-    step_epoch_boundaries: List[int] = []
-    prev_epoch: Optional[int] = None
+    # Derive epoch count from actual progress information if we have it.
+    max_epoch_seen = max(epoch_seen) if epoch_seen else None
 
-    for line in text.splitlines():
-        m_ep = epoch_re.search(line)
-        if m_ep:
-            ep = int(m_ep.group(1))
-            if ep != prev_epoch:
-                step_epoch_boundaries.append(len(step_losses))
-                prev_epoch = ep
+    def _aggregate_by_epoch(samples: List[Tuple[int, float]]) -> tuple[List[int], List[float]]:
+        if not samples:
+            return [], []
 
-        m_sl = step_loss_re.search(line)
-        if m_sl:
-            step_losses.append(float(m_sl.group(1)))
+        buckets: Dict[int, List[float]] = {}
+        if steps_per_epoch and steps_per_epoch > 0:
+            for step_num, value in samples:
+                buckets.setdefault(step_num // steps_per_epoch, []).append(value)
+        elif max_epoch_seen is not None:
+            # Best effort when we know how many epochs exist but do not know the
+            # per-epoch step count.  Distribute samples evenly across epochs.
+            n_epochs = max_epoch_seen + 1
+            ordered = [value for _step, value in samples]
+            chunk_size = max(1, len(ordered) // n_epochs)
+            for idx in range(n_epochs):
+                start = idx * chunk_size
+                end = (idx + 1) * chunk_size if idx < n_epochs - 1 else len(ordered)
+                chunk = ordered[start:end]
+                if chunk:
+                    buckets[idx] = chunk
+        else:
+            buckets[0] = [value for _step, value in samples]
 
-    # Deduplicate consecutive identical values (tqdm re-renders)
-    deduped: List[float] = []
-    for v in step_losses:
-        if not deduped or v != deduped[-1]:
-            deduped.append(v)
-    run["loss_step"] = deduped
-    run["step_numbers"] = list(range(len(deduped)))
-    run["epoch_step_boundaries"] = step_epoch_boundaries
+        epochs_sorted = sorted(buckets)
+        return epochs_sorted, [float(np.mean(buckets[e])) for e in epochs_sorted]
+
+    # If the log printed explicit epoch-level values, keep them. Otherwise,
+    # derive them from the step-level series rather than inventing 50 epochs.
+    for key, samples in step_samples.items():
+        epochs, values = _aggregate_by_epoch(samples)
+        if key == "loss_step":
+            run["loss_step"] = [v for _s, v in step_samples[key]]
+            run["step_numbers"] = [s for s, _v in step_samples[key]]
+        elif key == "val_loss":
+            run["val_loss"] = values
+            run["val_epochs"] = epochs
+        elif key == "val_loss_shuffled":
+            run["val_loss_shuffled"] = values
+            run["val_loss_shuffled_steps"] = epochs
+        elif key == "genomic_guided_loss":
+            run["genomic_guided_loss"] = values
+            run["genomic_guided_steps"] = epochs
+        elif key == "genomic_train_loss":
+            run["genomic_train_loss"] = values
+            run["genomic_train_steps"] = epochs
+        elif key == "genomic_val_loss":
+            run["genomic_val_loss"] = values
+            run["genomic_val_steps"] = epochs
+        elif key == "counterfactual_loss":
+            run["counterfactual_loss"] = values
+            run["counterfactual_steps"] = epochs
+        elif key == "cond_gap":
+            run["cond_gap"] = values
+            run["cond_gap_steps"] = epochs
+        elif key == "cond_gap_train":
+            run["cond_gap_train"] = values
+            run["cond_gap_train_steps"] = epochs
+
+    if run["loss_step"]:
+        run["epoch_step_boundaries"] = []
+        if steps_per_epoch and steps_per_epoch > 0:
+            max_step = max(run["step_numbers"] or [0])
+            n_epochs = max(1, (max_step // steps_per_epoch) + 1)
+        elif max_epoch_seen is not None:
+            n_epochs = max_epoch_seen + 1
+        else:
+            n_epochs = max(1, len(run["loss_step"]))
+
+        run["epochs"] = list(range(n_epochs))
+
+        # If we did not manage to construct epoch losses from explicit series,
+        # fall back to evenly chunking the logged step losses.  This keeps the
+        # x-axis honest and anchored to the observed run length instead of an
+        # arbitrary hard-coded 50-epoch assumption.
+        if not run["loss_epoch"]:
+            step_losses = run["loss_step"]
+            chunk_size = max(1, len(step_losses) // n_epochs)
+            inferred = []
+            for idx in range(n_epochs):
+                start = idx * chunk_size
+                end = (idx + 1) * chunk_size if idx < n_epochs - 1 else len(step_losses)
+                chunk = step_losses[start:end]
+                if chunk:
+                    inferred.append(float(np.mean(chunk)))
+            run["loss_epoch"] = inferred
+
+    if not run["val_loss"] and "val_loss" in run.get("series", {}):
+        run["val_loss"] = run["series"]["val_loss"]["values"]
+
+    if run["val_loss"] and not run.get("val_epochs"):
+        run["val_epochs"] = list(range(len(run["val_loss"])))
+
+    run["meta"]["source"] = "lightning_log"
+    run["meta"]["log_path"] = str(log_path)
+    if steps_per_epoch is not None:
+        run["meta"]["steps_per_epoch"] = steps_per_epoch
+    if max_epoch_seen is not None:
+        run["meta"]["max_epoch_seen"] = max_epoch_seen
 
     # --- metadata from header ---
     lr_match = re.search(r"UNet LR\s*:\s*([\d.eE+-]+)", text)
@@ -330,8 +533,6 @@ def parse_lightning_log(
         r"Patient split:\s*(\d+)\s*train,\s*(\d+)\s*val", text
     )
 
-    run["meta"]["source"] = "lightning_log"
-    run["meta"]["log_path"] = str(log_path)
     if lr_match:
         run["meta"]["unet_lr"] = float(lr_match.group(1))
     if proj_lr_match:
@@ -460,25 +661,46 @@ def parse_experiment_dir(
     run = _empty_run()
     run["meta"]["logdir"] = str(logdir)
 
+    def _newest(paths: List[Path]) -> Optional[Path]:
+        if not paths:
+            return None
+        return max(paths, key=lambda p: p.stat().st_mtime)
+
+    def _merge(dst: TrainingRun, src: TrainingRun) -> None:
+        for key in ("epochs", "loss_epoch", "val_loss", "val_epochs", "loss_step", "step_numbers", "epoch_step_boundaries", "lr", "lr_steps", "genomic_guided_loss", "genomic_guided_steps", "counterfactual_loss", "counterfactual_steps", "cond_gap", "cond_gap_steps", "cond_gap_train", "cond_gap_train_steps", "val_loss_shuffled", "val_loss_shuffled_steps", "improved_epochs"):
+            if src.get(key) and not dst.get(key):
+                dst[key] = src[key]
+
+        for key, value in src.get("series", {}).items():
+            dst.setdefault("series", {})[key] = value
+
+        for key, value in src.get("meta", {}).items():
+            if key not in dst["meta"]:
+                dst["meta"][key] = value
+
     # --- TensorBoard ---
     tb_run = parse_tensorboard_events(logdir)
 
     # --- stdout (.out) log ---
-    out_files = sorted(logdir.glob("*.out"))
+    out_files = sorted(logdir.rglob("*.out"))
     log_run = _empty_run()
-    if out_files:
+    out_file = _newest(out_files)
+    if out_file is not None:
         try:
-            log_run = parse_lightning_log(out_files[0])
+            log_run = parse_lightning_log(out_file)
         except Exception as e:
-            print(f"[WARN] Could not parse {out_files[0]}: {e}")
+            print(f"[WARN] Could not parse {out_file}: {e}")
 
     # --- stderr (.err) log ---
-    err_files = sorted(logdir.glob("*.err"))
-    if err_files:
+    err_files = sorted(logdir.rglob("*.err"))
+    err_file = _newest(err_files)
+    err_run = _empty_run()
+    if err_file is not None:
         try:
-            parse_stderr_log(err_files[0], run=run)
+            err_run = parse_lightning_log(err_file)
+            parse_stderr_log(err_file, run=err_run)
         except Exception as e:
-            print(f"[WARN] Could not parse {err_files[0]}: {e}")
+            print(f"[WARN] Could not parse {err_file}: {e}")
 
     # --- Merge strategy ---
     # TensorBoard epoch-level metrics are more reliable (precise floats).
@@ -536,54 +758,50 @@ def parse_experiment_dir(
         run["lr"] = tb_run["lr"]
         run["lr_steps"] = tb_run["lr_steps"]
 
-    # --- INFER MISSING EPOCH METRICS FROM STEP METRICS ---
-    if not run.get("loss_epoch") and run.get("loss_step"):
-        step_losses = run["loss_step"]
-        boundaries = run.get("epoch_step_boundaries", [])
-        inferred_epochs = []
-        
-        if boundaries and len(boundaries) > 1:
-            for i in range(len(boundaries) - 1):
-                chunk = step_losses[boundaries[i]:boundaries[i+1]]
-                if chunk: inferred_epochs.append(sum(chunk) / len(chunk))
-            last_chunk = step_losses[boundaries[-1]:]
-            if last_chunk: inferred_epochs.append(sum(last_chunk) / len(last_chunk))
-        else:
-            # Try to infer the number of epochs from checkpoint filenames (if any).
-            # If we have a checkpoint named `epoch=99-step=500000.ckpt`, we can use
-            # that to set a realistic epoch count instead of an arbitrary 50.
-            n_epochs = None
-            for ckpt in Path(logdir).glob("epoch=*.ckpt"):
-                m = re.search(r"epoch=(\d+)", ckpt.name)
-                if m:
-                    epoch_id = int(m.group(1))
-                    if n_epochs is None or epoch_id + 1 > n_epochs:
-                        n_epochs = epoch_id + 1
+    # Merge the richer scalar series from TensorBoard and the Lightning logs.
+    _merge(run, tb_run)
+    _merge(run, log_run)
+    _merge(run, err_run)
 
-            if n_epochs is None:
-                n_epochs = min(50, len(step_losses))
+    # Rebuild epoch-level curves from the merged step-level series.
+    steps_per_epoch = run.get("meta", {}).get("steps_per_epoch")
 
-            # Ensure we have at most one loss value per epoch
-            n_epochs = min(n_epochs, len(step_losses))
+    def _aggregate_from_series(series_name: str) -> tuple[List[int], List[float]]:
+        payload = run.get("series", {}).get(series_name)
+        if not payload:
+            return [], []
+        steps = payload.get("steps", [])
+        values = payload.get("values", [])
+        if not steps or not values or len(steps) != len(values):
+            return [], []
+        if not steps_per_epoch or steps_per_epoch <= 0:
+            return list(range(len(values))), [float(v) for v in values]
+        buckets: Dict[int, List[float]] = {}
+        for step_num, value in zip(steps, values):
+            buckets.setdefault(int(step_num) // int(steps_per_epoch), []).append(float(value))
+        epochs = sorted(buckets)
+        return epochs, [float(np.mean(buckets[e])) for e in epochs]
 
-            chunk_size = len(step_losses) // n_epochs
-            for i in range(n_epochs):
-                start = i * chunk_size
-                end = (i + 1) * chunk_size if i < n_epochs - 1 else len(step_losses)
-                chunk = step_losses[start:end]
-                if chunk:
-                    inferred_epochs.append(sum(chunk) / len(chunk))
+    if run.get("series", {}).get("loss_step"):
+        run["epochs"], run["loss_epoch"] = _aggregate_from_series("loss_step")
 
-        run["loss_epoch"] = inferred_epochs
-        if not run.get("epochs") or len(run["epochs"]) != len(inferred_epochs):
-            run["epochs"] = list(range(len(inferred_epochs)))
-        run["meta"]["inferred_epoch_loss"] = True
+    if run.get("series", {}).get("val_loss"):
+        run["val_epochs"], run["val_loss"] = _aggregate_from_series("val_loss")
 
-    # Merge metadata
-    for src in (tb_run, log_run):
-        for k, v in src.get("meta", {}).items():
-            if k not in run["meta"]:
-                run["meta"][k] = v
+    if run.get("series", {}).get("val_loss_shuffled"):
+        run["val_loss_shuffled_steps"], run["val_loss_shuffled"] = _aggregate_from_series("val_loss_shuffled")
+
+    if run.get("series", {}).get("genomic_guided_loss"):
+        run["genomic_guided_steps"], run["genomic_guided_loss"] = _aggregate_from_series("genomic_guided_loss")
+
+    if run.get("series", {}).get("counterfactual_loss"):
+        run["counterfactual_steps"], run["counterfactual_loss"] = _aggregate_from_series("counterfactual_loss")
+
+    if run.get("series", {}).get("cond_gap"):
+        run["cond_gap_steps"], run["cond_gap"] = _aggregate_from_series("cond_gap")
+
+    if run.get("series", {}).get("cond_gap_train"):
+        run["cond_gap_train_steps"], run["cond_gap_train"] = _aggregate_from_series("cond_gap_train")
 
     return run
 
@@ -628,6 +846,12 @@ def print_training_summary(run: TrainingRun) -> None:
         print(f"  UNet LR   : {meta['unet_lr']}")
     if meta.get("proj_lr"):
         print(f"  Proj LR   : {meta['proj_lr']}")
+    if run.get("genomic_guided_loss"):
+        print(f"  Genomic   : loss/genomic_guided={run['genomic_guided_loss'][-1]:.6f}")
+    if run.get("counterfactual_loss"):
+        print(f"  Counterf. : loss/counterfactual={run['counterfactual_loss'][-1]:.6f}")
+    if run.get("cond_gap"):
+        print(f"  cond/gap  : final={run['cond_gap'][-1]:.6e}")
     if meta.get("n_train"):
         print(
             f"  Patients  : {meta['n_train']} train, "
@@ -770,6 +994,7 @@ def main() -> None:
         plot_training_summary,
         plot_batch_loss_trajectory,
         plot_train_val_comparison,
+        plot_genomic_diagnostics,
         plot_early_stopping,
         plot_run_comparison,
     )
@@ -784,6 +1009,7 @@ def main() -> None:
         "loss_curves": plot_loss_curves,
         "batch_trajectory": plot_batch_loss_trajectory,
         "train_val_comparison": plot_train_val_comparison,
+        "genomic_diagnostics": plot_genomic_diagnostics,
         "early_stopping": plot_early_stopping,
         "summary": plot_training_summary,
         "comparison": plot_run_comparison,
@@ -830,6 +1056,13 @@ def main() -> None:
                 )
             elif plot_type == "train_val_comparison":
                 plot_train_val_comparison(
+                    runs[0],
+                    cmap_name=cmap_cat,
+                    save_path=str(fname),
+                    show=not args.no_show,
+                )
+            elif plot_type == "genomic_diagnostics":
+                plot_genomic_diagnostics(
                     runs[0],
                     cmap_name=cmap_cat,
                     save_path=str(fname),

@@ -69,9 +69,16 @@ class GenomicTrainConfig(TrainConfig):
     # ── Counterfactual conditioning objective ─────────────────────────
     # These are optional; when loss weight is 0 the objective is disabled.
     counterfactual_loss_weight: float = 0.0
-    counterfactual_margin: float = 0.0
+    counterfactual_margin: float = 0.0       # kept for backwards compat; unused when temperature > 0
+    counterfactual_temperature: float = 0.05  # softplus temperature; effective soft-margin ≈ this value
     counterfactual_every_n_steps: int = 1
     counterfactual_warmup_steps: int = 0
+
+    # ── Classifier-free guidance dropout ──────────────────────────────
+    # Probability of zeroing the conditioning vector per sample during training.
+    # Required for CFG at inference and creates a structural incentive to use
+    # genomic conditioning when it is present.
+    cond_dropout_prob: float = 0.0
 
     def __post_init__(self):
         super().__post_init__()

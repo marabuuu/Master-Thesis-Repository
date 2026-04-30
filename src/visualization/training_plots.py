@@ -14,6 +14,7 @@ Plots available
 - :func:`plot_loss_curves` – train & validation epoch-level loss
 - :func:`plot_batch_loss_trajectory` – per-step loss across all epochs
 - :func:`plot_train_val_comparison` – overlaid train vs val with gap shading
+- :func:`plot_genomic_diagnostics` – auxiliary genomic losses and cond/gap
 - :func:`plot_lr_schedule` – learning-rate over training steps / epochs
 - :func:`plot_early_stopping` – val loss with patience / best markers
 - :func:`plot_training_summary` – multi-panel figure combining all above
@@ -79,6 +80,50 @@ if TYPE_CHECKING:  # pragma: no cover
 #      meta           – dict[str, Any]
 #
 TrainingRun = Dict[str, Any]
+
+
+def _series_payload(run: TrainingRun, *candidate_names: str) -> Optional[Dict[str, Any]]:
+    series = run.get("series", {})
+    for name in candidate_names:
+        key = name.lower().replace("/", "_").replace("-", "_")
+        payload = series.get(key)
+        if payload:
+            return payload
+    return None
+
+
+def _series_xy(run: TrainingRun, *candidate_names: str) -> Tuple[List[float], List[float]]:
+    payload = _series_payload(run, *candidate_names)
+    if not payload:
+        return [], []
+    return payload.get("steps", []), payload.get("values", [])
+
+
+def _plot_smoothed_series(
+    ax: Any,
+    x: Sequence[float],
+    y: Sequence[float],
+    color: str,
+    label: str,
+    linewidth: float = 0.4,
+    alpha: float = 0.35,
+    smooth_color: Optional[str] = None,
+) -> None:
+    if not y:
+        return
+    ax.plot(x, y, linewidth=linewidth, alpha=alpha, color=color, label=label)
+    if len(y) > 50:
+        w = max(10, len(y) // 80)
+        kernel = np.ones(w) / w
+        smoothed = np.convolve(np.asarray(y, dtype=float), kernel, mode="valid")
+        offset = w // 2
+        ax.plot(
+            x[offset: offset + len(smoothed)],
+            smoothed,
+            linewidth=1.6,
+            color=smooth_color or color,
+            alpha=0.95,
+        )
 
 
 # ===================================================================
@@ -303,6 +348,145 @@ def plot_train_val_comparison(
     ax.grid(True, alpha=0.25)
 
     fig.tight_layout()
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig
+
+
+# ===================================================================
+#  Genomic diagnostics summary
+# ===================================================================
+
+
+def plot_genomic_diagnostics(
+    run: TrainingRun,
+    title: str = "Genomic Conditioning Diagnostics",
+    cmap_name: str = CATEGORICAL_CMAP,
+    figsize: Tuple[float, float] = (16, 12),
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> Figure:
+    """Visualise diffusion loss, auxiliary genomic losses, and cond/gap.
+
+    Panels:
+      1. Epoch-level image loss (train vs val)
+      2. Validation image loss vs shuffled-conditioning loss
+      3. Step-level auxiliary genomic losses
+      4. Validation cond/gap trajectory
+    """
+    _check_matplotlib()
+    setup_style()
+
+    epochs = run.get("epochs", [])
+    train = run.get("loss_epoch", [])
+    val = run.get("val_loss", [])
+    val_shuffled = run.get("val_loss_shuffled", [])
+    val_epochs = run.get("val_epochs", [])
+    cond_gap = run.get("cond_gap", [])
+
+    if not (epochs or train or val or val_shuffled or cond_gap):
+        raise ValueError("No genomic diagnostics available in run")
+
+    colors = get_categorical_colors(8, cmap_name=cmap_name)
+    seq_cmap = get_crameri_cmap(SEQUENTIAL_CMAP)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    axes_flat = axes.flatten()
+
+    # Panel 1: epoch-level image loss
+    ax = axes_flat[0]
+    if train and epochs:
+        train_ep = epochs[: len(train)]
+        ax.plot(train_ep, train, "-o", markersize=3, linewidth=1.5,
+                color=colors[0], label="Train loss", alpha=0.9)
+        _annotate_min(ax, train_ep, train, color=colors[0])
+    if val and epochs:
+        val_ep = val_epochs if val_epochs and len(val_epochs) == len(val) else epochs[: len(val)]
+        ax.plot(val_ep, val, "-s", markersize=3, linewidth=1.5,
+                color=colors[1], label="Val loss", alpha=0.9)
+        _annotate_min(ax, val_ep, val, color=colors[1])
+    ax.set_title("Epoch-Level Image Loss")
+    ax.set_xlabel("Epoch")
+    ax.set_ylabel("Loss")
+    ax.xaxis.set_major_locator(MaxNLocator(integer=True))
+    ax.grid(True, alpha=0.25)
+    ax.legend(framealpha=0.9)
+
+    # Panel 2: validation correct vs shuffled conditioning
+    ax = axes_flat[1]
+    val_x, val_y = _series_xy(run, "loss/val", "val_loss")
+    shuffled_x, shuffled_y = _series_xy(run, "loss/val_shuffled", "val_loss_shuffled")
+    gap_x, gap_y = _series_xy(run, "cond/gap", "cond_gap")
+    if val_y and shuffled_y:
+        ax.plot(val_x[: len(val_y)], val_y, "-o", markersize=3, linewidth=1.5,
+                color=colors[2], label="Val loss (correct)", alpha=0.9)
+        ax.plot(shuffled_x[: len(shuffled_y)], shuffled_y, "-s", markersize=3, linewidth=1.5,
+                color=colors[3], label="Val loss (shuffled)", alpha=0.9)
+        shared_n = min(len(val_x), len(shuffled_x), len(val_y), len(shuffled_y))
+        if shared_n:
+            gap = np.asarray(shuffled_y[:shared_n]) - np.asarray(val_y[:shared_n])
+            ax2 = ax.twinx()
+            ax2.plot(val_x[:shared_n], gap, color=seq_cmap(0.7), linewidth=1.2,
+                     alpha=0.85, label="cond/gap")
+            ax2.axhline(0.0, color="grey", linewidth=0.8, alpha=0.35)
+            ax2.set_ylabel("cond/gap")
+            ax2.tick_params(axis="y", labelcolor=seq_cmap(0.7))
+            handles_left, labels_left = ax.get_legend_handles_labels()
+            handles_right, labels_right = ax2.get_legend_handles_labels()
+            ax2.legend(handles_left + handles_right, labels_left + labels_right,
+                       framealpha=0.9, loc="upper right")
+    elif gap_y and gap_x:
+        ax.plot(gap_x, gap_y, "-o", markersize=3, linewidth=1.5,
+                color=seq_cmap(0.7), label="cond/gap", alpha=0.9)
+        ax.axhline(0.0, color="grey", linewidth=0.8, alpha=0.35)
+    ax.set_title("Validation Conditioning Gap")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.grid(True, alpha=0.25)
+    ax.legend(framealpha=0.9, loc="upper right")
+
+    # Panel 3: step-level auxiliary losses
+    ax = axes_flat[2]
+    genomic_train_x, genomic_train_y = _series_xy(run, "loss/genomic_train", "genomic_train_loss")
+    genomic_val_x, genomic_val_y = _series_xy(run, "loss/genomic_val", "genomic_val_loss")
+    genomic_x, genomic_y = _series_xy(run, "loss/genomic_guided", "genomic_guided_loss")
+    cf_x, cf_y = _series_xy(run, "loss/counterfactual", "counterfactual_loss")
+    gap_train_x, gap_train_y = _series_xy(run, "cond/gap_train", "cond_gap_train")
+    if genomic_train_y:
+        _plot_smoothed_series(ax, genomic_train_x, genomic_train_y, colors[4], "loss/genomic_train", smooth_color=seq_cmap(0.75))
+    elif genomic_y:
+        _plot_smoothed_series(ax, genomic_x, genomic_y, colors[4], "loss/genomic_guided", smooth_color=seq_cmap(0.75))
+    if genomic_val_y:
+        _plot_smoothed_series(ax, genomic_val_x, genomic_val_y, colors[1], "loss/genomic_val", smooth_color=seq_cmap(0.55))
+    if cf_y:
+        _plot_smoothed_series(ax, cf_x, cf_y, colors[5], "loss/counterfactual", smooth_color=seq_cmap(0.55))
+    if gap_train_y:
+        _plot_smoothed_series(ax, gap_train_x, gap_train_y, colors[6], "cond/gap_train", smooth_color=seq_cmap(0.35))
+    if not (genomic_train_y or genomic_val_y or genomic_y or cf_y or gap_train_y):
+        ax.text(0.5, 0.5, "No auxiliary genomic losses found", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("Auxiliary / Genomic Losses")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("Loss")
+    ax.grid(True, alpha=0.25)
+    if genomic_train_y or genomic_val_y or genomic_y or cf_y or gap_train_y:
+        ax.legend(framealpha=0.9)
+
+    # Panel 4: validation cond/gap over time
+    ax = axes_flat[3]
+    if gap_y:
+        ax.plot(gap_x, gap_y, "-o", markersize=3, linewidth=1.5,
+                color=seq_cmap(0.8), label="cond/gap", alpha=0.9)
+        ax.axhline(0.0, color="grey", linewidth=0.8, alpha=0.35)
+        _annotate_min(ax, gap_x, gap_y, color=seq_cmap(0.8), label="min gap")
+    else:
+        ax.text(0.5, 0.5, "No validation cond/gap found", ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("Validation cond/gap")
+    ax.set_xlabel("Step")
+    ax.set_ylabel("cond/gap")
+    ax.grid(True, alpha=0.25)
+    ax.legend(framealpha=0.9)
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.96))
     show_or_save(fig, save_path=save_path, show=show)
     return fig
 

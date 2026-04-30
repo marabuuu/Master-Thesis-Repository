@@ -27,9 +27,11 @@ Overrides from MoPaDi's ``LitModel``:
 from __future__ import annotations
 
 import logging
+import random
 
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from mopadi.train_diff_autoenc import LitModel
 from mopadi.utils.dist_utils import get_world_size
@@ -91,13 +93,13 @@ class GenomicLitModel(LitModel):
             cache_pickle_tiles_path=getattr(self.conf, "cache_pickle_tiles_path", None),
         )
 
-        # ── Validation dataset (no tile capping) ─────────────────────────
+        # ── Validation dataset ────────────────────────────────────────────
         self.val_data = ZipTilesWithGenomicFeatures(
             zip_dir=self.conf.zip_dir,
             genomic_h5_dir=self.conf.genomic_feature_dir,
             patient_splits_path=self.conf.patient_splits_path,
             split="val",
-            max_tiles_by_subtype=None,   # no cap on validation
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
             tile_sampling_seed=self.conf.tile_sampling_seed,
             img_size=self.conf.img_size,
             do_resize=self.conf.do_resize,
@@ -130,18 +132,69 @@ class GenomicLitModel(LitModel):
 
         Lightning's ``limit_val_batches`` is unreliable with integer
         ``val_check_interval`` in 2.5.x, so we cap the dataset directly.
+        
+        Uses stratified sampling across subtypes when possible: picks roughly equal
+        tiles per subtype to ensure cond/gap is representative across all classes.
+        Randomizes which tiles are selected each epoch (seed = base + epoch).
         """
         import torch.utils.data as tud
+        from collections import defaultdict
 
         # self.conf.batch_size is global batch size in MoPaDi's TrainConfig.
         # Using local self.batch_size here would shrink validation by world_size
         # under DDP (e.g. 4x fewer val batches on 4 GPUs).
         limit = self.conf.val_limit_batches * self.conf.batch_size
-        dataset = (
-            tud.Subset(self.val_data, list(range(limit)))
-            if len(self.val_data) > limit
-            else self.val_data
-        )
+        
+        # Stratified sampling: group tiles by subtype and pick roughly equal from each
+        try:
+            subtype_map = self.val_data._subtype_map if hasattr(self.val_data, "_subtype_map") else {}
+            tile_paths = self.val_data.tile_paths if hasattr(self.val_data, "tile_paths") else []
+            
+            if subtype_map and tile_paths and len(subtype_map) > 0:
+                # group by subtype
+                subtype_indices = defaultdict(list)
+                for idx, path in enumerate(tile_paths):
+                    from mopadi_genomic.dataset import patient_id_from_tile_path
+                    pid = patient_id_from_tile_path(path)
+                    subtype = subtype_map.get(pid, "unknown")
+                    subtype_indices[subtype].append(idx)
+                
+                # stratified sampling: pick equal tiles from each subtype
+                rng = random.Random(self.current_epoch + 42)  # randomize per epoch
+                selected_indices = []
+                tiles_per_subtype = max(1, limit // max(1, len(subtype_indices)))
+                for subtype, indices in subtype_indices.items():
+                    sampled = rng.sample(indices, min(tiles_per_subtype, len(indices)))
+                    selected_indices.extend(sampled)
+                
+                selected_indices = selected_indices[:limit]
+                dataset = tud.Subset(self.val_data, selected_indices)
+                
+                if self.global_rank == 0:
+                    log.info(
+                        f"Val sampling: stratified across {len(subtype_indices)} subtypes, "
+                        f"using {len(selected_indices)} tiles (epoch {self.current_epoch})"
+                    )
+            else:
+                # fallback: simple limit
+                dataset = (
+                    tud.Subset(self.val_data, list(range(limit)))
+                    if len(self.val_data) > limit
+                    else self.val_data
+                )
+        except Exception as e:
+            # fallback on any error — still randomize per epoch so different
+            # tiles are evaluated across epochs for data augmentation purposes
+            if self.global_rank == 0:
+                log.warning(f"Stratified val sampling failed: {e}, using shuffled limit")
+            if len(self.val_data) > limit:
+                rng = random.Random(self.current_epoch + 42)
+                indices = list(range(len(self.val_data)))
+                rng.shuffle(indices)
+                dataset = tud.Subset(self.val_data, indices[:limit])
+            else:
+                dataset = self.val_data
+        
         conf = self.conf.clone()
         conf.batch_size = self.batch_size
         return conf.make_loader(dataset, shuffle=False, drop_last=False)
@@ -161,10 +214,14 @@ class GenomicLitModel(LitModel):
         """
         out = super().training_step(batch, batch_idx)
 
-        # Optional counterfactual objective to force genomic conditioning use.
-        # Uses real patient vectors from other samples in the same batch.
+        # --- Counterfactual conditioning objective ---
+        # Maximises the gap (loss_shuffled − loss_cond) using a softplus penalty
+        # instead of a hard hinge.  Softplus(-gap/T) always provides gradient:
+        # near log(2) ≈ 0.69 when gap ≈ 0, decays to ≈0 when gap >> T.
+        # This avoids the hinge's saturation problem where gradient drops to zero
+        # once gap > margin, letting the model drift back toward ignoring genomics.
         cf_weight = float(getattr(self.conf, "counterfactual_loss_weight", 0.0))
-        cf_margin = float(getattr(self.conf, "counterfactual_margin", 0.0))
+        cf_temperature = max(1e-6, float(getattr(self.conf, "counterfactual_temperature", 0.05)))
         cf_every = max(1, int(getattr(self.conf, "counterfactual_every_n_steps", 1)))
         cf_warmup = max(0, int(getattr(self.conf, "counterfactual_warmup_steps", 0)))
 
@@ -176,6 +233,8 @@ class GenomicLitModel(LitModel):
             and batch["feat"].shape[0] > 1
         ):
             imgs = batch["img"].to(self.device)
+            # Use the real genomic vectors for the CF loss so the gap measures
+            # correct vs. shuffled patient conditioning only.
             feats = batch["feat"].to(self.device, dtype=torch.float32)
 
             t, _ = self.T_sampler.sample(len(imgs), imgs.device)
@@ -204,7 +263,9 @@ class GenomicLitModel(LitModel):
             loss_shuffled = losses_shuffled["loss"].mean()
 
             gap = loss_shuffled - loss_cond
-            cf_penalty = torch.relu(gap.new_tensor(cf_margin) - gap)
+            # Softplus: -log σ(gap/T) = log(1 + exp(-gap/T))
+            # Gradient is always non-zero; effective "soft margin" ≈ T.
+            cf_penalty = F.softplus(-gap / cf_temperature)
             cf_term = cf_weight * cf_penalty
             loss_val = loss_val + cf_term
 
