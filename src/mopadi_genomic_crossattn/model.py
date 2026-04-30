@@ -29,19 +29,14 @@ import torch.nn.functional as F
 from typing import Any, NamedTuple, TYPE_CHECKING, cast, Optional
 
 if TYPE_CHECKING:
-    from mopadi_genomic.train import GenomicLitModel
+    from mopadi_genomic_crossattn.genomic_train import GenomicLitModel
     from mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
     from mopadi.model.nn import timestep_embedding
     from mopadi.model.unet import BeatGANsUNetModel
 else:
-    try:
-        from mopadi_genomic.train import GenomicLitModel
-        from mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
-        from mopadi.model.nn import timestep_embedding
-    except ImportError:
-        from src.mopadi_genomic.train import GenomicLitModel
-        from src.mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
-        from src.mopadi.model.nn import timestep_embedding
+    from mopadi_genomic_crossattn.genomic_train import GenomicLitModel
+    from mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
+    from mopadi.model.nn import timestep_embedding
 
 log = logging.getLogger(__name__)
 

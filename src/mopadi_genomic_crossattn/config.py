@@ -11,10 +11,7 @@ import dataclasses
 from dataclasses import dataclass
 from typing import Any, Dict
 
-try:
-    from mopadi_genomic.config import GenomicTrainConfig
-except ImportError:
-    from src.mopadi_genomic.config import GenomicTrainConfig
+from mopadi_genomic_crossattn.genomic_config import GenomicTrainConfig
 
 
 @dataclass

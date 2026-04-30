@@ -135,61 +135,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"[INFO] Encoding stage not yet configured in this CLI")
         print(f"       Run: python -m src.encoding.encode_genomics --config {config_path}")
     
-    elif stage == "extract_joint_latents":
-        from src.joint_training.train import extract_latents
-        if "extract_joint_latents" not in config:
-            raise ValueError("No 'extract_joint_latents' section in config.yaml")
-        if "joint_training" not in config:
-            raise ValueError("No 'joint_training' section in config.yaml to provide model definitions")
-        extract_cfg = config["extract_joint_latents"]
-
-        section = extract_cfg.get("section", "joint_training")
-        if section == "joint_training":
-            joint_cfg = config["joint_training"].copy()
-            expected_variant = "joint_training"
-        else:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
-
-            _repo_root = Path(config_path).resolve().parent.parent
-            _full_cfg = _resolve_config_paths(dict(config), _repo_root)
-            if section not in _full_cfg:
-                raise ValueError(f"No '{section}' section in config.yaml")
-            _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
-            _overrides = _full_cfg[section]
-            joint_cfg = _deep_update(_base, _overrides)
-            expected_variant = (
-                "gene_token_cross_attention_joint_training"
-                if section.startswith("gene_token_cross_attention_")
-                else "gene_token_transformer_joint_training"
-            )
-        
-        # Enforce output directory override
-        joint_cfg["latent_dir"] = extract_cfg.get("out_dir")
-        
-        if verbose:
-            print(f"[INFO] Extracting joint latents from {extract_cfg.get('ckpt')}...")
-            print(f"[INFO] Latent extraction section: {section}")
-            
-        extract_latents(
-            joint_cfg=joint_cfg,
-            ckpt_path=extract_cfg.get("ckpt"),
-            split=extract_cfg.get("split", "all"),
-            verbose=verbose,
-            expected_variant=expected_variant,
-        )
-    
     elif stage == "visualize_latents":
         from src.visualization.visualize_latents import run_visualizations
         if "visualize_latents" not in config:
             raise ValueError("No 'visualize_latents' section in config.yaml")
         run_visualizations(config["visualize_latents"], verbose=verbose)
     
-    elif stage == "joint_training":
-        from src.joint_training.train import run_joint_training
-        if "joint_training" not in config:
-            raise ValueError("No 'joint_training' section in config.yaml")
-        run_joint_training(config["joint_training"], verbose=verbose)
-
     elif stage == "training":
         print(f"[INFO] Training stage not yet configured in this CLI")
         print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
@@ -256,52 +207,15 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
 
     elif stage == "build_genomic_features":
         from src.preprocessing.build_genomic_features import run_build_genomic_features
-        if "mopadi_genomic_training" not in config:
-            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
-        run_build_genomic_features(config["mopadi_genomic_training"], verbose=verbose)
-
-    elif stage == "mopadi_genomic_training":
-        from src.mopadi_genomic.run_genomic_training import run_genomic_training
-        if "mopadi_genomic_training" not in config:
-            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
-        run_genomic_training(config["mopadi_genomic_training"], verbose=verbose)
+        if "build_genomic_features" not in config:
+            raise ValueError("No 'build_genomic_features' section in config.yaml")
+        run_build_genomic_features(config["build_genomic_features"], verbose=verbose)
 
     elif stage == "mopadi_genomic_crossattn":
         from src.mopadi_genomic_crossattn.run_training import run_genomic_crossattn_training
         if "mopadi_genomic_crossattn" not in config:
             raise ValueError("No 'mopadi_genomic_crossattn' section in config.yaml")
         run_genomic_crossattn_training(config["mopadi_genomic_crossattn"], verbose=verbose)
-
-    elif stage in ("gtca_training", "gtca_nocfg", "gtca_scratch"):
-        # Gene-token cross-attention training — three variants sharing one train function.
-        #   gtca_training : mopadi init, cond_dropout=0.15 (CFG, for guidance experiments)
-        #   gtca_nocfg    : mopadi init, cond_dropout=0.0  (no uncond path; zero-cond → noise)
-        #   gtca_scratch  : random init, cond_dropout=0.0  (fully from scratch baseline)
-        from src.gene_token_cross_attention_joint_training.train import (
-            run_gene_token_cross_attention_training,
-        )
-        try:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
-        except ImportError:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update
-            _resolve_config_paths = lambda cfg, _: cfg  # noqa: E731
-
-        from pathlib import Path as _Path
-        _repo_root = _Path(config_path).resolve().parent.parent
-        _full_cfg = _resolve_config_paths(dict(config), _repo_root)
-
-        _section_map = {
-            "gtca_training": "gene_token_cross_attention_joint_training",
-            "gtca_nocfg":    "gene_token_cross_attention_nocfg_training",
-            "gtca_scratch":  "gene_token_cross_attention_scratch_training",
-        }
-        _section = _section_map[stage]
-        if _section not in _full_cfg:
-            raise ValueError(f"No '{_section}' section in config.yaml")
-        _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
-        _overrides = _full_cfg[_section]
-        _joint_cfg = _deep_update(_base, _overrides)
-        run_gene_token_cross_attention_training(_joint_cfg, verbose=verbose)
 
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
@@ -318,7 +232,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_training, mopadi_genomic_crossattn, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, evaluation, all"
         )
 
 
@@ -350,7 +264,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "gtca_training", "gtca_nocfg", "gtca_scratch", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "mopadi_genomic_crossattn", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
