@@ -65,6 +65,24 @@ class GenomicLitModel(LitModel):
             perm = torch.roll(perm, shifts=1)
         return perm
 
+    @staticmethod
+    def _flatten_bag_batch(batch: dict) -> tuple:
+        """Flatten a bag batch (B, N, C, H, W) → (B*N, C, H, W).
+
+        Returns (flat_batch, N) where N=1 if the input was already flat.
+        The feat tensor is expanded along the tile dimension so each tile
+        carries its patient's genomic vector.
+        """
+        img = batch["img"]
+        if img.dim() == 5:
+            B, N, C, H, W = img.shape
+            flat = dict(batch)
+            flat["img"] = img.reshape(B * N, C, H, W)
+            feat = batch["feat"]  # (B, n_genes)
+            flat["feat"] = feat.unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
+            return flat, N
+        return batch, 1
+
     # ------------------------------------------------------------------
     # Dataset creation (overrides parent)
     # ------------------------------------------------------------------
@@ -79,6 +97,8 @@ class GenomicLitModel(LitModel):
             torch.cuda.manual_seed(seed)
             log.info("Local seed: %d", seed)
 
+        n_tiles_per_bag = int(getattr(self.conf, "n_tiles_per_bag", 1))
+
         # ── Training dataset ─────────────────────────────────────────────
         self.train_data = ZipTilesWithGenomicFeatures(
             zip_dir=self.conf.zip_dir,
@@ -87,13 +107,14 @@ class GenomicLitModel(LitModel):
             split="train",
             max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
             tile_sampling_seed=self.conf.tile_sampling_seed,
+            n_tiles_per_bag=n_tiles_per_bag,
             img_size=self.conf.img_size,
             do_resize=self.conf.do_resize,
             do_normalize=self.conf.do_normalize,
             cache_pickle_tiles_path=getattr(self.conf, "cache_pickle_tiles_path", None),
         )
 
-        # ── Validation dataset ────────────────────────────────────────────
+        # ── Validation dataset (always single-tile for clean cond/gap metrics)
         self.val_data = ZipTilesWithGenomicFeatures(
             zip_dir=self.conf.zip_dir,
             genomic_h5_dir=self.conf.genomic_feature_dir,
@@ -101,6 +122,7 @@ class GenomicLitModel(LitModel):
             split="val",
             max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
             tile_sampling_seed=self.conf.tile_sampling_seed,
+            n_tiles_per_bag=1,
             img_size=self.conf.img_size,
             do_resize=self.conf.do_resize,
             do_normalize=self.conf.do_normalize,
@@ -113,12 +135,22 @@ class GenomicLitModel(LitModel):
         # feat, so this path is never reached during normal training.
         if self.global_rank == 0:
             log.info(
-                "train tiles: %d  |  val tiles: %d  |  genomic features: %d-dim",
+                "train items: %d  |  val tiles: %d  |  genomic features: %d-dim%s",
                 len(self.train_data),
                 len(self.val_data),
                 next(iter(self.train_data._genomic_cache.values())).shape[0]
                 if self.train_data._genomic_cache else 0,
+                f" [bag_size={n_tiles_per_bag}]" if n_tiles_per_bag > 1 else "",
             )
+
+    # ------------------------------------------------------------------
+    # Per-epoch tile resampling for training diversity
+    # ------------------------------------------------------------------
+
+    def on_train_epoch_start(self) -> None:
+        """Rotate tile caps each epoch so different tiles are seen per epoch."""
+        if hasattr(self, "train_data") and hasattr(self.train_data, "resample_tiles"):
+            self.train_data.resample_tiles(self.current_epoch)
 
     # ------------------------------------------------------------------
     # Val dataloader (parent only defines train_dataloader)
@@ -211,7 +243,16 @@ class GenomicLitModel(LitModel):
         TensorBoard places the training curve on the same chart as
         ``"loss/val"`` (TensorBoard groups series by the prefix before
         the first ``/``).
+
+        In bag mode (n_tiles_per_bag > 1) the batch arrives with
+        ``img: (B, N, C, H, W)``.  We flatten to ``(B*N, C, H, W)`` before
+        the UNet forward pass.  The counterfactual shuffle operates at the
+        patient (bag) level so all N tiles from one patient always receive
+        a different patient's genomic vector.
         """
+        # Flatten bag batches → (B*N, C, H, W) before parent processes them.
+        batch, _bag_n = self._flatten_bag_batch(batch)
+
         out = super().training_step(batch, batch_idx)
 
         # --- Counterfactual conditioning objective ---
@@ -250,17 +291,33 @@ class GenomicLitModel(LitModel):
             )
             loss_cond = losses_cond["loss"].mean()
 
-            perm = self._non_identity_permutation(feats.size(0), feats.device)
-            feats_shuffled = feats[perm]
-            losses_shuffled = self.sampler.training_losses(
-                model=self.model,
-                x_start=imgs,
-                cond=feats_shuffled,
-                t=t,
-                noise=shared_noise,
-                model_kwargs={"cond": feats_shuffled},
-            )
-            loss_shuffled = losses_shuffled["loss"].mean()
+            # Shuffle at the patient (bag) level: all N tiles from patient i
+            # always go with a different patient's genomic vector.
+            if _bag_n > 1:
+                B_bags = feats.shape[0] // _bag_n
+                bag_perm = self._non_identity_permutation(B_bags, feats.device)
+                feats_shuffled = (
+                    feats.reshape(B_bags, _bag_n, -1)[bag_perm]
+                    .reshape(B_bags * _bag_n, -1)
+                )
+            else:
+                perm = self._non_identity_permutation(feats.size(0), feats.device)
+                feats_shuffled = feats[perm]
+
+            # Shuffled pass needs only a reference loss value, not gradients.
+            # Using no_grad here cuts peak activation memory from 3× to 2× a
+            # single forward pass (main-pass activations + cond-pass activations
+            # are the only two graphs held simultaneously before backward).
+            with torch.no_grad():
+                losses_shuffled = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats_shuffled,
+                    t=t,
+                    noise=shared_noise,
+                    model_kwargs={"cond": feats_shuffled},
+                )
+            loss_shuffled = losses_shuffled["loss"].mean().detach()
 
             gap = loss_shuffled - loss_cond
             # Softplus: -log σ(gap/T) = log(1 + exp(-gap/T))
@@ -469,21 +526,22 @@ class GenomicLitModel(LitModel):
         img = batch["img"]
         feat = batch["feat"]
 
-        expected_img_shape = (None, 3, self.conf.img_size, self.conf.img_size)
-        expected_feat_shape = (None, self.conf.feat_dim)
-
-        def _shape_ok(t: torch.Tensor, expected) -> bool:
-            return all(
-                e is None or s == e
-                for s, e in zip(t.shape, expected)
-            )
-
-        if not _shape_ok(img, expected_img_shape):
-            raise RuntimeError(
-                f"Unexpected image shape: {tuple(img.shape)}, "
-                f"expected (B, 3, {self.conf.img_size}, {self.conf.img_size})"
-            )
-        if not _shape_ok(feat, expected_feat_shape):
+        if img.dim() == 5:
+            # Bag mode: (B, N, C, H, W)
+            _B, _N, C, H, W = img.shape
+            if C != 3 or H != self.conf.img_size or W != self.conf.img_size:
+                raise RuntimeError(
+                    f"Unexpected bag image shape: {tuple(img.shape)}, "
+                    f"expected (B, N, 3, {self.conf.img_size}, {self.conf.img_size})"
+                )
+        else:
+            # Single-tile mode: (B, C, H, W)
+            if img.shape[1] != 3 or img.shape[2] != self.conf.img_size or img.shape[3] != self.conf.img_size:
+                raise RuntimeError(
+                    f"Unexpected image shape: {tuple(img.shape)}, "
+                    f"expected (B, 3, {self.conf.img_size}, {self.conf.img_size})"
+                )
+        if feat.shape[1] != self.conf.feat_dim:
             raise RuntimeError(
                 f"Unexpected feat shape: {tuple(feat.shape)}, "
                 f"expected (B, {self.conf.feat_dim})"

@@ -74,6 +74,15 @@ class GenomicTrainConfig(TrainConfig):
     counterfactual_every_n_steps: int = 1
     counterfactual_warmup_steps: int = 0
 
+    # ── Multi-tile bag training ───────────────────────────────────────
+    # Number of tiles sampled from the same patient per training example.
+    # When > 1, __getitem__ returns img: (n_tiles_per_bag, C, H, W) and the
+    # training_step flattens to (B*n_tiles_per_bag, C, H, W) before the UNet
+    # forward pass.  The counterfactual loss shuffles at the patient (bag) level
+    # so all tiles from patient i always receive a different patient's features.
+    # Set to 1 to disable bag mode (default, backward-compatible behaviour).
+    n_tiles_per_bag: int = 1
+
     # ── Classifier-free guidance dropout ──────────────────────────────
     # Probability of zeroing the conditioning vector per sample during training.
     # Required for CFG at inference and creates a structural incentive to use

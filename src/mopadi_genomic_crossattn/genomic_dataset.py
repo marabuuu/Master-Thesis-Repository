@@ -101,12 +101,22 @@ def find_genomic_h5(patient_id: str, genomic_h5_dir: str) -> Optional[str]:
 class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     """Dataset that pairs ZIP-archived tile images with genomic guidance vectors.
 
-    Each ``__getitem__`` returns a dict with:
+    In single-tile mode (``n_tiles_per_bag=1``, default) each ``__getitem__``
+    returns a dict with:
 
     ``img``      — ``(3, H, W)`` float32 tensor in ``[-1, 1]``
     ``feat``     — ``(n_genes,)`` float32 tensor (normalised gene expression)
-    ``coords``   — ``(2,)`` float32 tile coordinates (passthrough from parent)
     ``filename`` — str tile path (passthrough from parent)
+
+    In bag mode (``n_tiles_per_bag > 1``) ``__len__`` returns the number of
+    patients (not tiles) and each item contains:
+
+    ``img``      — ``(n_tiles_per_bag, 3, H, W)`` float32 tensor
+    ``feat``     — ``(n_genes,)`` float32 tensor (same for all tiles in bag)
+    ``filename`` — path of the first tile in the bag
+
+    Tile sampling within bags is random per call (no fixed seed) so each
+    training epoch sees a different subset of each patient's tiles.
 
     Parameters
     ----------
@@ -124,7 +134,11 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         absent subtype key) mean no cap for that subtype.  Pass ``None``
         to disable capping entirely (useful for val/test).
     tile_sampling_seed:
-        Seed for reproducible tile subsampling when caps are applied.
+        Base seed for per-epoch tile subsampling.  Epoch 0 uses this seed,
+        epoch k uses ``tile_sampling_seed + k``.  Call ``resample_tiles(epoch)``
+        at the start of each epoch to rotate which tiles are eligible.
+    n_tiles_per_bag:
+        Number of tiles to return per patient.  1 = single-tile mode (default).
     img_size:
         Resize target (pixels).  Only applied if ``do_resize=True``.
     do_resize:
@@ -143,6 +157,7 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         split: str = "train",
         max_tiles_by_subtype: Optional[Dict[str, Optional[int]]] = None,
         tile_sampling_seed: int = 42,
+        n_tiles_per_bag: int = 1,
         img_size: int = 256,
         do_resize: bool = False,
         do_normalize: bool = True,
@@ -150,6 +165,11 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     ):
         if split not in {"train", "val", "test", "all"}:
             raise ValueError(f"split must be one of train/val/test/all, got '{split}'")
+
+        self.n_tiles_per_bag = max(1, int(n_tiles_per_bag))
+        # Store cap config so resample_tiles() can re-apply them each epoch.
+        self._caps = max_tiles_by_subtype
+        self._base_seed = tile_sampling_seed
 
         # ── Load patient splits ──────────────────────────────────────────
         self._splits, self._subtype_map = _load_splits_and_subtypes(
@@ -194,14 +214,18 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         log.info("After split filter: %d tiles", len(self.tile_paths))
 
         # ── Per-subtype tile capping ─────────────────────────────────────
-        if max_tiles_by_subtype:
+        # Store the full (uncapped) tile list so resample_tiles() can re-apply
+        # caps with a different seed each epoch for training diversity.
+        self._uncapped_tile_paths: List[str] = list(self.tile_paths)
+
+        if self._caps:
             self.tile_paths = _apply_tile_caps(
-                tile_paths=self.tile_paths,
+                tile_paths=self._uncapped_tile_paths,
                 subtype_map=self._subtype_map,
-                caps=max_tiles_by_subtype,
-                seed=tile_sampling_seed,
+                caps=self._caps,
+                seed=self._base_seed,
             )
-            log.info("After tile capping: %d tiles", len(self.tile_paths))
+            log.info("After tile capping (seed=%d): %d tiles", self._base_seed, len(self.tile_paths))
 
         # ── Build genomic cache (H5 → RAM) ───────────────────────────────
         unique_patients = {
@@ -223,24 +247,91 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
                 p for p in self.tile_paths
                 if patient_id_from_tile_path(p) not in missing
             ]
+            self._uncapped_tile_paths = [
+                p for p in self._uncapped_tile_paths
+                if patient_id_from_tile_path(p) not in missing
+            ]
             log.info(
                 "After removing patients with no H5: %d tiles remain",
                 len(self.tile_paths),
             )
 
         log.info(
-            "Dataset ready: %d tiles, %d patients, %d genes",
+            "Dataset ready: %d tiles, %d patients, %d genes%s",
             len(self.tile_paths),
             len(self._genomic_cache),
             next(iter(self._genomic_cache.values())).shape[0]
             if self._genomic_cache else 0,
+            f" [bag_size={self.n_tiles_per_bag}]" if self.n_tiles_per_bag > 1 else "",
         )
+
+        # ── Build patient→tile index for bag mode ────────────────────────
+        if self.n_tiles_per_bag > 1:
+            self._build_patient_index()
+
+    # ------------------------------------------------------------------
+    # Per-epoch tile resampling (call from on_train_epoch_start)
+    # ------------------------------------------------------------------
+
+    def resample_tiles(self, epoch: int) -> None:
+        """Re-apply tile capping with an epoch-based seed for training diversity.
+
+        Without this, the same tile subset is used every epoch when caps are
+        configured.  Call from ``on_train_epoch_start`` with the current epoch
+        index so each epoch trains on a different random subset of each
+        patient's tiles (while keeping the total count constant).
+
+        In bag mode the patient index is rebuilt automatically.
+        """
+        if not self._caps:
+            return
+        seed = self._base_seed + epoch
+        self.tile_paths = _apply_tile_caps(
+            tile_paths=self._uncapped_tile_paths,
+            subtype_map=self._subtype_map,
+            caps=self._caps,
+            seed=seed,
+        )
+        if self.n_tiles_per_bag > 1:
+            self._build_patient_index()
+        log.debug(
+            "resample_tiles(epoch=%d, seed=%d): %d tiles", epoch, seed, len(self.tile_paths)
+        )
+
+    # ------------------------------------------------------------------
+    # Bag mode: patient index
+    # ------------------------------------------------------------------
+
+    def _build_patient_index(self) -> None:
+        """Map each patient to the indices of their tiles in self.tile_paths."""
+        from collections import defaultdict
+        patient_tiles: Dict[str, List[int]] = defaultdict(list)
+        for idx, path in enumerate(self.tile_paths):
+            pid = patient_id_from_tile_path(path)
+            patient_tiles[pid].append(idx)
+        # Only include patients present in the genomic cache.
+        self._patient_tile_indices: Dict[str, List[int]] = {
+            pid: indices
+            for pid, indices in patient_tiles.items()
+            if pid in self._genomic_cache
+        }
+        self._bag_patient_list: List[str] = sorted(self._patient_tile_indices.keys())
 
     # ------------------------------------------------------------------
     # Core data access
     # ------------------------------------------------------------------
 
+    def __len__(self) -> int:
+        if self.n_tiles_per_bag > 1:
+            return len(self._bag_patient_list)
+        return len(self.tile_paths)
+
     def __getitem__(self, index: int) -> Dict:
+        if self.n_tiles_per_bag > 1:
+            return self._getitem_bag(index)
+        return self._getitem_single(index)
+
+    def _getitem_single(self, index: int) -> Dict:
         # Some edge tiles in ZIPs are non-square (e.g. 480×640). Skip them by
         # walking forward until we find a tile with the expected square size.
         for offset in range(len(self.tile_paths)):
@@ -251,6 +342,48 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         pid = patient_id_from_tile_path(item["filename"])
         item["feat"] = self._genomic_cache[pid]    # (n_genes,) float32 tensor
         return item
+
+    def _getitem_bag(self, index: int) -> Dict:
+        """Return a bag of n_tiles_per_bag tiles from the same patient.
+
+        Tile selection is random per call (no fixed seed) so each training
+        step sees a different subset of the patient's tiles.  Sampling is
+        done with replacement only when the patient has fewer tiles than
+        the bag size (rare edge case).
+        """
+        pid = self._bag_patient_list[index]
+        tile_indices = self._patient_tile_indices[pid]
+        n = self.n_tiles_per_bag
+
+        if len(tile_indices) >= n:
+            chosen = random.sample(tile_indices, n)
+        else:
+            chosen = random.choices(tile_indices, k=n)
+
+        imgs: List[torch.Tensor] = []
+        first_filename: Optional[str] = None
+
+        for tile_idx in chosen:
+            # Prefer square tiles; fall back within the patient's own tiles.
+            item = super().__getitem__(tile_idx)
+            img = item["img"]
+            if img.shape[-2] != self._img_size or img.shape[-1] != self._img_size:
+                for alt_idx in tile_indices:
+                    alt_item = super().__getitem__(alt_idx)
+                    alt_img = alt_item["img"]
+                    if alt_img.shape[-2] == self._img_size and alt_img.shape[-1] == self._img_size:
+                        img = alt_img
+                        item = alt_item
+                        break
+            imgs.append(img)
+            if first_filename is None:
+                first_filename = item.get("filename", self.tile_paths[tile_idx])
+
+        return {
+            "img": torch.stack(imgs, dim=0),      # (N, C, H, W)
+            "feat": self._genomic_cache[pid],      # (n_genes,) float32 tensor
+            "filename": first_filename or self.tile_paths[chosen[0]],
+        }
 
 
 # ---------------------------------------------------------------------------

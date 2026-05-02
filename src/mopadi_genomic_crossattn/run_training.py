@@ -25,16 +25,16 @@ from torch.nn.parallel import DistributedDataParallel
 from mopadi.configs.choices import ModelName
 
 try:
+    from .config import GenomicCrossAttnConfig
+    from .model import GenomicCrossAttnLitModel
+except ImportError:
     from mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
     from mopadi_genomic_crossattn.model import GenomicCrossAttnLitModel
-except ImportError:
-    from src.mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
-    from src.mopadi_genomic_crossattn.model import GenomicCrossAttnLitModel
 
 try:
-    from mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
+    from .checkpoint_callback import CompositeMetricCheckpoint
 except ImportError:
-    from src.mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
+    from mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
 
 log = logging.getLogger(__name__)
 
@@ -170,27 +170,23 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
 
     accelerator = "gpu" if isinstance(gpus, (list, int)) else "cpu"
     devices = gpus if isinstance(gpus, list) else [gpus]
-    # All ranks are launched with identical code and seed, so the initial
-    # parameter broadcast inside DDP.__init__ (_sync_module_states) is
-    # structurally redundant.  In PyTorch 2.7+cu128, that broadcast runs
-    # inside a non-default CUDA stream (added by PL's _setup_model), and
-    # the temporary flat buffers it allocates crash on destruction with
-    # "CUDA illegal memory access" in TensorImpl::~TensorImpl/destroyEvent.
-    # Disabling the sync eliminates the crash with no correctness impact.
-    # This model has a more dynamic backward graph than the base MoPaDi run
-    # (multi-stage conditioning + extra CF pass), so we keep DDP in the safer
-    # unused-parameter mode instead of forcing static_graph.
-    use_static_graph = False
+    # static_graph=True is incompatible with gradient checkpointing.
+    # find_unused_parameters=True is required because cross-attention weights
+    # are not used during the CF warmup period (steps 0–counterfactual_warmup_steps),
+    # and some losses are conditionally disabled (genomic_guided, recon).
     strategy = (
         _DefaultStreamDDPStrategy(
             find_unused_parameters=True,
             init_sync=False,
             broadcast_buffers=False,
-            static_graph=use_static_graph,
+            static_graph=False,
         )
         if len(devices) > 1 else "auto"
     )
-    log.info("DDP static_graph=%s (gradient_checkpoint=%s)", use_static_graph, conf.net_beatgans_gradient_checkpoint)
+    log.info(
+        "DDP static_graph=False find_unused=True (gradient_checkpoint=%s)",
+        conf.net_beatgans_gradient_checkpoint,
+    )
 
     if len(devices) > 1 and conf.batch_size % len(devices) != 0:
         raise ValueError(
@@ -226,7 +222,7 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
     if resume_ckpt:
         log.info("Resuming from checkpoint: %s", resume_ckpt)
 
-    model.expected_world_size = max(1, len(devices))
+    model.__dict__["expected_world_size"] = max(1, len(devices))
 
     log.info(
         "Starting training: max_steps=%d, global_batch=%d (effective=%d), "
@@ -267,25 +263,26 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
 
     model_cfg = cfg.get("model", {})
 
-    def _get(key, default=None):
-        return cfg.get(key, model_cfg.get(key, default))
+    def _get(key: str, default: Any) -> Any:
+        value = cfg.get(key, model_cfg.get(key, default))
+        return default if value is None else value
 
     img_size = int(_get("img_size", 512))
     net_ch = int(_get("net_ch", 128))
     style_ch = int(_get("style_ch", 512))
     feat_dim = int(_get("feat_dim", style_ch))
 
-    raw_mult = _get("net_ch_mult")
+    raw_mult = _get("net_ch_mult", None)
     net_ch_mult = tuple(raw_mult) if raw_mult else (1, 1, 2, 2, 4, 4)
 
-    raw_attn = _get("net_attn")
+    raw_attn = _get("net_attn", None)
     net_attn = tuple(raw_attn) if raw_attn else (16,)
 
     base_dir = cfg.get("base_dir", cfg.get("output_dir", "checkpoints/genomic_crossattn"))
 
     cross_attn_cfg = cfg.get("cross_attention", {})
 
-    fields = dict(
+    fields: Dict[str, Any] = dict(
         name="genomic_crossattn",
         base_dir=base_dir,
         seed=int(_get("seed", 42)),
@@ -323,27 +320,28 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         zip_dir=cfg["zip_dir"],
         genomic_feature_dir=cfg["genomic_feature_dir"],
         patient_splits_path=cfg["patient_splits_path"],
-        max_tiles_by_subtype=cfg.get("max_tiles_by_subtype"),
-        tile_sampling_seed=int(cfg.get("tile_sampling_seed", 42)),
-        do_normalize=bool(cfg.get("do_normalize", True)),
-        do_resize=bool(cfg.get("do_resize", False)),
-        val_limit_batches=int(cfg.get("limit_val_batches", 100)),
+        max_tiles_by_subtype=_get("max_tiles_by_subtype", None),
+        tile_sampling_seed=int(_get("tile_sampling_seed", 42)),
+        n_tiles_per_bag=int(_get("n_tiles_per_bag", 1)),
+        do_normalize=bool(_get("do_normalize", True)),
+        do_resize=bool(_get("do_resize", False)),
+        val_limit_batches=int(_get("limit_val_batches", 100)),
         # Cross-attention
         cross_attn_heads=int(cross_attn_cfg.get("heads", 4)),
         cross_attn_dim_per_head=int(cross_attn_cfg.get("dim_per_head", 64)),
         cross_attn_patch_size=int(cross_attn_cfg.get("patch_size", 16)),
-        cross_attn_lr=float(cfg.get("cross_attn_lr", _get("lr", 1e-4))),
-        unet_lr=float(cfg.get("unet_lr", _get("lr", 1e-4))),
+        cross_attn_lr=float(_get("cross_attn_lr", _get("lr", 1e-4))),
+        unet_lr=float(_get("unet_lr", _get("lr", 1e-4))),
         # Genomic-guided loss
-        genomic_guided_loss_weight=float(cfg.get("genomic_guided_loss_weight", 0.3)),
-        genomic_guided_high_t_frac=float(cfg.get("genomic_guided_high_t_frac", 0.8)),
+        genomic_guided_loss_weight=float(_get("genomic_guided_loss_weight", 0.3)),
+        genomic_guided_high_t_frac=float(_get("genomic_guided_high_t_frac", 0.8)),
         # Genomic reconstruction loss
-        genomic_recon_weight=float(cfg.get("genomic_recon_weight", 0.05)),
+        genomic_recon_weight=float(_get("genomic_recon_weight", 0.05)),
         # Counterfactual conditioning loss
-        counterfactual_loss_weight=float(cfg.get("counterfactual_loss_weight", 0.0)),
-        counterfactual_temperature=float(cfg.get("counterfactual_temperature", 0.05)),
-        counterfactual_every_n_steps=int(cfg.get("counterfactual_every_n_steps", 1)),
-        counterfactual_warmup_steps=int(cfg.get("counterfactual_warmup_steps", 0)),
+        counterfactual_loss_weight=float(_get("counterfactual_loss_weight", 0.0)),
+        counterfactual_temperature=float(_get("counterfactual_temperature", 0.05)),
+        counterfactual_every_n_steps=int(_get("counterfactual_every_n_steps", 1)),
+        counterfactual_warmup_steps=int(_get("counterfactual_warmup_steps", 0)),
     )
 
     return GenomicCrossAttnConfig(**fields)

@@ -82,7 +82,10 @@ class _SpatialCrossAttentionAdapter(torch.nn.Module):
         tokens = self.in_proj(pooled).flatten(2).transpose(1, 2)
         k = self.k_proj(cond).unsqueeze(1)
         v = self.v_proj(cond).unsqueeze(1)
-        attn_out, _ = self.attn(tokens, k, v)
+        # Capture attention output and attention weights for diagnostics.
+        # attn_weights shape depends on PyTorch version and `batch_first`:
+        # typically (B, tgt_len, src_len). With a single K/V token src_len==1.
+        attn_out, attn_weights = self.attn(tokens, k, v)
 
         attn_map = attn_out.transpose(1, 2).reshape(b, self.embed_dim, pooled_h, pooled_w)
         # additive residual (spatial)
@@ -90,14 +93,42 @@ class _SpatialCrossAttentionAdapter(torch.nn.Module):
         # multiplicative FiLM: predict a small per-channel delta initialized to zero
         scale_delta = self.scale_proj(attn_map)
         
-        # log attention statistics (no grad)
+        # Log attention output and FiLM modulation stats (no grad).
+        # Note: with a single K/V token (the genomic vector), PyTorch's
+        # MultiheadAttention always assigns weight 1.0 to that token — softmax
+        # of a single score is always 1.  The informative quantities are the
+        # magnitude of attn_out (= V_proj(cond)) and the resulting FiLM
+        # residuals delta / scale_delta that actually modulate the UNet features.
         with torch.no_grad():
-            self._attn_stats = {
-                "attn_mean": attn_out.abs().mean().item(),
-                "attn_max": attn_out.abs().max().item(),
-                "scale_delta_mean": scale_delta.abs().mean().item(),
-                "scale_delta_max": scale_delta.abs().max().item(),
+            # attn_out: (B, N_patches, embed_dim) — spatially uniform (same V at each patch)
+            attn_norm = attn_out.norm(dim=-1)          # (B, N_patches)
+            stats = {
+                "attn_out_norm_mean": attn_norm.mean().item(),
+                "attn_out_norm_std": attn_norm.std().item() if attn_norm.numel() > 1 else 0.0,
+                "scale_delta_abs_mean": scale_delta.abs().mean().item(),
+                "scale_delta_abs_max": scale_delta.abs().max().item(),
+                "delta_abs_mean": delta.abs().mean().item() if delta.shape[2:] == (h, w) else 0.0,
+                "delta_abs_max": delta.abs().max().item() if delta.shape[2:] == (h, w) else 0.0,
             }
+
+            # If attention weights are available, aggregate simple diagnostics.
+            try:
+                if attn_weights is not None:
+                    # attn_weights may be (B, tgt_len, src_len) or (B, num_heads, tgt_len, src_len)
+                    aw = attn_weights
+                    if aw.dim() == 4:
+                        # (B, heads, tgt, src) -> merge heads
+                        aw = aw.mean(dim=1)
+                    # now (B, tgt, src)
+                    stats["attn_weights_mean"] = aw.mean().item()
+                    stats["attn_weights_std"] = aw.std().item() if aw.numel() > 1 else 0.0
+                    # record max weight (useful to see concentration)
+                    stats["attn_weights_max"] = aw.max().item()
+            except Exception:
+                # Be conservative: don't fail forward on diagnostics
+                pass
+
+            self._attn_stats = stats
         
         # ensure same spatial resolution as input
         if delta.shape[2:] != (h, w):
@@ -216,12 +247,40 @@ class MultiStageCrossAttentionUNetWrapper(torch.nn.Module):
                 block.cond_emb_layers = torch.nn.Sequential(torch.nn.SiLU(), linear_layer)
 
         # Patch input_blocks, middle_block, and output_blocks in-place
+        # and count how many ResBlocks were successfully patched.
+        patched_count = 0
+        
+        def count_patched_resblocks(module):
+            nonlocal patched_count
+            if ResBlock is not None and isinstance(module, ResBlock):
+                if hasattr(module, "cond_emb_layers") and module.cond_emb_layers is not None:
+                    patched_count += 1
+            elif hasattr(module, "__iter__") and not isinstance(module, torch.nn.ModuleList):
+                for layer in module:
+                    count_patched_resblocks(layer)
+        
         for module in list(getattr(base_unet, "input_blocks", [])):
             _patch_block(module, cond_dim)
         if hasattr(base_unet, "middle_block"):
             _patch_block(base_unet.middle_block, cond_dim)
         for module in list(getattr(base_unet, "output_blocks", [])):
             _patch_block(module, cond_dim)
+        
+        # Verify patching succeeded by counting patched blocks
+        for module in list(getattr(base_unet, "input_blocks", [])):
+            count_patched_resblocks(module)
+        if hasattr(base_unet, "middle_block"):
+            count_patched_resblocks(base_unet.middle_block)
+        for module in list(getattr(base_unet, "output_blocks", [])):
+            count_patched_resblocks(module)
+        
+        if patched_count == 0:
+            log.warning(
+                "No ResBlocks were patched with cond_emb_layers! "
+                "Check that mopadi.model.blocks.ResBlock is available and FiLM conditioning may not be active."
+            )
+        else:
+            log.info(f"Successfully patched {patched_count} ResBlocks with 2*out_channels cond_emb_layers.")
 
     def wrapper_parameters(self):
         yield from self.input_adapter.parameters()
@@ -407,12 +466,17 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
         model: Any,
         imgs: torch.Tensor,
         feats: torch.Tensor,
+        bag_n: int = 1,
     ) -> torch.Tensor:
         """Compute the high-t genomic-guided denoising loss."""
         high_t_frac = float(getattr(self.conf, "genomic_guided_high_t_frac", 0.8))
         T = self.conf.T
         t_lo = int(high_t_frac * T)
-        high_t = torch.randint(t_lo, T, (len(imgs),), device=imgs.device)
+        # imgs is expected to be flat (B*N, C, H, W). If bag_n > 1,
+        # aggregate the per-tile losses into per-bag means before averaging
+        # to compute the genomic-guided loss at the bag level.
+        total_tiles = imgs.shape[0]
+        high_t = torch.randint(t_lo, T, (total_tiles,), device=imgs.device)
 
         losses_high_t = self.sampler.training_losses(
             model=model,
@@ -421,7 +485,18 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
             t=high_t,
             model_kwargs={"cond": feats},
         )
-        return losses_high_t["loss"].mean()
+        per_tile = losses_high_t["loss"]  # (B*N,)
+
+        if bag_n is None or bag_n <= 1:
+            return per_tile.mean()
+
+        # bag_n > 1: reshape to (B, N) where B = total_tiles // bag_n
+        if total_tiles % bag_n != 0:
+            # fall back to flat mean if shapes don't align
+            return per_tile.mean()
+        B = total_tiles // bag_n
+        per_bag = per_tile.view(B, bag_n).mean(dim=1)
+        return per_bag.mean()
 
     # ------------------------------------------------------------------
     # Training step: L1 (standard diffusion) + L2 (genomic-guided high-t)
@@ -437,6 +512,11 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
 
         Total backprop loss = L1 + λ·L2, with λ = genomic_guided_loss_weight.
         """
+        # Flatten bag batches before any processing so that super() sees
+        # (B*N, C, H, W) images. GenomicLitModel.training_step does the same
+        # check, but doing it here first avoids double-flattening issues.
+        batch, _bag_n = self._flatten_bag_batch(batch)
+
         # L1: standard diffusion loss at uniform t (image-guided regime)
         out = super().training_step(batch, batch_idx)
 
@@ -444,36 +524,117 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
         if genomic_weight <= 0.0:
             return out
 
-        # L2: denoising at high t (genomic-guided regime)
+        # Always extract imgs and feats for reconstruction loss (even if high-t is skipped)
         imgs = batch["img"].to(self.device)
         feats = batch["feat"].to(self.device, dtype=torch.float32)
-
-        genomic_loss = self._compute_genomic_guided_loss(self.model, imgs, feats)
-
         loss_l1 = out["loss"] if isinstance(out, dict) else out
-        total_loss = loss_l1 + genomic_weight * genomic_loss
+        total_loss = loss_l1
 
-        if isinstance(out, dict):
-            out["loss"] = total_loss
-        else:
-            out = total_loss
+        # L2: denoising at high t (genomic-guided regime).
+        # Compute both conditioned and shuffled high-t losses using the
+        # same timesteps and noise so we can form a counterfactual gap at
+        # high t. Aggregate per-bag when bag mode is active.
+        # Skip during training if compute_high_t_loss_during_training=False (default).
+        compute_high_t = bool(getattr(self.conf, "compute_high_t_loss_during_training", False))
+        
+        if compute_high_t:
+            # draw high timesteps and shared noise for fair comparison
+            high_t_frac = float(getattr(self.conf, "genomic_guided_high_t_frac", 0.8))
+            T = self.conf.T
+            t_lo = int(high_t_frac * T)
+            total_tiles = imgs.shape[0]
+            high_t = torch.randint(t_lo, T, (total_tiles,), device=imgs.device)
+            shared_noise = torch.randn_like(imgs)
 
-        self.log(
-            "loss/genomic_guided",
-            genomic_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            logger=True,
-        )
-        self.log(
-            "loss/genomic_train",
-            genomic_loss,
-            on_step=True,
-            on_epoch=False,
-            prog_bar=False,
-            logger=True,
-        )
+            losses_cond = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats,
+                t=high_t,
+                noise=shared_noise,
+                model_kwargs={"cond": feats},
+            )
+            per_tile_cond = losses_cond["loss"]  # (B*N,)
+
+            # Shuffle feats at patient (bag) level for comparison
+            if _bag_n > 1:
+                B_bags = feats.shape[0] // _bag_n
+                bag_perm = self._non_identity_permutation(B_bags, feats.device)
+                feats_shuffled = (
+                    feats.reshape(B_bags, _bag_n, -1)[bag_perm]
+                    .reshape(B_bags * _bag_n, -1)
+                )
+            else:
+                perm = self._non_identity_permutation(feats.size(0), feats.device)
+                feats_shuffled = feats[perm]
+
+            losses_shuffled = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats_shuffled,
+                t=high_t,
+                noise=shared_noise,
+                model_kwargs={"cond": feats_shuffled},
+            )
+            per_tile_shuffled = losses_shuffled["loss"]
+
+            # Aggregate per-bag if requested
+            def _aggregate_per_bag(per_tile_loss: torch.Tensor, bag_n: int) -> torch.Tensor:
+                if bag_n is None or bag_n <= 1:
+                    return per_tile_loss.mean()
+                if per_tile_loss.numel() % bag_n != 0:
+                    return per_tile_loss.mean()
+                B = per_tile_loss.numel() // bag_n
+                return per_tile_loss.view(B, bag_n).mean(dim=1).mean()
+
+            genomic_loss = _aggregate_per_bag(per_tile_cond, _bag_n)
+            genomic_loss_shuffled = _aggregate_per_bag(per_tile_shuffled, _bag_n)
+
+            # Counterfactual gap at high-t (encourages using cond at high noise)
+            cf_weight = float(getattr(self.conf, "counterfactual_loss_weight", 0.0))
+            cf_temperature = max(1e-6, float(getattr(self.conf, "counterfactual_temperature", 0.05)))
+            gap = genomic_loss_shuffled - genomic_loss
+            cf_penalty_high_t = F.softplus(-gap / cf_temperature)
+
+            total_loss = loss_l1 + genomic_weight * genomic_loss + cf_weight * cf_penalty_high_t
+
+            if isinstance(out, dict):
+                out["loss"] = total_loss
+            else:
+                out = total_loss
+
+            self.log(
+                "loss/genomic_guided",
+                genomic_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+            self.log(
+                "loss/genomic_train",
+                genomic_loss,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+            self.log(
+                "loss/genomic_guided_gap",
+                gap,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+            self.log(
+                "loss/genomic_cf_high_t",
+                cf_penalty_high_t,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
 
         # --- Optional genomic reconstruction loss (from pooled middle features)
         recon_weight = float(getattr(self.conf, "genomic_recon_weight", 0.0))
@@ -527,6 +688,8 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
 
     def validation_step(self, batch, batch_idx):
         """Extend validation with an explicit genomic-guided validation loss."""
+        # Val dataset always uses n_tiles_per_bag=1, but guard for safety.
+        batch, _bag_n = self._flatten_bag_batch(batch)
         loss_cond = super().validation_step(batch, batch_idx)
         if loss_cond is None or self.trainer.sanity_checking:
             return loss_cond
@@ -534,7 +697,7 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
         imgs = batch["img"].to(self.device)
         feats = batch["feat"].to(self.device, dtype=torch.float32)
         with torch.no_grad():
-            genomic_val_loss = self._compute_genomic_guided_loss(self.ema_model, imgs, feats)
+            genomic_val_loss = self._compute_genomic_guided_loss(self.ema_model, imgs, feats, bag_n=_bag_n)
 
         # genomic reconstruction on EMA model
         recon_val_loss = None

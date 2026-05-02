@@ -60,6 +60,7 @@ class GenomicCrossAttnConfig(GenomicTrainConfig):
     # ── Genomic-guided high-t loss ────────────────────────────────────────
     genomic_guided_loss_weight: float = 0.3
     genomic_guided_high_t_frac: float = 0.8
+    compute_high_t_loss_during_training: bool = False  # Skip high-t loss during training; still compute at validation
     # ── Optional genomic reconstruction loss (MSE from pooled mid features)
     genomic_recon_weight: float = 0.05
 

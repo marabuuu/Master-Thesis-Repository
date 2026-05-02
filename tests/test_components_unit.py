@@ -60,10 +60,9 @@ def test_spatial_cross_attention_adapter():
         assert hasattr(adapter, "scale_proj"), "scale_proj not found"
         log.info("✓ FiLM scale projection layer present (zero-init)")
         
-        return True
     except Exception as e:
         log.error(f"Adapter test failed: {e}", exc_info=True)
-        return False
+        raise
 
 
 def test_multi_stage_wrapper_patching():
@@ -115,10 +114,9 @@ def test_multi_stage_wrapper_patching():
         assert isinstance(stats, dict), "stats is not a dict"
         log.info(f"✓ Attention stats method works (can retrieve stats)")
         
-        return True
     except Exception as e:
         log.error(f"Wrapper patching test failed: {e}", exc_info=True)
-        return False
+        raise
 
 
 def test_recon_head():
@@ -155,10 +153,9 @@ def test_recon_head():
         assert not torch.isnan(loss).any(), "NaN in recon loss"
         log.info(f"✓ Recon MSE loss computed: {loss:.6f}")
         
-        return True
     except Exception as e:
         log.error(f"Recon head test failed: {e}", exc_info=True)
-        return False
+        raise
 
 
 def test_film_initialization():
@@ -199,10 +196,9 @@ def test_film_initialization():
         if diff < 0.1:  # reasonable tolerance
             log.info("✓ FiLM zero-init confirms identity behavior at start")
         
-        return True
     except Exception as e:
         log.error(f"FiLM init test failed: {e}", exc_info=True)
-        return False
+        raise
 
 
 def main():
@@ -213,10 +209,26 @@ def main():
     torch.manual_seed(42)
     
     results = []
-    results.append(("Spatial Adapter (FiLM Gating)", test_spatial_cross_attention_adapter()))
-    results.append(("Multi-Stage Wrapper Patching", test_multi_stage_wrapper_patching()))
-    results.append(("Reconstruction Head MLP", test_recon_head()))
-    results.append(("FiLM Scale Initialization", test_film_initialization()))
+    try:
+        test_spatial_cross_attention_adapter()
+        results.append(("Spatial Adapter (FiLM Gating)", True))
+    except Exception:
+        results.append(("Spatial Adapter (FiLM Gating)", False))
+    try:
+        test_multi_stage_wrapper_patching()
+        results.append(("Multi-Stage Wrapper Patching", True))
+    except Exception:
+        results.append(("Multi-Stage Wrapper Patching", False))
+    try:
+        test_recon_head()
+        results.append(("Reconstruction Head MLP", True))
+    except Exception:
+        results.append(("Reconstruction Head MLP", False))
+    try:
+        test_film_initialization()
+        results.append(("FiLM Scale Initialization", True))
+    except Exception:
+        results.append(("FiLM Scale Initialization", False))
     
     log.info("\n" + "=" * 70)
     log.info("Test Results Summary:")

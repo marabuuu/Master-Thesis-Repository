@@ -103,22 +103,32 @@ class CompositeMetricCheckpoint(Callback):
                 f"gap_norm={gap_norm:.4f}, composite_score={composite_score:.6f}"
             )
 
-        # save checkpoint if best so far
+        # Always save last.ckpt from ALL ranks for safe resumption.
+        # trainer.save_checkpoint calls ddp.barrier internally — must be called
+        # from all ranks, not just rank 0, or other ranks will time out.
+        if pl_module.global_rank == 0:
+            self.dirpath.mkdir(parents=True, exist_ok=True)
+        last_ckpt_path = self.dirpath / "last.ckpt"
+        trainer.save_checkpoint(str(last_ckpt_path))
+
+        # save best composite checkpoint if score improved
         if composite_score < self.best_composite_score:
             self.best_composite_score = composite_score
             ckpt_path = (
                 self.dirpath / f"best-composite-step{trainer.global_step}.ckpt"
             )
+            # Rank 0 copies last.ckpt → named composite checkpoint (no extra barrier).
             if pl_module.global_rank == 0:
-                self.dirpath.mkdir(parents=True, exist_ok=True)
-                trainer.save_checkpoint(str(ckpt_path))
-                log.info(f"Saved checkpoint: {ckpt_path}")
+                import shutil
+                shutil.copy2(str(last_ckpt_path), str(ckpt_path))
+                log.info(f"Saved composite checkpoint: {ckpt_path}")
 
-            # keep only top_k checkpoints
+            # keep only top_k checkpoints (all ranks maintain consistent state
+            # since callback_metrics are synced; only rank 0 touches the filesystem)
             self.saved_ckpts.append((composite_score, ckpt_path))
             self.saved_ckpts.sort()
             if len(self.saved_ckpts) > self.save_top_k:
                 _, old_ckpt = self.saved_ckpts.pop()
-                if old_ckpt.exists() and pl_module.global_rank == 0:
+                if pl_module.global_rank == 0 and old_ckpt.exists():
                     old_ckpt.unlink()
                     log.info(f"Removed old checkpoint: {old_ckpt}")
