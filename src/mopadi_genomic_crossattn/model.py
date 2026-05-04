@@ -220,67 +220,93 @@ class MultiStageCrossAttentionUNetWrapper(torch.nn.Module):
         # is identity (scale_delta=0, shift=0).
         try:
             from mopadi.model.blocks import ResBlock
+            _resblock_import_ok = True
         except Exception:
             ResBlock = None
+            _resblock_import_ok = False
+
+        patched_count = 0
+        patched_sample: list = []  # store one (block, out_ch) for spot-check
 
         def _patch_block(block, cond_dim: int):
-            # block may be a TimestepEmbedSequential or ResBlock
+            nonlocal patched_count
             if hasattr(block, "__iter__") and not isinstance(block, torch.nn.ModuleList):
                 for layer in block:
                     _patch_block(layer, cond_dim)
                 return
             if ResBlock is not None and isinstance(block, ResBlock):
-                # ensure two_cond path is enabled so cond_emb_layers is actually called
+                # Ensure two_cond=True so the forward path actually calls cond_emb_layers.
+                # ResBlockConfig is a plain (non-frozen) dataclass so assignment works.
+                two_cond_set = False
                 try:
                     block.conf.two_cond = True
-                except Exception:
-                    log.warning(
-                        "Could not set two_cond=True on ResBlock (frozen config?); "
-                        "cond_emb_layers will be replaced but NOT called during forward."
-                    )
-                out_ch = int(getattr(block.conf, "out_channels", block.conf.channels))
-                # create new cond_emb_layers mapping cond_dim -> 2*out_ch
+                    two_cond_set = True
+                except Exception as e:
+                    raise RuntimeError(
+                        f"Could not set two_cond=True on ResBlock config: {e}. "
+                        "The FiLM conditioning path will be silently skipped during forward — "
+                        "genomic conditioning cannot work. Fix the ResBlockConfig class."
+                    ) from e
+                out_ch = int(getattr(block.conf, "out_channels", None) or block.conf.channels)
                 linear_layer = torch.nn.Linear(cond_dim, 2 * out_ch)
                 torch.nn.init.zeros_(linear_layer.weight)
                 if linear_layer.bias is not None:
                     torch.nn.init.zeros_(linear_layer.bias)
                 block.cond_emb_layers = torch.nn.Sequential(torch.nn.SiLU(), linear_layer)
+                patched_count += 1
+                if not patched_sample:
+                    patched_sample.append((block, out_ch))
 
-        # Patch input_blocks, middle_block, and output_blocks in-place
-        # and count how many ResBlocks were successfully patched.
-        patched_count = 0
-        
-        def count_patched_resblocks(module):
-            nonlocal patched_count
-            if ResBlock is not None and isinstance(module, ResBlock):
-                if hasattr(module, "cond_emb_layers") and module.cond_emb_layers is not None:
-                    patched_count += 1
-            elif hasattr(module, "__iter__") and not isinstance(module, torch.nn.ModuleList):
-                for layer in module:
-                    count_patched_resblocks(layer)
-        
         for module in list(getattr(base_unet, "input_blocks", [])):
             _patch_block(module, cond_dim)
         if hasattr(base_unet, "middle_block"):
             _patch_block(base_unet.middle_block, cond_dim)
         for module in list(getattr(base_unet, "output_blocks", [])):
             _patch_block(module, cond_dim)
-        
-        # Verify patching succeeded by counting patched blocks
-        for module in list(getattr(base_unet, "input_blocks", [])):
-            count_patched_resblocks(module)
-        if hasattr(base_unet, "middle_block"):
-            count_patched_resblocks(base_unet.middle_block)
-        for module in list(getattr(base_unet, "output_blocks", [])):
-            count_patched_resblocks(module)
-        
-        if patched_count == 0:
-            log.warning(
-                "No ResBlocks were patched with cond_emb_layers! "
-                "Check that mopadi.model.blocks.ResBlock is available and FiLM conditioning may not be active."
+
+        # ── Hard assertion: fail fast rather than silently train without conditioning ──
+        if _resblock_import_ok and patched_count == 0:
+            raise RuntimeError(
+                "MultiStageCrossAttentionUNetWrapper: mopadi.model.blocks.ResBlock was "
+                "imported successfully but zero ResBlocks were found and patched in the "
+                "base UNet (input_blocks / middle_block / output_blocks). "
+                "This means the scale+shift FiLM conditioning path is completely absent — "
+                "genomic conditioning cannot work. "
+                "Check that base_unet.input_blocks / output_blocks / middle_block are "
+                "populated and that the UNet architecture matches expectations."
             )
-        else:
-            log.info(f"Successfully patched {patched_count} ResBlocks with 2*out_channels cond_emb_layers.")
+        if not _resblock_import_ok:
+            log.warning(
+                "mopadi.model.blocks.ResBlock could not be imported; "
+                "skipping scale+shift FiLM patching. "
+                "Genomic conditioning will rely on cross-attention adapters only."
+            )
+
+        # ── Spot-check: verify output dimension of at least one patched block ──
+        if patched_sample:
+            sample_block, expected_out_ch = patched_sample[0]
+            linear = sample_block.cond_emb_layers[-1]
+            actual_out = linear.out_features
+            expected_out = 2 * expected_out_ch
+            if actual_out != expected_out:
+                raise RuntimeError(
+                    f"FiLM cond_emb_layers output dim mismatch on first patched ResBlock: "
+                    f"expected {expected_out} (2×{expected_out_ch}), got {actual_out}. "
+                    "This will produce shift-only conditioning, not scale+shift. "
+                    "This is a code bug — the patching logic is incorrect."
+                )
+            if not sample_block.conf.two_cond:
+                raise RuntimeError(
+                    "two_cond is still False on first patched ResBlock despite the assignment. "
+                    "The forward path will not call cond_emb_layers and FiLM is inactive. "
+                    "This is a code bug — ResBlockConfig assignment is not persisting."
+                )
+
+        log.info(
+            "FiLM patching complete: %d ResBlocks upgraded to scale+shift "
+            "(2×out_channels cond_emb_layers, two_cond=True).",
+            patched_count,
+        )
 
     def wrapper_parameters(self):
         yield from self.input_adapter.parameters()
@@ -520,6 +546,17 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
         # L1: standard diffusion loss at uniform t (image-guided regime)
         out = super().training_step(batch, batch_idx)
 
+        # Log attention adapter stats unconditionally so they appear in TensorBoard
+        # even when all conditioning losses are disabled.  No gradient impact.
+        if self.global_step % 100 == 0:
+            attn_stats = self.model.get_attention_stats()
+            for key, val in attn_stats.items():
+                self.log(
+                    f"attn/{key}", val,
+                    on_step=True, on_epoch=False, prog_bar=False,
+                    logger=True, sync_dist=False,
+                )
+
         genomic_weight = float(getattr(self.conf, "genomic_guided_loss_weight", 0.0))
         if genomic_weight <= 0.0:
             return out
@@ -672,17 +709,6 @@ class GenomicCrossAttnLitModel(GenomicLitModel):
                     prog_bar=False,
                     logger=True,
                 )
-
-        # --- Log attention statistics periodically (every ~100 steps)
-        if self.global_step % 100 == 0:
-            attn_stats = self.model.get_attention_stats()
-            if self.global_rank == 0:
-                logger = getattr(self, "logger", None)
-                if logger is not None and hasattr(logger, "experiment"):
-                    for key, val in attn_stats.items():
-                        logger.experiment.add_scalar(f"attn/{key}", val, self.num_samples)
-            for key, val in attn_stats.items():
-                self.log(f"attn/{key}", val, on_step=True, on_epoch=False, prog_bar=False, logger=False)
 
         return out
 

@@ -274,22 +274,7 @@ class GenomicLitModel(LitModel):
             and batch["feat"].shape[0] > 1
         ):
             imgs = batch["img"].to(self.device)
-            # Use the real genomic vectors for the CF loss so the gap measures
-            # correct vs. shuffled patient conditioning only.
             feats = batch["feat"].to(self.device, dtype=torch.float32)
-
-            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
-            shared_noise = torch.randn_like(imgs)
-
-            losses_cond = self.sampler.training_losses(
-                model=self.model,
-                x_start=imgs,
-                cond=feats,
-                t=t,
-                noise=shared_noise,
-                model_kwargs={"cond": feats},
-            )
-            loss_cond = losses_cond["loss"].mean()
 
             # Shuffle at the patient (bag) level: all N tiles from patient i
             # always go with a different patient's genomic vector.
@@ -304,24 +289,40 @@ class GenomicLitModel(LitModel):
                 perm = self._non_identity_permutation(feats.size(0), feats.device)
                 feats_shuffled = feats[perm]
 
-            # Shuffled pass needs only a reference loss value, not gradients.
-            # Using no_grad here cuts peak activation memory from 3× to 2× a
-            # single forward pass (main-pass activations + cond-pass activations
-            # are the only two graphs held simultaneously before backward).
-            with torch.no_grad():
-                losses_shuffled = self.sampler.training_losses(
-                    model=self.model,
-                    x_start=imgs,
-                    cond=feats_shuffled,
-                    t=t,
-                    noise=shared_noise,
-                    model_kwargs={"cond": feats_shuffled},
-                )
-            loss_shuffled = losses_shuffled["loss"].mean().detach()
+            # Draw shared t/noise used for BOTH conditioned and shuffled CF passes.
+            # Using the same t/noise eliminates timestep variance from the gap
+            # estimate: the only source of difference is conditioning correctness.
+            # Both passes run WITH gradient so:
+            #   ∂(cf_term)/∂θ pushes loss_cond_cf DOWN (use correct conditioning)
+            #   ∂(cf_term)/∂θ pushes loss_shuffled_cf UP (perform worse with wrong cond)
+            # This is the correct contrastive signal absent from the previous no_grad design.
+            t_cf, _ = self.T_sampler.sample(len(imgs), imgs.device)
+            noise_cf = torch.randn_like(imgs)
 
-            gap = loss_shuffled - loss_cond
-            # Softplus: -log σ(gap/T) = log(1 + exp(-gap/T))
-            # Gradient is always non-zero; effective "soft margin" ≈ T.
+            # Both CF passes run with gradient: ∂(cf_term)/∂θ pushes loss_cond_cf down
+            # (use correct conditioning) and loss_shuffled_cf up (fail on wrong cond).
+            # Memory fits because n_tiles_per_bag=1: 3 passes × ~19 GB = ~57 GB < 80 GB.
+            losses_cond_cf = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats,
+                t=t_cf,
+                noise=noise_cf,
+                model_kwargs={"cond": feats},
+            )
+            loss_cond_cf = losses_cond_cf["loss"].mean()
+
+            losses_shuffled = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats_shuffled,
+                t=t_cf,
+                noise=noise_cf,
+                model_kwargs={"cond": feats_shuffled},
+            )
+            loss_shuffled_cf = losses_shuffled["loss"].mean()
+
+            gap = loss_shuffled_cf - loss_cond_cf
             cf_penalty = F.softplus(-gap / cf_temperature)
             cf_term = cf_weight * cf_penalty
             loss_val = loss_val + cf_term
@@ -394,7 +395,14 @@ class GenomicLitModel(LitModel):
         feats = batch["feat"].to(self.device, dtype=torch.float32)
 
         with torch.no_grad():
-            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+            # Use batch_idx as seed so the same batch always draws the same
+            # timesteps and permutation across val epochs.  This removes t-
+            # and perm-variance from cond/gap so the trend is visible earlier.
+            # CPU-based sampling avoids CUDA RNG interference.
+            with torch.random.fork_rng(devices=[]):  # CPU-only sampling; don't init all 4 CUDA devices
+                torch.manual_seed(batch_idx)
+                t = torch.randint(0, self.conf.T, (len(imgs),)).to(imgs.device)
+                perm = self._non_identity_permutation(feats.size(0), device="cpu").to(feats.device)
 
             # ── Loss with correct conditioning ───────────────────────────
             losses_cond = self.sampler.training_losses(
@@ -409,7 +417,6 @@ class GenomicLitModel(LitModel):
             # ── Loss with shuffled conditioning ──────────────────────────
             # Permute genomic vectors within the batch so each image is
             # paired with a random (likely wrong) patient's features.
-            perm = self._non_identity_permutation(feats.size(0), feats.device)
             feats_shuffled = feats[perm]
             losses_shuffled = self.sampler.training_losses(
                 model=self.ema_model,

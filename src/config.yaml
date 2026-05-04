@@ -1,3 +1,5 @@
+# python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz
+
 dataset_statistics:
   clinical_csv: ../dataframes/brca_subtypes.csv
   patient_col: bcr_patient_barcode
@@ -6,12 +8,13 @@ dataset_statistics:
   menopause_col: menopause_status
   os_time_col: OS.time
   os_event_col: OS
-  output_dir: ./experiments/20260408_dataset_statistics
+  output_dir: ./experiments/20260504_dataset_statistics
   plots:
   - tumor_stage_distribution
   - menopause_distribution
   - subtype_distribution
   - kaplan_meier_by_subtype
+  - combined_overview
   cmap_categorical: romaO
   cmap_sequential: batlow
   figsize_distributions:
@@ -23,6 +26,9 @@ dataset_statistics:
   figsize_km:
   - 10
   - 7
+  figsize_combined:
+  - 14
+  - 10
   dpi: 200
   min_patients_km: 10
   
@@ -115,9 +121,14 @@ mopadi_genomic_crossattn:
   lr: 0.0001
   unet_lr: 1.0e-4
   cross_attn_lr: 1.5e-4
-  genomic_guided_loss_weight: 0.0   # disabled: causes mean-tile collapse + wastes a full forward pass per step
+  # High-t genomic-guided loss: both conditioned and shuffled passes have gradients so
+  # the model is explicitly pushed to use conditioning at high noise levels.
+  # λ=0.3 keeps the high-t term from dominating the L1 loss; high-t outputs looking like
+  # blurry class averages ("mean-tile") is *expected* — that is the class prior at t≈T.
+  genomic_guided_loss_weight: 0.3
+  compute_high_t_loss_during_training: true
   genomic_guided_high_t_frac: 0.8
-  n_tiles_per_bag: 2               # 2 tiles/patient: enough bag signal, fits in 80 GB without gradient checkpointing
+  n_tiles_per_bag: 1               # 1 tile/patient: 3 CF passes × ~19 GB = 57 GB fits without checkpointing; genomic vector is per-patient so bag averaging adds no signal
   batch_size: 4
   accumulate_grad_batches: 2
   total_samples: 2500000
@@ -125,7 +136,7 @@ mopadi_genomic_crossattn:
   save_every_samples: 80000
   reconstruct_every_samples: 100000
   sample_size: 8
-  net_beatgans_gradient_checkpoint: false  # not needed with 2 tiles/bag; disabling recovers 2× backward speed
+  net_beatgans_gradient_checkpoint: false  # not needed: n_tiles_per_bag=1 keeps 3 CF passes × ~19 GB = ~57 GB well within 80 GB
   ema_decay: 0.9999
   grad_clip: 1.0
   fp16: false
@@ -139,30 +150,30 @@ mopadi_genomic_crossattn:
   - 1
   - 2
   - 3
-  base_dir: ./experiments/20260501_genomic_crossattn_v5
+  base_dir: ./experiments/20260502_genomic_crossattn_v5
   save_top_k: 3
-  out_dir: ./experiments/20260501_genomic_crossattn_v5/train
-  checkpoint_dir: ./experiments/20260501_genomic_crossattn_v5/checkpoints
-  logdir: ./experiments/20260501_genomic_crossattn_v5/logs
-  tensorboard_dir: ./experiments/20260501_genomic_crossattn_v5/tensorboard
-  sample_dir: ./experiments/20260501_genomic_crossattn_v5/samples
-  reconstructions_dir: ./experiments/20260501_genomic_crossattn_v5/reconstructions
+  out_dir: ./experiments/20260502_genomic_crossattn_v5/train
+  checkpoint_dir: ./experiments/20260502_genomic_crossattn_v5/checkpoints
+  logdir: ./experiments/20260502_genomic_crossattn_v5/logs
+  tensorboard_dir: ./experiments/20260502_genomic_crossattn_v5/tensorboard
+  sample_dir: ./experiments/20260502_genomic_crossattn_v5/samples
+  reconstructions_dir: ./experiments/20260502_genomic_crossattn_v5/reconstructions
   # Counterfactual conditioning gap loss (softplus; effective margin ≈ temperature)
-  counterfactual_loss_weight: 1.0
+  counterfactual_loss_weight: 0.05
   counterfactual_temperature: 0.5
   counterfactual_every_n_steps: 1
   counterfactual_warmup_steps: 5000  # longer warmup for stable conditioning ramp with bag mode
-  # Genomic reconstruction loss: MSE from pooled UNet bottleneck → genomic vector
-  # Disabled: adds a full extra forward pass per step with no benefit to generation quality.
-  genomic_recon_weight: 0.0
+  # Genomic reconstruction loss: MSE from pooled UNet bottleneck → genomic vector.
+  # Provides a conditioning gradient at t=0 (clean image), complementing the high-t loss.
+  genomic_recon_weight: 0.05
   # Composite checkpoint: saves best ckpt by (loss/val - alpha * cond/gap_norm)
   # instead of loss/val alone, so a conditioning-collapsed model is not selected.
   use_composite_metric_checkpoint: true
   composite_alpha: 1.0
 
 training_stats:
-  logdir: ./experiments/20260501_genomic_crossattn_v5
-  output_dir: ./experiments/20260501_genomic_crossattn_v5/training_stats
+  logdir: ./experiments/20260502_genomic_crossattn_v5
+  output_dir: ./experiments/20260502_genomic_crossattn_v5/training_stats
   plots:
   - loss_curves
   - genomic_diagnostics
@@ -210,6 +221,7 @@ tfd_separability:
   figsize: null
 
 tfd_separability_viz:
+  # ── Input ─────────────────────────────────────────────────────────────────
   results_json: ./experiments/20260420_tfd_separability/results_all_subtypes/tfd_separability_results.json
   masks_dir: ./experiments/20260420_tfd_separability/masks
   metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
@@ -217,17 +229,32 @@ tfd_separability_viz:
   subtype_col: Majority_Subtype_mRNA
   classes: null
   output_dir: ./experiments/20260420_tfd_separability/plots
+
+  # ── Plots to generate ─────────────────────────────────────────────────────
   plots:
-  - ternary_composition
-  max_tiles_per_subtype: 2000
+    #- radar_contributions     # radar/spider chart with blended subtype colours
+    #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
+    #- cell_type_boxplots      # pixel-fraction boxplots per subtype
+    - ternary_composition     # epithelium-immune-connective triangle plot
+    - nn_distance_violins     # intra-type NN distance violins (spatial clustering)
+    - cross_type_proximity    # cross-cell-type NN distance heatmaps (spatial interface)
+
+  # ── Tile sampling ──────────────────────────────────────────────────────────
+  max_tiles_per_subtype: 2000   # cap for boxplots + ternary (fast pixel ops)
+  max_tiles_spatial: 500        # cap for spatial NN plots (connected components, slower)
   include_background: false
-  cmap_categorical: romaO
-  cmap_cell_types: batlow
-  cmap_heatmap: lajolla
-  figsize_radar: null
-  figsize_heatmap: null
-  figsize_boxplot: null
-  figsize_ternary: null
+  seed: 42
+
+  # ── Styling (Crameri scientific colour maps) ──────────────────────────────
+  cmap_categorical: romaO       # subtype colours (radar, ternary)
+  cmap_cell_types: batlow       # cell-type colours in boxplots + NN violins
+  cmap_heatmap: lajolla         # sequential colourmap for all heatmaps
+  figsize_radar: null           # null = auto (9x9 square)
+  figsize_heatmap: null         # null = auto
+  figsize_boxplot: null         # null = auto
+  figsize_ternary: null         # null = auto (9x8.5)
+  figsize_nn_violins: null      # null = auto (same layout as boxplots)
+  figsize_proximity: null       # null = auto (5 panels x 6x6 matrix)
   dpi: 200
 
 segmentation:

@@ -31,6 +31,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 import zipfile
 from io import BytesIO
 from pathlib import Path
@@ -64,6 +65,24 @@ except ImportError:  # pragma: no cover
     pass
 
 logger = logging.getLogger(__name__)
+
+
+def _extract_patient_id(name: str) -> str:
+    """Extract the TCGA-XX-XXXX barcode from a filename or bare patient string."""
+    stem = Path(name).stem.upper()
+    m = re.match(r"(TCGA-[A-Z0-9]+-[A-Z0-9]+)", stem)
+    if m:
+        return m.group(1)
+    for sep in ("_", "."):
+        stem = stem.replace(sep, "-")
+    while "--" in stem:
+        stem = stem.replace("--", "-")
+    parts = stem.split("-")
+    if len(parts) >= 3 and parts[0].startswith("TCGA"):
+        return "-".join(parts[:3])
+    m = re.search(r"(?i)(TCGA-[A-Z0-9]+-[A-Z0-9]+)", name)
+    return m.group(1).upper() if m else name
+
 
 # -----------------------------------------------------------------------
 # Cell-type metadata
@@ -539,7 +558,7 @@ def plot_cell_type_boxplots(
     _check_seaborn()
     setup_style()
 
-    from src.quality_assurance.utils import extract_patient_id as _pid
+    _pid = _extract_patient_id
 
     masks_dir = Path(masks_dir)
     output_dir = Path(output_dir)
@@ -791,7 +810,7 @@ def plot_ternary_composition(
     _check_matplotlib()
     setup_style()
     from matplotlib.lines import Line2D
-    from src.quality_assurance.utils import extract_patient_id as _pid
+    _pid = _extract_patient_id
 
     masks_dir = Path(masks_dir)
     output_dir = Path(output_dir)
@@ -906,6 +925,409 @@ def plot_ternary_composition(
 
 
 # ===================================================================
+# § 6  Spatial topology: nearest-neighbour distances
+# ===================================================================
+
+def _collect_spatial_stats(
+    masks_dir: Path,
+    patient_ids: List[str],
+    non_bg_channels: List[int],
+    max_tiles: Optional[int],
+    seed: int = 42,
+) -> Dict[str, np.ndarray]:
+    """Return per-tile nearest-neighbour distances between cell types.
+
+    For each tile:
+    1. Per-pixel argmax assigns each pixel to the most probable class.
+    2. Connected-component centroids are extracted for each non-background
+       channel via ``scipy.ndimage``.
+    3. Two arrays are built:
+
+       * ``nn_intra`` (N, n_ch): mean distance from each cell to its nearest
+         same-type neighbour.  ``NaN`` when fewer than 2 cells of that type
+         are present in the tile.
+       * ``nn_cross`` (N, n_ch, n_ch): ``[i, j]`` = mean distance from every
+         cell of type *i* to the nearest cell of type *j* (``NaN`` if either
+         type has zero cells; diagonal = intra-type, requires ≥ 2 cells).
+
+    All distances are in pixels.  ``nn_intra`` equals the diagonal of
+    ``nn_cross``.
+
+    Parameters
+    ----------
+    masks_dir : Path
+    patient_ids : list[str]
+    non_bg_channels : list[int]
+        Channel indices to analyse (typically 1–6; background excluded).
+    max_tiles : int or None
+        Total tile budget across all patients; ``None`` = use all.
+    seed : int
+    """
+    try:
+        from scipy.ndimage import label as nd_label
+        from scipy.ndimage import center_of_mass as nd_com
+        from scipy.spatial import KDTree
+    except ImportError as exc:
+        raise ImportError("scipy is required for spatial NN analysis") from exc
+
+    rng = np.random.default_rng(seed)
+    n_ch = len(non_bg_channels)
+    nn_intra_all: List[np.ndarray] = []
+    nn_cross_all: List[np.ndarray] = []
+
+    per_patient: Optional[int] = (
+        max(1, int(np.ceil(max_tiles / len(patient_ids))))
+        if max_tiles is not None and len(patient_ids) > 0
+        else None
+    )
+
+    for pid in patient_ids:
+        zip_path = masks_dir / f"{pid}.zip"
+        if not zip_path.exists():
+            continue
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
+                if per_patient is not None and len(tile_names) > per_patient:
+                    chosen = rng.choice(len(tile_names), per_patient, replace=False)
+                    tile_names = [tile_names[i] for i in chosen]
+
+                for name in tile_names:
+                    try:
+                        with zf.open(name) as f:
+                            mask = np.load(BytesIO(f.read()))
+                        if mask.ndim == 2:
+                            continue
+                        if mask.ndim == 3 and mask.shape[0] >= mask.shape[1]:
+                            mask = np.transpose(mask, (2, 0, 1))
+
+                        pixel_classes = np.argmax(mask, axis=0)
+
+                        # Centroids per channel via connected components
+                        centroids: List[Optional[np.ndarray]] = []
+                        for ch in non_bg_channels:
+                            binary = (pixel_classes == ch)
+                            labeled, n_comp = nd_label(binary)
+                            if n_comp == 0:
+                                centroids.append(None)
+                                continue
+                            coms = nd_com(binary, labeled, list(range(1, n_comp + 1)))
+                            centroids.append(np.array(coms))  # (n_comp, 2) in (row, col)
+
+                        # Cross-type NN matrix; diagonal = intra-type
+                        nn_cross_tile = np.full((n_ch, n_ch), np.nan)
+                        for i, cents_a in enumerate(centroids):
+                            if cents_a is None or len(cents_a) == 0:
+                                continue
+                            for j, cents_b in enumerate(centroids):
+                                if cents_b is None or len(cents_b) == 0:
+                                    continue
+                                if i == j:
+                                    if len(cents_b) < 2:
+                                        continue
+                                    tree = KDTree(cents_b)
+                                    dists, _ = tree.query(cents_a, k=2)
+                                    nn_cross_tile[i, j] = dists[:, 1].mean()
+                                else:
+                                    tree = KDTree(cents_b)
+                                    dists, _ = tree.query(cents_a, k=1)
+                                    nn_cross_tile[i, j] = dists.mean()  # k=1 → 1D
+
+                        nn_intra_all.append(np.diag(nn_cross_tile).copy())
+                        nn_cross_all.append(nn_cross_tile)
+
+                    except Exception:
+                        logger.debug("Spatial stats failed: %s in %s", name, zip_path)
+        except Exception:
+            logger.debug("Cannot open %s", zip_path)
+
+    if not nn_intra_all:
+        return {
+            "nn_intra": np.empty((0, n_ch), dtype=float),
+            "nn_cross": np.empty((0, n_ch, n_ch), dtype=float),
+        }
+
+    nn_intra_arr = np.stack(nn_intra_all)
+    nn_cross_arr = np.stack(nn_cross_all)
+    if max_tiles is not None and nn_intra_arr.shape[0] > max_tiles:
+        idx = rng.choice(nn_intra_arr.shape[0], max_tiles, replace=False)
+        nn_intra_arr = nn_intra_arr[idx]
+        nn_cross_arr = nn_cross_arr[idx]
+    return {"nn_intra": nn_intra_arr, "nn_cross": nn_cross_arr}
+
+
+def _collect_spatial_stats_for_subtypes(
+    masks_dir: Path,
+    subtypes: List[str],
+    patient_to_subtype: Dict[str, str],
+    non_bg_channels: List[int],
+    max_tiles: Optional[int],
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Collect spatial NN stats for each subtype; returns ``{subtype: stats}``."""
+    class_to_patients: Dict[str, List[str]] = {s: [] for s in subtypes}
+    for p, st in patient_to_subtype.items():
+        if st in class_to_patients:
+            class_to_patients[st].append(p)
+
+    stats_by_subtype: Dict[str, Dict[str, np.ndarray]] = {}
+    for subtype in subtypes:
+        pids = class_to_patients[subtype]
+        if not pids:
+            continue
+        if verbose:
+            print(f"  [{subtype}] Computing spatial NN stats ({len(pids)} patients)…")
+        stats = _collect_spatial_stats(
+            masks_dir, pids, non_bg_channels, max_tiles, seed=seed
+        )
+        if stats["nn_intra"].shape[0] == 0:
+            logger.warning("%s: no spatial stats collected", subtype)
+            continue
+        stats_by_subtype[subtype] = stats
+        if verbose:
+            print(f"  [{subtype}] {stats['nn_intra'].shape[0]} tiles processed")
+    return stats_by_subtype
+
+
+def plot_nn_distance_violins(
+    stats_by_subtype: Dict[str, Dict[str, np.ndarray]],
+    non_bg_channels: List[int],
+    output_dir: Union[str, Path],
+    *,
+    cell_type_cmap: str = CELL_TYPE_CMAP,
+    figsize: Optional[Tuple[float, float]] = None,
+    dpi: int = 200,
+    verbose: bool = True,
+) -> None:
+    """Save violin plots of intra-type nearest-neighbour distances per subtype.
+
+    Layout mirrors the cell-type boxplots: one panel per PAM50 subtype,
+    x-axis = cell type, y-axis = mean distance (px) from each cell to its
+    nearest same-type neighbour.  Tiles where a type has fewer than two
+    cells are dropped (``NaN``).  The y-axis is shared for direct comparison.
+
+    Uses the same Crameri ``batlow`` cell-type palette as the composition
+    boxplots so colours are consistent across all figures.
+
+    Parameters
+    ----------
+    stats_by_subtype : dict
+        Output of :func:`_collect_spatial_stats_for_subtypes`.
+    non_bg_channels : list[int]
+        Channel indices included in the stats (typically 1–6).
+    output_dir : path
+        Where to save ``tfd_nn_distance_violins.png``.
+    cell_type_cmap : str
+    figsize : (w, h) or None
+    dpi : int
+    verbose : bool
+    """
+    _check_seaborn()
+    setup_style()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    subtypes = [s for s in PAM50_ORDER if s in stats_by_subtype]
+    subtypes += [s for s in stats_by_subtype if s not in PAM50_ORDER]
+    ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
+    cell_type_palette = _build_cell_type_palette(ch_labels, cmap_name=cell_type_cmap)
+
+    # Long-form DataFrame; drop NaN (tiles with < 2 cells of that type)
+    records: List[Dict] = []
+    for subtype in subtypes:
+        nn_intra = stats_by_subtype[subtype]["nn_intra"]  # (N, n_ch)
+        for i, ch in enumerate(non_bg_channels):
+            vals = nn_intra[:, i]
+            for v in vals[np.isfinite(vals)]:
+                records.append({
+                    "Subtype": subtype,
+                    "Cell Type": CHANNEL_NAMES[ch],
+                    "NN Distance (px)": float(v),
+                })
+
+    if not records:
+        logger.error("No intra-type NN data collected — skipping violin plot.")
+        return
+
+    df_long = pd.DataFrame(records)
+    n_subtypes = len(subtypes)
+    if figsize is None:
+        figsize = (n_subtypes * 4.2, 5.2)
+
+    fig, axes = plt.subplots(
+        1, n_subtypes, figsize=figsize, sharey=True, squeeze=False
+    )
+
+    for col_idx, subtype in enumerate(subtypes):
+        ax = axes[0][col_idx]
+        subset = df_long[df_long["Subtype"] == subtype]
+        present = [name for name in ch_labels if name in subset["Cell Type"].values]
+
+        if subset.empty:
+            ax.set_title(subtype, fontsize=12, fontweight="bold", pad=6)
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="grey")
+            continue
+
+        sns.violinplot(
+            data=subset,
+            x="Cell Type",
+            y="NN Distance (px)",
+            order=present,
+            palette=cell_type_palette,
+            linewidth=0.8,
+            inner="quartile",
+            cut=0,
+            ax=ax,
+        )
+        ax.set_title(subtype, fontsize=12, fontweight="bold", pad=6)
+        ax.set_xlabel("")
+        ax.set_ylabel("Mean NN distance (px)" if col_idx == 0 else "")
+        ax.tick_params(axis="x", labelrotation=40)
+        if col_idx > 0:
+            ax.tick_params(axis="y", labelleft=False)
+
+    fig.suptitle(
+        "Intra-Type Nearest-Neighbour Distance per PAM50 Subtype\n"
+        "(mean distance from each cell to its nearest same-type neighbour)",
+        fontsize=12, y=1.02,
+    )
+    fig.tight_layout()
+
+    out = output_dir / "tfd_nn_distance_violins.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved NN distance violin plots → {out}")
+
+
+def plot_cross_type_proximity_heatmaps(
+    stats_by_subtype: Dict[str, Dict[str, np.ndarray]],
+    non_bg_channels: List[int],
+    output_dir: Union[str, Path],
+    *,
+    cmap_name: str = HEATMAP_CMAP,
+    figsize: Optional[Tuple[float, float]] = None,
+    dpi: int = 200,
+    verbose: bool = True,
+) -> None:
+    """Save side-by-side heatmaps of cross-cell-type nearest-neighbour distances.
+
+    One heatmap per PAM50 subtype.  Cell *(i, j)* shows the **median**
+    (over all tiles) of the mean distance from a cell of type *i* to the
+    nearest cell of type *j*.  The diagonal is the intra-type clustering
+    distance.
+
+    Key biological readouts
+    -----------------------
+    * **Lymphocyte → Epithelium**: shorter in high-TIL subtypes (Basal/Her2)
+      → tumour-immune interface proximity.
+    * **Connective → Epithelium**: reflects desmoplastic stromal response
+      (typically elevated in LumA/LumB).
+    * **Lymphocyte → Lymphocyte** (diagonal): small = aggregated TIL clusters;
+      large = dispersed infiltration.
+
+    A shared colour scale across all panels makes subtype differences
+    immediately visible.  Colourmap: Crameri ``lajolla`` (same as the
+    channel contribution heatmaps).
+
+    Parameters
+    ----------
+    stats_by_subtype : dict
+        Output of :func:`_collect_spatial_stats_for_subtypes`.
+    non_bg_channels : list[int]
+        Channel indices included in the stats (typically 1–6).
+    output_dir : path
+        Where to save ``tfd_cross_type_proximity.png``.
+    cmap_name : str
+    figsize : (w, h) or None
+    dpi : int
+    verbose : bool
+    """
+    _check_matplotlib()
+    setup_style()
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    subtypes = [s for s in PAM50_ORDER if s in stats_by_subtype]
+    subtypes += [s for s in stats_by_subtype if s not in PAM50_ORDER]
+    ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
+    n_ch = len(non_bg_channels)
+    cmap = get_crameri_cmap(cmap_name)
+
+    # Per-subtype median cross-type distance matrix
+    matrices: Dict[str, np.ndarray] = {}
+    for subtype in subtypes:
+        if subtype not in stats_by_subtype:
+            continue
+        nn_cross = stats_by_subtype[subtype]["nn_cross"]  # (N, n_ch, n_ch)
+        matrices[subtype] = np.nanmedian(nn_cross, axis=0)
+
+    if not matrices:
+        logger.error("No cross-type proximity data — skipping heatmaps.")
+        return
+
+    # Shared colour scale — 5th to 95th percentile of all finite values
+    all_vals = np.concatenate([m.ravel() for m in matrices.values()])
+    all_vals = all_vals[np.isfinite(all_vals)]
+    vmin = float(np.percentile(all_vals, 5))
+    vmax = float(np.percentile(all_vals, 95))
+
+    n_subtypes = len(subtypes)
+    if figsize is None:
+        figsize = (n_subtypes * 3.6 + 1.2, 5.2)
+
+    fig, axes = plt.subplots(1, n_subtypes, figsize=figsize, squeeze=False)
+    norm_range = vmax - vmin + 1e-9
+    im_ref = None
+
+    for col_idx, subtype in enumerate(subtypes):
+        ax = axes[0][col_idx]
+        if subtype not in matrices:
+            ax.set_visible(False)
+            continue
+        mat = matrices[subtype]
+        im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax,
+                       aspect="equal", interpolation="none")
+        im_ref = im
+
+        ax.set_xticks(range(n_ch))
+        ax.set_xticklabels(ch_labels, rotation=40, ha="right", fontsize=8)
+        ax.set_yticks(range(n_ch))
+        ax.set_yticklabels(ch_labels if col_idx == 0 else [], fontsize=8)
+        ax.set_title(subtype, fontsize=11, fontweight="bold", pad=5)
+
+        for i in range(n_ch):
+            for j in range(n_ch):
+                v = mat[i, j]
+                if not np.isfinite(v):
+                    ax.text(j, i, "—", ha="center", va="center",
+                            fontsize=7, color="#888888")
+                    continue
+                txt_col = "white" if (v - vmin) / norm_range > 0.6 else "black"
+                ax.text(j, i, f"{v:.0f}", ha="center", va="center",
+                        fontsize=7, color=txt_col)
+
+    if im_ref is not None:
+        cbar = fig.colorbar(im_ref, ax=axes[0, -1], fraction=0.046, pad=0.10)
+        cbar.set_label("Median NN distance (px)", fontsize=9)
+
+    fig.suptitle(
+        "Cross–Cell-Type Nearest-Neighbour Distances per PAM50 Subtype\n"
+        "row = source type  ·  col = target type  ·  median over tiles (px)",
+        fontsize=11, y=1.03,
+    )
+    fig.tight_layout()
+
+    out = output_dir / "tfd_cross_type_proximity.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved cross-type proximity heatmaps → {out}")
+
+
+# ===================================================================
 # § 4  Pipeline entry point
 # ===================================================================
 
@@ -940,9 +1362,15 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
     figsize_boxplot : [w, h] or null
     dpi : int
         Save resolution (default: 200).
+    max_tiles_spatial : int
+        Tile budget per subtype for spatial NN computations (default: 500).
+        Kept separate from ``max_tiles_per_subtype`` because connected-component
+        extraction is significantly slower than pixel-fraction counting.
     plots : list[str]
-        Which plots to generate. Choices: ``channel_contributions``,
-        ``radar_contributions``, ``cell_type_boxplots``.  Default: all three.
+        Which plots to generate.  Choices:
+        ``channel_contributions``, ``radar_contributions``,
+        ``cell_type_boxplots``, ``ternary_composition``,
+        ``nn_distance_violins``, ``cross_type_proximity``.
     """
     results_json = cfg.get("results_json")
     masks_dir = cfg.get("masks_dir")
@@ -1036,3 +1464,75 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 dpi=dpi,
                 verbose=verbose,
             )
+
+    # --- Spatial NN plots (B + C): shared data collection ---
+    _need_spatial = (
+        "nn_distance_violins" in plots or "cross_type_proximity" in plots
+    )
+    if _need_spatial:
+        if not masks_dir or not metadata_csv:
+            logger.warning(
+                "'masks_dir' or 'metadata_csv' not set — skipping spatial NN plots."
+            )
+        else:
+            _patient_col = cfg.get("patient_col", "Patient_ID")
+            _subtype_col = cfg.get("subtype_col", "Majority_Subtype_mRNA")
+            _df_meta = pd.read_csv(metadata_csv)
+            _df_meta["_pid"] = _df_meta[_patient_col].apply(_extract_patient_id)
+            _p2s = dict(zip(_df_meta["_pid"], _df_meta[_subtype_col]))
+            _available = sorted(_df_meta[_subtype_col].dropna().unique().tolist())
+            _classes = cfg.get("classes")
+            if _classes is not None:
+                _subtypes = [c for c in PAM50_ORDER if c in _classes]
+                _subtypes += [c for c in _classes if c not in PAM50_ORDER]
+            else:
+                _subtypes = [c for c in PAM50_ORDER if c in _available]
+                _subtypes += [c for c in _available if c not in PAM50_ORDER]
+
+            _non_bg = list(range(1, 7))
+            _max_sp = cfg.get("max_tiles_spatial", 500)
+            if verbose:
+                print(
+                    f"\n[TFD-Viz] Computing spatial NN statistics "
+                    f"(max {_max_sp} tiles/subtype via scipy connected components)…"
+                )
+
+            _stats = _collect_spatial_stats_for_subtypes(
+                masks_dir=Path(masks_dir),
+                subtypes=_subtypes,
+                patient_to_subtype=_p2s,
+                non_bg_channels=_non_bg,
+                max_tiles=_max_sp,
+                seed=cfg.get("seed", 42),
+                verbose=verbose,
+            )
+
+            if "nn_distance_violins" in plots:
+                if verbose:
+                    print("\n[TFD-Viz] Generating intra-type NN distance violin plots…")
+                figsize_raw = cfg.get("figsize_nn_violins")
+                figsize = tuple(figsize_raw) if figsize_raw else None
+                plot_nn_distance_violins(
+                    stats_by_subtype=_stats,
+                    non_bg_channels=_non_bg,
+                    output_dir=output_dir,
+                    cell_type_cmap=cfg.get("cmap_cell_types", CELL_TYPE_CMAP),
+                    figsize=figsize,
+                    dpi=dpi,
+                    verbose=verbose,
+                )
+
+            if "cross_type_proximity" in plots:
+                if verbose:
+                    print("\n[TFD-Viz] Generating cross-type proximity heatmaps…")
+                figsize_raw = cfg.get("figsize_proximity")
+                figsize = tuple(figsize_raw) if figsize_raw else None
+                plot_cross_type_proximity_heatmaps(
+                    stats_by_subtype=_stats,
+                    non_bg_channels=_non_bg,
+                    output_dir=output_dir,
+                    cmap_name=cfg.get("cmap_heatmap", HEATMAP_CMAP),
+                    figsize=figsize,
+                    dpi=dpi,
+                    verbose=verbose,
+                )

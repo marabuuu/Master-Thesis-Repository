@@ -88,6 +88,8 @@ from .tfd_separability import (
     plot_radar_channel_contributions,
     plot_cell_type_boxplots,
     plot_ternary_composition,
+    plot_nn_distance_violins,
+    plot_cross_type_proximity_heatmaps,
     run_tfd_separability_viz,
 )
 
@@ -137,5 +139,7 @@ __all__ = [
     "plot_radar_channel_contributions",
     "plot_cell_type_boxplots",
     "plot_ternary_composition",
+    "plot_nn_distance_violins",
+    "plot_cross_type_proximity_heatmaps",
     "run_tfd_separability_viz",
 ]

@@ -488,6 +488,200 @@ def plot_kaplan_meier_by_subtype(
     save_figure(fig, output_dir / "kaplan_meier_overall_survival_by_subtype.png", dpi=dpi)
 
 
+def plot_combined_overview(
+    df: pd.DataFrame,
+    subtype_col: str,
+    stage_col: str,
+    os_time_col: str,
+    os_event_col: str,
+    output_dir: Path,
+    palette: Optional[Dict[str, str]] = None,
+    cmap_name: str = CATEGORICAL_CMAP,
+    min_patients: int = 10,
+    figsize: tuple = (14, 10),
+    dpi: int = 200,
+) -> None:
+    """Three-panel overview: PAM50 pie (left) | KM survival (right-top) | AJCC stage (right-bottom).
+
+    A single shared PAM50 colour legend is placed below all panels.
+    Log-rank test annotations are intentionally omitted.
+    Font sizes are tuned for inclusion in a thesis/report.
+    """
+    if not HAS_MPL:
+        return
+
+    assert plt is not None
+    assert mticker is not None
+
+    if subtype_col not in df.columns:
+        print(f"[DatasetStats][WARN] '{subtype_col}' not found — skipping combined overview")
+        return
+
+    # ── Build shared palette ────────────────────────────────────────────────
+    subtype_vals = df[subtype_col].dropna().astype(str).str.strip()
+    subtype_vals = subtype_vals[subtype_vals != ""]
+    ordered_subtypes = _canonical_order(subtype_vals.unique().tolist())
+    if palette is None:
+        palette = build_label_palette(np.array(ordered_subtypes), cmap_name=cmap_name)
+
+    TITLE_FS  = 14
+    LABEL_FS  = 12
+    TICK_FS   = 11
+    LEGEND_FS = 11
+
+    fig, axes = plt.subplot_mosaic(
+        [["pie", "km"], ["pie", "stage"]],
+        figsize=figsize,
+    )
+    ax_pie   = axes["pie"]
+    ax_km    = axes["km"]
+    ax_stage = axes["stage"]
+
+    # ══ Panel A: PAM50 subtype pie ═══════════════════════════════════════════
+    counts = subtype_vals.value_counts()
+    ordered_for_pie = _canonical_order(list(counts.index))
+    counts = counts.reindex(ordered_for_pie).dropna()
+    colours = [palette.get(s, "#888888") for s in counts.index]
+
+    wedges, _, autotexts = ax_pie.pie(
+        counts.to_numpy(dtype=float),
+        labels=None,
+        colors=colours,
+        autopct="%1.1f%%",
+        startangle=90,
+        wedgeprops={"edgecolor": "white", "linewidth": 1.5},
+        pctdistance=0.75,
+    )
+    for at in autotexts:
+        at.set_fontsize(TICK_FS)
+        at.set_fontweight("bold")
+        at.set_color("white")
+    ax_pie.set_title("PAM50 Subtype Distribution", fontsize=TITLE_FS, fontweight="bold", pad=12)
+
+    # ══ Panel B: Kaplan-Meier (no log-rank annotations) ══════════════════════
+    if HAS_LIFELINES and os_time_col in df.columns and os_event_col in df.columns:
+        assert KaplanMeierFitter is not None
+
+        km_df = df[[subtype_col, os_time_col, os_event_col]].copy()
+        km_df[os_time_col]  = pd.to_numeric(km_df[os_time_col],  errors="coerce")
+        km_df[os_event_col] = pd.to_numeric(km_df[os_event_col], errors="coerce")
+        km_df = km_df.dropna()
+        km_df["os_years"] = km_df[os_time_col] / 365.25
+
+        km_subtypes = _canonical_order(list(km_df[subtype_col].unique()))
+        km_subtypes = [s for s in km_subtypes if (km_df[subtype_col] == s).sum() >= min_patients]
+
+        for subtype in km_subtypes:
+            mask = km_df[subtype_col] == subtype
+            sub  = km_df[mask]
+            kmf  = KaplanMeierFitter()
+            kmf.fit(sub["os_years"], event_observed=sub[os_event_col], label=subtype)
+            kmf.plot_survival_function(
+                ax=ax_km,
+                ci_show=True,
+                color=palette.get(subtype, "#888888"),
+                linewidth=2.0,
+                ci_alpha=0.12,
+            )
+    else:
+        ax_km.text(0.5, 0.5, "OS data not available", ha="center", va="center",
+                   transform=ax_km.transAxes, fontsize=LABEL_FS, color="gray")
+
+    ax_km.set_xlabel("Time (years)", fontsize=LABEL_FS)
+    ax_km.set_ylabel("Overall Survival Probability", fontsize=LABEL_FS)
+    ax_km.set_title("Overall Survival (Kaplan-Meier)", fontsize=TITLE_FS, fontweight="bold")
+    ax_km.set_ylim(0, 1.05)
+    ax_km.set_xlim(left=0)
+    ax_km.tick_params(labelsize=TICK_FS)
+    ax_km.spines["top"].set_visible(False)
+    ax_km.spines["right"].set_visible(False)
+    ax_km.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+    if ax_km.get_legend():
+        ax_km.get_legend().remove()
+
+    # ══ Panel C: AJCC tumor stage horizontal stacked bar ═════════════════════
+    if stage_col in df.columns:
+        stage_values = df[stage_col].dropna().astype(str).str.strip()
+        invalid_values = {"[Not Available]", "[Discrepancy]", "nan", ""}
+        stage_values = stage_values[~stage_values.isin(invalid_values)]
+
+        sub_vals_stage = df[subtype_col].fillna("").astype(str).str.strip()
+        sub_vals_stage = sub_vals_stage[~sub_vals_stage.isin({"", "nan"})]
+
+        valid_idx      = stage_values.index.intersection(sub_vals_stage.index)
+        stage_values   = stage_values.loc[valid_idx]
+        sub_vals_stage = sub_vals_stage.loc[valid_idx]
+
+        if not stage_values.empty:
+            stage_by_subtype = pd.crosstab(stage_values, sub_vals_stage)
+            stage_by_subtype = stage_by_subtype.sort_index()
+            ordered_st = _canonical_order(list(stage_by_subtype.columns))
+            stage_by_subtype = stage_by_subtype.reindex(columns=ordered_st, fill_value=0)
+
+            totals    = stage_by_subtype.sum(axis=1).to_numpy(dtype=float)
+            max_count = float(totals.max()) if totals.size else 0.0
+            left      = np.zeros(len(stage_by_subtype), dtype=float)
+
+            for subtype in ordered_st:
+                vals = stage_by_subtype[subtype].to_numpy(dtype=float)
+                if not np.any(vals):
+                    continue
+                ax_stage.barh(
+                    stage_by_subtype.index.tolist(),
+                    vals,
+                    left=left,
+                    color=palette.get(subtype, "#888888"),
+                    edgecolor="white",
+                    linewidth=0.5,
+                )
+                left += vals
+
+            for i, total in enumerate(totals):
+                ax_stage.text(
+                    total + max_count * 0.01, i,
+                    str(int(total)),
+                    va="center", ha="left", fontsize=TICK_FS,
+                )
+        else:
+            ax_stage.text(0.5, 0.5, "Stage data not available", ha="center", va="center",
+                          transform=ax_stage.transAxes, fontsize=LABEL_FS, color="gray")
+    else:
+        ax_stage.text(0.5, 0.5, "Stage data not available", ha="center", va="center",
+                      transform=ax_stage.transAxes, fontsize=LABEL_FS, color="gray")
+
+    ax_stage.set_xlabel("Number of patients", fontsize=LABEL_FS)
+    ax_stage.set_title("AJCC Tumor Stage by PAM50 Subtype", fontsize=TITLE_FS, fontweight="bold")
+    ax_stage.tick_params(labelsize=TICK_FS)
+    ax_stage.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
+    ax_stage.spines["top"].set_visible(False)
+    ax_stage.spines["right"].set_visible(False)
+    ax_stage.invert_yaxis()
+
+    # ── Single shared legend below all panels ──────────────────────────────
+    from matplotlib.patches import Patch
+    legend_handles = [
+        Patch(color=palette.get(s, "#888888"),
+              label=f"{s}  (n={int(counts.get(s, 0)):,})")
+        for s in ordered_subtypes
+        if s in palette
+    ]
+    fig.legend(
+        handles=legend_handles,
+        title="PAM50 Subtype",
+        title_fontsize=LEGEND_FS,
+        fontsize=LEGEND_FS,
+        loc="lower center",
+        bbox_to_anchor=(0.5, 0.0),
+        ncol=min(len(ordered_subtypes), 6),
+        frameon=False,
+    )
+
+    fig.tight_layout()
+    fig.subplots_adjust(bottom=0.14)
+    save_figure(fig, output_dir / "combined_overview.png", dpi=dpi)
+    print("[DatasetStats] Saved combined overview → combined_overview.png")
+
+
 # ---------------------------------------------------------------------------
 # Main entry point
 # ---------------------------------------------------------------------------
@@ -497,6 +691,7 @@ _AVAILABLE_PLOTS = {
     "menopause_distribution",
     "subtype_distribution",
     "kaplan_meier_by_subtype",
+    "combined_overview",
 }
 
 
@@ -744,10 +939,11 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
     requested     = set(cfg.get("plots", list(_AVAILABLE_PLOTS)))
     cmap_cat      = cfg.get("cmap_categorical", CATEGORICAL_CMAP)
     cmap_seq      = cfg.get("cmap_sequential",  SEQUENTIAL_CMAP)
-    figsize_dist  = tuple(cfg.get("figsize_distributions", [10, 6]))
-    figsize_pie   = tuple(cfg.get("figsize_pie",  [8, 8]))
-    figsize_km    = tuple(cfg.get("figsize_km",   [10, 7]))
-    dpi           = int(cfg.get("dpi", 200))
+    figsize_dist     = tuple(cfg.get("figsize_distributions", [10, 6]))
+    figsize_pie      = tuple(cfg.get("figsize_pie",      [8, 8]))
+    figsize_km       = tuple(cfg.get("figsize_km",       [10, 7]))
+    figsize_combined = tuple(cfg.get("figsize_combined", [20, 7]))
+    dpi              = int(cfg.get("dpi", 200))
 
     output_dir.mkdir(parents=True, exist_ok=True)
 
@@ -798,6 +994,15 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
             output_dir, palette=palette,
             cmap_name=cmap_cat, min_patients=min_patients,
             figsize=figsize_km, dpi=dpi,
+        )
+
+    # ── Plot: combined three-panel overview ───────────────────────────────────
+    if "combined_overview" in requested:
+        plot_combined_overview(
+            df, subtype_col, stage_col, os_time_col, os_event_col,
+            output_dir, palette=palette or shared_palette,
+            cmap_name=cmap_cat, min_patients=min_patients,
+            figsize=figsize_combined, dpi=dpi,
         )
 
     # ── Table: patient characteristics (LaTeX + Markdown) ───────────────────
