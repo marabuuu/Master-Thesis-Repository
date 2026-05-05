@@ -777,3 +777,330 @@ def plot_kmeans_confusion(
 
     show_or_save(fig, save_path=save_path, show=show)
     return fig
+
+
+# ===================================================================
+#  Composite Report Figure: Clustermap + UMAP + Silhouette
+# ===================================================================
+
+
+def plot_composite_latent_analysis(
+    X: np.ndarray,
+    coords_umap: np.ndarray,
+    hue_labels: np.ndarray,
+    style_labels: np.ndarray,
+    cmap_name: str = CATEGORICAL_CMAP,
+    heatmap_cmap_name: str = HEATMAP_CMAP,
+    figsize: Tuple[float, float] = (18, 10),
+    n_samples_heatmap: int = 200,
+    random_state: int = 42,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+) -> Figure:
+    """Create a composite report figure with three panels:
+    
+    - **Left (large)**: Cosine distance clustermap of raw features
+    - **Top-right**: UMAP projection colored by subtype, marked by split
+    - **Bottom-right**: Silhouette scores per subtype
+    
+    Single shared legend showing subtype colors + split marker shapes for report readability.
+
+    Parameters
+    ----------
+    X : ndarray, shape (n, d)
+        Raw feature matrix (e.g., 512-D VAE latents).
+    coords_umap : ndarray, shape (n, 2)
+        Pre-computed UMAP 2-D coordinates.
+    hue_labels : ndarray
+        Categorical labels for coloring (e.g., PAM50 subtypes).
+    style_labels : ndarray
+        Categorical labels for marker styles (e.g., train/val/test split).
+    cmap_name : str
+        Crameri categorical colormap for subtypes.
+    heatmap_cmap_name : str
+        Crameri colormap for the cosine distance heatmap.
+    figsize : tuple
+        Overall figure size (width, height).
+    n_samples_heatmap : int
+        Number of random samples to show in clustermap.
+    random_state : int
+        For reproducibility.
+    save_path : str | Path | None
+    show : bool
+
+    Returns
+    -------
+    matplotlib.figure.Figure
+    """
+    _check_matplotlib()
+    _check_seaborn()
+    from scipy.cluster import hierarchy
+    from sklearn.metrics import silhouette_samples, pairwise_distances
+
+    setup_style()
+
+    # Build color palette for subtypes
+    palette = build_label_palette(hue_labels, cmap_name)
+    marker_map = {"train": "o", "test": "^", "val": "s", "unknown": "D"}
+
+    # Main layout: left clustermap-style panel, middle two smaller plots, right legend column.
+    fig = plt.figure(figsize=figsize)
+    outer = fig.add_gridspec(
+        2,
+        3,
+        width_ratios=[2.65, 1.2, 0.85],
+        height_ratios=[1.0, 1.0],
+        wspace=0.18,
+        hspace=0.26,
+    )
+
+    # ──────────────────────────────────────────────────
+    # LEFT PANEL: clustermap-like cosine distance view
+    # ──────────────────────────────────────────────────
+    left = outer[:, 0].subgridspec(
+        3,
+        3,
+        width_ratios=[0.18, 0.035, 1.0],
+        height_ratios=[0.18, 0.035, 1.0],
+        wspace=0.01,
+        hspace=0.01,
+    )
+
+    ax_row_dend = fig.add_subplot(left[2, 0])
+    ax_col_dend = fig.add_subplot(left[0, 2])
+    ax_row_colors = fig.add_subplot(left[2, 1])
+    ax_col_colors = fig.add_subplot(left[1, 2])
+    ax_heatmap = fig.add_subplot(left[2, 2])
+
+    rng = np.random.RandomState(random_state)
+    idx = rng.choice(len(X), size=min(n_samples_heatmap, len(X)), replace=False)
+    X_sub = _ensure_2d(X[idx])
+    labels_sub = np.asarray(hue_labels)[idx]
+    dist_mat = pairwise_distances(X_sub, metric="cosine")
+
+    # Use the exact same clustering path as the standalone clustermap plot.
+    # This avoids subtle ordering differences compared with manual linkage choices.
+    palette_sub = build_label_palette(labels_sub, cmap_name)
+    row_colors_sub = pd.Series(labels_sub).map(palette_sub).values
+    g_tmp = sns.clustermap(
+        dist_mat,
+        cmap=get_crameri_cmap(heatmap_cmap_name),
+        row_colors=row_colors_sub,
+        col_colors=row_colors_sub,
+        xticklabels=False,
+        yticklabels=False,
+    )
+    row_order = g_tmp.dendrogram_row.reordered_ind
+    col_order = g_tmp.dendrogram_col.reordered_ind
+    row_linkage = g_tmp.dendrogram_row.linkage
+    col_linkage = g_tmp.dendrogram_col.linkage
+    plt.close(g_tmp.fig)
+
+    dist_reordered = dist_mat[np.ix_(row_order, col_order)]
+    labels_ordered_row = labels_sub[row_order]
+    labels_ordered_col = labels_sub[col_order]
+
+    # Draw dendrograms (top and left).
+    hierarchy.dendrogram(
+        col_linkage,
+        no_labels=True,
+        color_threshold=0,
+        above_threshold_color="#444444",
+        ax=ax_col_dend,
+    )
+    ax_col_dend.set_xticks([])
+    ax_col_dend.set_yticks([])
+    for spine in ax_col_dend.spines.values():
+        spine.set_visible(False)
+
+    hierarchy.dendrogram(
+        row_linkage,
+        orientation="left",
+        no_labels=True,
+        color_threshold=0,
+        above_threshold_color="#444444",
+        ax=ax_row_dend,
+    )
+    ax_row_dend.set_xticks([])
+    ax_row_dend.set_yticks([])
+    for spine in ax_row_dend.spines.values():
+        spine.set_visible(False)
+
+    # Draw subtype color bars akin to row_colors/col_colors in standalone clustermap.
+    color_rgb_row = np.array([
+        plt.matplotlib.colors.to_rgb(palette[label]) for label in labels_ordered_row
+    ])
+    color_rgb_col = np.array([
+        plt.matplotlib.colors.to_rgb(palette[label]) for label in labels_ordered_col
+    ])
+
+    ax_row_colors.imshow(color_rgb_row.reshape(-1, 1, 3), aspect="auto", interpolation="nearest")
+    ax_row_colors.set_xticks([])
+    ax_row_colors.set_yticks([])
+    for spine in ax_row_colors.spines.values():
+        spine.set_visible(False)
+
+    ax_col_colors.imshow(color_rgb_col.reshape(1, -1, 3), aspect="auto", interpolation="nearest")
+    ax_col_colors.set_xticks([])
+    ax_col_colors.set_yticks([])
+    for spine in ax_col_colors.spines.values():
+        spine.set_visible(False)
+
+    cmap_heat = get_crameri_cmap(heatmap_cmap_name)
+    im = ax_heatmap.imshow(dist_reordered, cmap=cmap_heat, aspect="auto", interpolation="nearest")
+    ax_heatmap.set_xticks([])
+    ax_heatmap.set_yticks([])
+    ax_heatmap.set_xlabel("Samples (cluster-ordered)", fontsize=11, fontweight="bold")
+    ax_heatmap.set_ylabel("")
+
+    ax_col_dend.set_title(
+        f"Cosine Distance Clustermap ({len(idx)} random samples)",
+        fontsize=12,
+        fontweight="bold",
+        pad=2,
+    )
+
+    cbar = fig.colorbar(im, ax=ax_heatmap, fraction=0.035, pad=0.015)
+    cbar.set_label("Cosine Distance", fontsize=10)
+
+    # ──────────────────────────────────────────────────
+    # MIDDLE TOP: UMAP projection
+    # ──────────────────────────────────────────────────
+    ax_umap = fig.add_subplot(outer[0, 1])
+
+    # Scatter plot: one series per (subtype, split) combination for unified legend
+    for split in sorted(np.unique(style_labels)):
+        for subtype in sorted(np.unique(hue_labels)):
+            mask = (hue_labels == subtype) & (style_labels == split)
+            if mask.sum() > 0:
+                ax_umap.scatter(
+                    coords_umap[mask, 0],
+                    coords_umap[mask, 1],
+                    c=[palette[subtype]],
+                    marker=marker_map.get(split, "o"),
+                    s=60,
+                    alpha=0.75,
+                    edgecolors="k",
+                    linewidths=0.5,
+                    label=f"{subtype} ({split})",
+                )
+
+    ax_umap.set_xlabel("UMAP 1", fontsize=11, fontweight="bold")
+    ax_umap.set_ylabel("UMAP 2", fontsize=11, fontweight="bold")
+    ax_umap.set_title(
+        "UMAP of Genomic Representation",
+        fontsize=12,
+        fontweight="bold",
+        pad=10,
+    )
+    ax_umap.grid(True, alpha=0.2, linestyle="--")
+
+    # ──────────────────────────────────────────────────
+    # MIDDLE BOTTOM: Silhouette scores
+    # ──────────────────────────────────────────────────
+    ax_sil = fig.add_subplot(outer[1, 1])
+
+    sil_vals = silhouette_samples(coords_umap, hue_labels, metric="euclidean")
+    sil_df = pd.DataFrame({"Subtype": hue_labels, "Silhouette": sil_vals})
+
+    sns.boxplot(
+        data=sil_df,
+        x="Subtype",
+        y="Silhouette",
+        hue="Subtype",
+        palette=palette,
+        dodge=False,
+        ax=ax_sil,
+        width=0.6,
+    )
+    if ax_sil.get_legend() is not None:
+        ax_sil.get_legend().remove()
+
+    ax_sil.set_xlabel("PAM50 Subtype", fontsize=11, fontweight="bold")
+    ax_sil.set_ylabel("Silhouette Coefficient", fontsize=10, fontweight="bold", labelpad=6)
+    ax_sil.yaxis.set_label_position("right")
+    ax_sil.set_title(
+        "Silhouette Scores per PAM50 Subtype",
+        fontsize=12,
+        fontweight="bold",
+        pad=10,
+    )
+    ax_sil.set_ylim(-1.0, 1.0)
+    ax_sil.axhline(0, color="gray", linestyle="--", linewidth=0.8, alpha=0.5)
+    ax_sil.grid(True, alpha=0.2, axis="y", linestyle="--")
+
+    # ──────────────────────────────────────────────────
+    # RIGHT COLUMN: unified legend (no overlap)
+    # ──────────────────────────────────────────────────
+    ax_leg = fig.add_subplot(outer[:, 2])
+    ax_leg.axis("off")
+
+    legend_elements = []
+
+    legend_elements.append(
+        plt.Line2D([0], [0], color="none", label="Subtype Colors")
+    )
+
+    # Add subtype colors with marker='o'
+    for subtype in sorted(np.unique(hue_labels)):
+        legend_elements.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker="o",
+                color="w",
+                markerfacecolor=palette[subtype],
+                markersize=8,
+                markeredgecolor="k",
+                markeredgewidth=0.5,
+                label=subtype,
+            )
+        )
+
+    # Add spacer and second section label
+    legend_elements.append(plt.Line2D([0], [0], color="none", label=""))
+    legend_elements.append(
+        plt.Line2D([0], [0], color="none", label="Data Split Markers")
+    )
+
+    # Add split marker styles
+    for split in sorted(np.unique(style_labels)):
+        marker = marker_map.get(split, "o")
+        legend_elements.append(
+            plt.Line2D(
+                [0],
+                [0],
+                marker=marker,
+                color="w",
+                markerfacecolor="gray",
+                markersize=8,
+                markeredgecolor="k",
+                markeredgewidth=0.5,
+                label=split,
+            )
+        )
+
+    ax_leg.legend(
+        handles=legend_elements,
+        loc="upper left",
+        bbox_to_anchor=(0.08, 1.0),
+        ncol=1,
+        frameon=True,
+        fontsize=9,
+        framealpha=0.95,
+        edgecolor="k",
+        handlelength=1.4,
+        labelspacing=0.6,
+    )
+
+    fig.suptitle(
+        "Latent Space Analysis: Genomic Representation and Subtype Separability",
+        fontsize=14,
+        fontweight="bold",
+        y=0.988,
+    )
+
+    fig.subplots_adjust(left=0.03, right=0.98, top=0.93, bottom=0.06)
+
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig

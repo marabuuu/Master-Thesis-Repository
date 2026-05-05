@@ -63,6 +63,7 @@ from .latent_space import (
     compute_silhouette,
     compute_tsne,
     compute_umap,
+    plot_composite_latent_analysis,
     plot_cosine_distance_clustermap,
     plot_dendrogram,
     plot_kmeans_confusion,
@@ -122,6 +123,7 @@ __all__ = [
     "plot_silhouette_per_group",
     "plot_dendrogram",
     "plot_kmeans_confusion",
+    "plot_composite_latent_analysis",
     # distributions
     "plot_countplot",
     "plot_stacked_bar",

@@ -42,6 +42,7 @@ from visualization import (
     plot_countplot,
     plot_stacked_bar,
     plot_mosaic,
+    plot_composite_latent_analysis,
     setup_style,
 )
 
@@ -278,6 +279,22 @@ def run_visualizations(config: dict, verbose: bool = True):
         plot_dendrogram(X, y_subtype, n_samples=n_sample_dendro, metric="cosine", method="ward", save_path=out_dir / "ward_dendrogram.png")
     except Exception as e:
         print(f"  ⚠️ Dendrogram failed: {e}")
+
+    # 13. COMPOSITE REPORT FIGURE
+    if verbose: print("[Latents] Generating composite report figure...")
+    try:
+        plot_composite_latent_analysis(
+            X,
+            coords_umap=X_umap,
+            hue_labels=y_subtype,
+            style_labels=y_split,
+            figsize=(18, 10),
+            n_samples_heatmap=200,
+            save_path=out_dir / "composite_latent_analysis_report.png",
+            show=False,
+        )
+    except Exception as e:
+        print(f"  ⚠️ Composite figure failed: {e}")
 
     if verbose: print(f"[Latents] 🚀 All latent visualizations generated in {out_dir}")
 

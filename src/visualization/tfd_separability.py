@@ -50,6 +50,12 @@ from .core import (
     save_figure,
     setup_style,
 )
+from .spatial_metrics_viz import (
+    compute_spatial_metrics_per_tile,
+    plot_knn_metrics_comparison,
+    plot_ripley_L_by_subtype,
+    plot_voronoi_distribution,
+)
 
 try:
     import matplotlib.pyplot as plt
@@ -165,7 +171,11 @@ def plot_channel_contributions(
         n_pairs = len(pair_labels)
         figsize = (max(9, n_channels * 1.4), max(5, n_pairs * 0.7 + 1.5))
 
-    cmap = get_crameri_cmap(cmap_name)
+    # Use a warm sequential colormap (magma) to improve visual contrast
+    try:
+        cmap = plt.get_cmap("magma")
+    except Exception:
+        cmap = get_crameri_cmap(cmap_name)
 
     for suffix, df, title_suffix, fmt in [
         ("absolute", df_abs, "Absolute TFD per Channel", "{:.0f}"),
@@ -173,7 +183,11 @@ def plot_channel_contributions(
     ]:
         fig, ax = plt.subplots(figsize=figsize)
         vals = df.values.astype(float)
-        im = ax.imshow(vals, cmap=cmap, aspect="auto", interpolation="none")
+        # Use nearest interpolation to avoid white grid artefacts between cells
+        im = ax.imshow(vals, cmap=cmap, aspect="auto", interpolation="nearest")
+        # Remove axes spines so heatmap appears as a contiguous grid
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
         # Colorbar
         divider = make_axes_locatable(ax)
@@ -188,6 +202,7 @@ def plot_channel_contributions(
         ax.set_xticklabels(col_labels, rotation=35, ha="right", fontsize=9)
         ax.set_yticks(range(len(pair_labels)))
         ax.set_yticklabels(pair_labels, fontsize=9)
+        ax.grid(False)
         ax.set_title(
             f"TFD Channel Contributions — {title_suffix}",
             fontsize=12, pad=8,
@@ -537,7 +552,7 @@ def plot_cell_type_boxplots(
         CSV mapping patient IDs to PAM50 subtypes.
     output_dir : path
         Where to save the output PNG.
-    patient_col, subtype_col : str
+    n_bootstrap: int = 99,
         Column names in ``metadata_csv``.
     classes : list[str] or None
         Subtypes to include in PAM50 canonical order; ``None`` = all.
@@ -1090,6 +1105,87 @@ def _collect_spatial_stats_for_subtypes(
     return stats_by_subtype
 
 
+def _collect_spatial_topology_for_subtypes(
+    masks_dir: Path,
+    subtypes: List[str],
+    patient_to_subtype: Dict[str, str],
+    non_bg_channels: List[int],
+    max_tiles: Optional[int],
+    n_bootstrap: int = 99,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, List[Dict[str, object]]]:
+    """Collect tile-level topology metrics for each subtype.
+
+    Returns a mapping ``{subtype: [tile_metrics, ...]}`` compatible with the
+    spatial summary plot functions in ``spatial_metrics_viz.py``.
+    """
+    rng = np.random.default_rng(seed)
+    class_to_patients: Dict[str, List[str]] = {s: [] for s in subtypes}
+    for p, st in patient_to_subtype.items():
+        if st in class_to_patients:
+            class_to_patients[st].append(p)
+
+    stats_by_subtype: Dict[str, List[Dict[str, object]]] = {}
+    per_patient: Optional[int] = (
+        max(1, int(np.ceil(max_tiles / len(subtypes))))
+        if max_tiles is not None and len(subtypes) > 0
+        else None
+    )
+
+    for subtype in subtypes:
+        pids = class_to_patients[subtype]
+        if not pids:
+            continue
+        if verbose:
+            print(f"  [{subtype}] Computing spatial topology stats ({len(pids)} patients)…")
+
+        tile_metrics: List[Dict[str, object]] = []
+        for pid in pids:
+            zip_path = masks_dir / f"{pid}.zip"
+            if not zip_path.exists():
+                continue
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
+                    if per_patient is not None and len(tile_names) > per_patient:
+                        chosen = rng.choice(len(tile_names), per_patient, replace=False)
+                        tile_names = [tile_names[i] for i in chosen]
+
+                    for name in tile_names:
+                        try:
+                            with zf.open(name) as f:
+                                mask = np.load(BytesIO(f.read()))
+                            if mask.ndim == 2:
+                                continue
+                            if mask.ndim == 3 and mask.shape[0] >= mask.shape[1]:
+                                mask = np.transpose(mask, (2, 0, 1))
+                            if mask.ndim != 3:
+                                continue
+
+                            # Use the union of all non-background classes as the
+                            # foreground cell mask for topology metrics.
+                            foreground = np.sum(mask[non_bg_channels, :, :], axis=0)
+                            metrics = compute_spatial_metrics_per_tile(
+                                foreground,
+                                channel_idx=-1,
+                                bounding_box=(foreground.shape[1], foreground.shape[0]),
+                                n_bootstrap=n_bootstrap,
+                            )
+                            tile_metrics.append(metrics)
+                        except Exception:
+                            logger.debug("Topology stats failed: %s in %s", name, zip_path)
+            except Exception:
+                logger.debug("Cannot open %s", zip_path)
+
+        if tile_metrics:
+            stats_by_subtype[subtype] = tile_metrics
+            if verbose:
+                print(f"  [{subtype}] {len(tile_metrics)} tiles processed")
+
+    return stats_by_subtype
+
+
 def plot_nn_distance_violins(
     stats_by_subtype: Dict[str, Dict[str, np.ndarray]],
     non_bg_channels: List[int],
@@ -1255,7 +1351,11 @@ def plot_cross_type_proximity_heatmaps(
     subtypes += [s for s in stats_by_subtype if s not in PAM50_ORDER]
     ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
     n_ch = len(non_bg_channels)
-    cmap = get_crameri_cmap(cmap_name)
+    # Prefer a sequential warm colormap for distances
+    try:
+        cmap = plt.get_cmap("magma")
+    except Exception:
+        cmap = get_crameri_cmap(cmap_name)
 
     # Per-subtype median cross-type distance matrix
     matrices: Dict[str, np.ndarray] = {}
@@ -1290,13 +1390,17 @@ def plot_cross_type_proximity_heatmaps(
             continue
         mat = matrices[subtype]
         im = ax.imshow(mat, cmap=cmap, vmin=vmin, vmax=vmax,
-                       aspect="equal", interpolation="none")
+                       aspect="equal", interpolation="nearest")
         im_ref = im
+        # Hide spines so cell boundaries are not emphasised by white lines
+        for spine in ax.spines.values():
+            spine.set_visible(False)
 
         ax.set_xticks(range(n_ch))
         ax.set_xticklabels(ch_labels, rotation=40, ha="right", fontsize=8)
         ax.set_yticks(range(n_ch))
         ax.set_yticklabels(ch_labels if col_idx == 0 else [], fontsize=8)
+        ax.grid(False)
         ax.set_title(subtype, fontsize=11, fontweight="bold", pad=5)
 
         for i in range(n_ch):
@@ -1370,7 +1474,9 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
         Which plots to generate.  Choices:
         ``channel_contributions``, ``radar_contributions``,
         ``cell_type_boxplots``, ``ternary_composition``,
-        ``nn_distance_violins``, ``cross_type_proximity``.
+        ``nn_distance_violins``, ``cross_type_proximity``,
+        ``ripley_L_by_subtype``, ``voronoi_distribution``,
+        ``knn_metrics``.
     """
     results_json = cfg.get("results_json")
     masks_dir = cfg.get("masks_dir")
@@ -1467,7 +1573,11 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
 
     # --- Spatial NN plots (B + C): shared data collection ---
     _need_spatial = (
-        "nn_distance_violins" in plots or "cross_type_proximity" in plots
+        "nn_distance_violins" in plots
+        or "cross_type_proximity" in plots
+        or "ripley_L_by_subtype" in plots
+        or "voronoi_distribution" in plots
+        or "knn_metrics" in plots
     )
     if _need_spatial:
         if not masks_dir or not metadata_csv:
@@ -1491,10 +1601,12 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
 
             _non_bg = list(range(1, 7))
             _max_sp = cfg.get("max_tiles_spatial", 500)
+            _ripley_bootstrap = cfg.get("ripley_n_bootstrap", 99)
             if verbose:
                 print(
                     f"\n[TFD-Viz] Computing spatial NN statistics "
-                    f"(max {_max_sp} tiles/subtype via scipy connected components)…"
+                    f"(max {_max_sp} tiles/subtype via scipy connected components; "
+                    f"Ripley bootstrap={_ripley_bootstrap})…"
                 )
 
             _stats = _collect_spatial_stats_for_subtypes(
@@ -1535,4 +1647,66 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     figsize=figsize,
                     dpi=dpi,
                     verbose=verbose,
+                )
+
+            # The newer spatial summary plots need tile-level topology metrics,
+            # so we collect them separately from the NN summary stats.
+            _topology_stats: Optional[Dict[str, List[Dict[str, object]]]] = None
+            if "ripley_L_by_subtype" in plots:
+                if verbose:
+                    print("\n[TFD-Viz] Generating Ripley L(r) curves by subtype…")
+                if _topology_stats is None:
+                    _topology_stats = _collect_spatial_topology_for_subtypes(
+                        masks_dir=Path(masks_dir),
+                        subtypes=_subtypes,
+                        patient_to_subtype=_p2s,
+                        non_bg_channels=_non_bg,
+                        max_tiles=_max_sp,
+                        n_bootstrap=_ripley_bootstrap,
+                        seed=cfg.get("seed", 42),
+                        verbose=verbose,
+                    )
+                plot_ripley_L_by_subtype(
+                    results=_topology_stats,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                )
+
+            if "voronoi_distribution" in plots:
+                if verbose:
+                    print("\n[TFD-Viz] Generating Voronoi area distributions…")
+                if _topology_stats is None:
+                    _topology_stats = _collect_spatial_topology_for_subtypes(
+                        masks_dir=Path(masks_dir),
+                        subtypes=_subtypes,
+                        patient_to_subtype=_p2s,
+                        non_bg_channels=_non_bg,
+                        max_tiles=_max_sp,
+                        n_bootstrap=_ripley_bootstrap,
+                        seed=cfg.get("seed", 42),
+                        verbose=verbose,
+                    )
+                plot_voronoi_distribution(
+                    results=_topology_stats,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                )
+
+            if "knn_metrics" in plots:
+                if verbose:
+                    print("\n[TFD-Viz] Generating kNN connectivity metrics…")
+                if _topology_stats is None:
+                    _topology_stats = _collect_spatial_topology_for_subtypes(
+                        masks_dir=Path(masks_dir),
+                        subtypes=_subtypes,
+                        patient_to_subtype=_p2s,
+                        non_bg_channels=_non_bg,
+                        max_tiles=_max_sp,
+                        seed=cfg.get("seed", 42),
+                        verbose=verbose,
+                    )
+                plot_knn_metrics_comparison(
+                    results=_topology_stats,
+                    output_dir=output_dir,
+                    dpi=dpi,
                 )
