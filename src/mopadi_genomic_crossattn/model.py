@@ -129,7 +129,7 @@ class _SpatialCrossAttentionAdapter(torch.nn.Module):
                 pass
 
             self._attn_stats = stats
-        
+
         # ensure same spatial resolution as input
         if delta.shape[2:] != (h, w):
             delta = F.interpolate(delta, size=(h, w), mode="bilinear", align_corners=False)
