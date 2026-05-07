@@ -1,5 +1,8 @@
 """
-Entry point for genomic-conditioned MoPaDi training with patchified cross-attention.
+Entry point for genomic-conditioned MoPaDi training with clean dual conditioning.
+
+Philosophy: Use MoPaDi's built-in resnet_two_cond=True mechanism.
+No extra wrappers or losses during training.
 
 Called from run_pipeline.py via:
     python run_pipeline.py --config src/config.yaml --stage mopadi_genomic_crossattn
@@ -25,15 +28,12 @@ from torch.nn.parallel import DistributedDataParallel
 from mopadi.configs.choices import ModelName
 
 try:
-    from .config import GenomicCrossAttnConfig
-    from .model import GenomicCrossAttnLitModel
-except ImportError:
-    from mopadi_genomic_crossattn.config import GenomicCrossAttnConfig
-    from mopadi_genomic_crossattn.model import GenomicCrossAttnLitModel
-
-try:
+    from .genomic_config import GenomicTrainConfig
+    from .model import GenomicLitModel
     from .checkpoint_callback import CompositeMetricCheckpoint
 except ImportError:
+    from mopadi_genomic_crossattn.genomic_config import GenomicTrainConfig
+    from mopadi_genomic_crossattn.model import GenomicLitModel
     from mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
 
 log = logging.getLogger(__name__)
@@ -67,24 +67,19 @@ class _DefaultStreamDDPStrategy(DDPStrategy):
         if torch.cuda.is_available():
             try:
                 # Ensure all in-flight CUDA work (allreduce, etc.) is retired
-                # before PL unwraps DDP and drops the Reducer reference.  In
-                # PyTorch 2.7+cu128 the Reducer's CUDA events crash on
-                # destruction if any GPU work is still pending.  If CUDA is
-                # already in an error state (training failed mid-step), the
-                # synchronize itself raises; swallow it so super().teardown()
-                # still runs and doesn't mask the original exception.
+                # before PL unwraps DDP and drops the Reducer reference.
                 torch.cuda.synchronize()
             except Exception:
                 pass
-        # Flush reference cycles (backward graph → NCCL work objects → CUDA
-        # events) while CUDA is idle so the events are destroyed safely here
-        # rather than in the Reducer destructor after DDP is unwrapped.
         gc.collect()
         super().teardown()
 
 
-def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
-    """Launch a genomic cross-attention MoPaDi training run.
+def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
+    """Launch a genomic MoPaDi training run with clean dual conditioning.
+
+    Uses MoPaDi's built-in resnet_two_cond=True mechanism.
+    No extra wrappers or complex losses - just standard diffusion loss.
 
     Parameters
     ----------
@@ -102,15 +97,13 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
 
     conf = _build_train_config(cfg)
     log.info(
-        "GenomicCrossAttnConfig: img_size=%d, feat_dim=%d, style_ch=%d, "
-        "patch_size=%d, heads=%d, dim_per_head=%d, genomic_weight=%.2f",
+        "GenomicTrainConfig: img_size=%d, feat_dim=%d, style_ch=%d, resnet_two_cond=%s",
         conf.img_size, conf.feat_dim, conf.style_ch,
-        conf.cross_attn_patch_size, conf.cross_attn_heads, conf.cross_attn_dim_per_head,
-        conf.genomic_guided_loss_weight,
+        conf.net_beatgans_resnet_two_cond,
     )
 
     conf.make_model_conf()
-    model = GenomicCrossAttnLitModel(conf)
+    model = GenomicLitModel(conf)
 
     logdir = Path(conf.logdir)
     autoenc_dir = logdir / "autoenc"
@@ -171,9 +164,9 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
     accelerator = "gpu" if isinstance(gpus, (list, int)) else "cpu"
     devices = gpus if isinstance(gpus, list) else [gpus]
     # static_graph=True is incompatible with gradient checkpointing.
-    # find_unused_parameters=True is required because cross-attention weights
-    # are not used during the CF warmup period (steps 0–counterfactual_warmup_steps),
-    # and some losses are conditionally disabled (genomic_guided, recon).
+    # find_unused_parameters=True is required because some diagnostic branches
+    # are conditionally disabled and the wrapped cross-attention modules are not
+    # always exercised on every step.
     strategy = (
         _DefaultStreamDDPStrategy(
             find_unused_parameters=True,
@@ -244,7 +237,8 @@ def run_genomic_crossattn_training(cfg: Dict[str, Any], verbose: bool = True) ->
     log.info("Training complete. Last checkpoint dir/path: %s", last_ckpt_path)
 
 
-def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
+def _build_train_config(cfg: Dict[str, Any]) -> GenomicTrainConfig:
+    """Build GenomicTrainConfig from YAML dict."""
     for key in ("zip_dir", "genomic_feature_dir", "patient_splits_path"):
         if not cfg.get(key):
             raise ValueError(
@@ -278,12 +272,10 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
     raw_attn = _get("net_attn", None)
     net_attn = tuple(raw_attn) if raw_attn else (16,)
 
-    base_dir = cfg.get("base_dir", cfg.get("output_dir", "checkpoints/genomic_crossattn"))
-
-    cross_attn_cfg = cfg.get("cross_attention", {})
+    base_dir = cfg.get("base_dir", cfg.get("output_dir", "checkpoints/genomic"))
 
     fields: Dict[str, Any] = dict(
-        name="genomic_crossattn",
+        name="genomic_training",
         base_dir=base_dir,
         seed=int(_get("seed", 42)),
         model_name=ModelName.beatgans_autoenc,
@@ -293,8 +285,6 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         net_ch_mult=net_ch_mult,
         net_attn=net_attn,
         net_num_res_blocks=int(_get("net_num_res_blocks", 2)),
-        # MOPADI_GRADIENT_CHECKPOINT=1 lets the SLURM launcher override this for
-        # nodes with <96 GB VRAM (e.g. titan gpu48) without editing config.yaml.
         net_beatgans_gradient_checkpoint=bool(
             os.environ.get("MOPADI_GRADIENT_CHECKPOINT", "") == "1"
             or _get("net_beatgans_gradient_checkpoint", False)
@@ -302,7 +292,7 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         style_ch=style_ch,
         feat_dim=feat_dim,
         net_beatgans_embed_channels=style_ch,
-        net_beatgans_resnet_two_cond=True,
+        net_beatgans_resnet_two_cond=True,  # Enable dual conditioning: time + genomic features
         T=int(_get("T", 1000)),
         T_eval=int(_get("T_eval", 20)),
         batch_size=int(_get("batch_size", 4)),
@@ -322,29 +312,12 @@ def _build_train_config(cfg: Dict[str, Any]) -> GenomicCrossAttnConfig:
         patient_splits_path=cfg["patient_splits_path"],
         max_tiles_by_subtype=_get("max_tiles_by_subtype", None),
         tile_sampling_seed=int(_get("tile_sampling_seed", 42)),
-        n_tiles_per_bag=int(_get("n_tiles_per_bag", 1)),
         do_normalize=bool(_get("do_normalize", True)),
         do_resize=bool(_get("do_resize", False)),
         val_limit_batches=int(_get("limit_val_batches", 100)),
-        # Cross-attention
-        cross_attn_heads=int(cross_attn_cfg.get("heads", 4)),
-        cross_attn_dim_per_head=int(cross_attn_cfg.get("dim_per_head", 64)),
-        cross_attn_patch_size=int(cross_attn_cfg.get("patch_size", 16)),
-        cross_attn_lr=float(_get("cross_attn_lr", _get("lr", 1e-4))),
-        unet_lr=float(_get("unet_lr", _get("lr", 1e-4))),
-        # Genomic-guided loss
-        genomic_guided_loss_weight=float(_get("genomic_guided_loss_weight", 0.3)),
-        genomic_guided_high_t_frac=float(_get("genomic_guided_high_t_frac", 0.8)),
-        # Genomic reconstruction loss
-        genomic_recon_weight=float(_get("genomic_recon_weight", 0.05)),
-        # Counterfactual conditioning loss
-        counterfactual_loss_weight=float(_get("counterfactual_loss_weight", 0.0)),
-        counterfactual_temperature=float(_get("counterfactual_temperature", 0.05)),
-        counterfactual_every_n_steps=int(_get("counterfactual_every_n_steps", 1)),
-        counterfactual_warmup_steps=int(_get("counterfactual_warmup_steps", 0)),
     )
 
-    return GenomicCrossAttnConfig(**fields)
+    return GenomicTrainConfig(**fields)
 
 
 if __name__ == "__main__":
@@ -364,4 +337,4 @@ if __name__ == "__main__":
     if not section:
         raise SystemExit("No 'mopadi_genomic_crossattn' section found in config.")
 
-    run_genomic_crossattn_training(section, verbose=True)
+    run_genomic_training(section)

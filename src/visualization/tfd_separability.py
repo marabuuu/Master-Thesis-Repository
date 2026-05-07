@@ -39,6 +39,7 @@ from typing import Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+from PIL import Image
 
 from .core import (
     HEATMAP_CMAP,
@@ -412,8 +413,20 @@ def plot_radar_channel_contributions(
 # ===================================================================
 
 #: Crameri colourmap used for the fixed cell-type colour assignment.
-#: Kept separate from the subtype palette so the two never clash.
-CELL_TYPE_CMAP = "batlowS"
+#: Light, pastel-like Crameri colormap for better separation from black background.
+#: Similar aesthetic to Set2 but using a perceptually-optimized categorical map.
+CELL_TYPE_CMAP = "lipari"
+
+# Canonical channel order used across all cell-type plots.
+CELL_TYPE_ORDER = [
+    CHANNEL_NAMES[0],
+    CHANNEL_NAMES[1],
+    CHANNEL_NAMES[2],
+    CHANNEL_NAMES[3],
+    CHANNEL_NAMES[4],
+    CHANNEL_NAMES[5],
+    CHANNEL_NAMES[6],
+]
 
 
 def _collect_tissue_fractions(
@@ -491,26 +504,47 @@ def _collect_tissue_fractions(
     return arr
 
 
-def _build_cell_type_palette(
-    ch_labels: List[str],
+def build_cell_type_palette(
+    include_background: bool = False,
     cmap_name: str = CELL_TYPE_CMAP,
 ) -> Dict[str, str]:
-    """Map cell-type names to maximally distinct Crameri colours.
+    """Return the canonical fixed colour mapping for cell-type plots.
 
-    Samples the colourmap at positions spread evenly between 0.05 and 0.95
-    (avoiding the identical-looking endpoints of sequential maps), then
-    assigns colours in alphabetical label order so the mapping is always
-    the same regardless of which channels are plotted.
+    The mapping is stable across all plots so the same cell type always
+    receives the same colour, regardless of which subset of channels is
+    displayed.
+    
+    Samples from the lighter part of the colormap (0.3–0.95) to ensure
+    good contrast against black backgrounds (esp. for darkly-colored cell types).
     """
     import matplotlib as mpl
     from .core import get_crameri_cmap
 
-    sorted_labels = sorted(ch_labels)
-    n = len(sorted_labels)
-    positions = np.linspace(0.05, 0.95, n)
     cmap = get_crameri_cmap(cmap_name)
-    colours = [mpl.colors.to_hex(cmap(float(p))) for p in positions]
-    return {label: col for label, col in zip(sorted_labels, colours)}
+    palette: Dict[str, str] = {}
+
+    if include_background:
+        palette[CHANNEL_NAMES[0]] = "#111111"
+
+    # Sample at non-uniform positions to ensure colour diversity across the hue range
+    # Positions chosen to give distinct colours: cool blues, purples, rose, coral, peachy, cream
+    positions = [0.25, 0.38, 0.50, 0.62, 0.75, 0.90]
+    for ch, pos in zip(range(1, 7), positions):
+        palette[CHANNEL_NAMES[ch]] = mpl.colors.to_hex(cmap(float(pos)))
+
+    return palette
+
+
+def _build_cell_type_palette(
+    ch_labels: List[str],
+    cmap_name: str = CELL_TYPE_CMAP,
+) -> Dict[str, str]:
+    """Backward-compatible wrapper around :func:`build_cell_type_palette`."""
+    palette = build_cell_type_palette(
+        include_background=CHANNEL_NAMES[0] in ch_labels,
+        cmap_name=cmap_name,
+    )
+    return {label: palette[label] for label in ch_labels if label in palette}
 
 
 def plot_cell_type_boxplots(
@@ -609,7 +643,10 @@ def plot_cell_type_boxplots(
 
     # Fixed colour per cell type — spread evenly across colourmap (0.05–0.95)
     # to avoid near-identical endpoint colours
-    cell_type_palette = _build_cell_type_palette(ch_labels, cmap_name=cell_type_cmap)
+    cell_type_palette = build_cell_type_palette(
+        include_background=include_background,
+        cmap_name=cell_type_cmap,
+    )
 
     # --- Collect tissue-area fractions per subtype ---
     records: List[Dict] = []
@@ -693,6 +730,256 @@ def plot_cell_type_boxplots(
     save_figure(fig, out, dpi=dpi)
     if verbose:
         print(f"[OK] Saved cell-type boxplots → {out}")
+
+
+def _normalise_multichannel_mask(mask: np.ndarray) -> np.ndarray:
+    """Return a mask in ``(C, H, W)`` layout."""
+    mask = np.asarray(mask)
+    if mask.ndim == 2:
+        return mask[np.newaxis, ...]
+    if mask.ndim != 3:
+        raise ValueError(f"Unexpected mask shape: {mask.shape}")
+    if mask.shape[0] <= 16 and mask.shape[0] < mask.shape[-1]:
+        return mask
+    return np.transpose(mask, (2, 0, 1))
+
+
+def _mask_to_label_image(mask: np.ndarray) -> np.ndarray:
+    """Collapse a multichannel mask to a single label map via argmax."""
+    mask_cf = _normalise_multichannel_mask(mask)
+    if mask_cf.ndim != 3:
+        raise ValueError(f"Expected a 3D mask after normalisation, got {mask_cf.shape}")
+    return np.argmax(mask_cf, axis=0).astype(np.int32)
+
+
+def _find_zip_member(
+    zip_names: List[str],
+    sample_prefix: str,
+    tile_stem: str,
+    suffixes: Tuple[str, ...],
+) -> Optional[str]:
+    """Find a member path inside a tile ZIP archive."""
+    for suffix in suffixes:
+        candidate = f"{sample_prefix}/{tile_stem}{suffix}"
+        if candidate in zip_names:
+            return candidate
+    basename_matches = [
+        name for name in zip_names
+        if name.startswith(f"{sample_prefix}/")
+        and Path(name).stem == tile_stem
+    ]
+    return basename_matches[0] if basename_matches else None
+
+
+def _count_mask_tiles(mask_zip_path: Path) -> int:
+    with zipfile.ZipFile(mask_zip_path, "r") as zf:
+        return sum(name.endswith("_cls.npy") for name in zf.namelist())
+
+
+def _select_example_from_mask_zip(
+    mask_zip_path: Path,
+    tiles_dir: Path,
+) -> Optional[Dict[str, object]]:
+    """Pick the most tissue-rich tile from one patient mask ZIP."""
+    best: Optional[Dict[str, object]] = None
+    with zipfile.ZipFile(mask_zip_path, "r") as mask_zip:
+        mask_names = sorted(name for name in mask_zip.namelist() if name.endswith("_cls.npy"))
+        for mask_member in mask_names:
+            if "__tile_" not in mask_member:
+                continue
+            sample_prefix, remainder = mask_member.split("__tile_", 1)
+            tile_stem = f"tile_{remainder.removesuffix('_cls.npy')}"
+            tile_zip_path = tiles_dir / f"{sample_prefix}.zip"
+            if not tile_zip_path.exists():
+                continue
+
+            with mask_zip.open(mask_member) as handle:
+                mask = np.load(handle)
+            labels = _mask_to_label_image(mask)
+            foreground_fraction = float(np.mean(labels > 0))
+
+            if best is None or foreground_fraction > float(best["foreground_fraction"]):
+                with zipfile.ZipFile(tile_zip_path, "r") as tile_zip:
+                    tile_member = _find_zip_member(
+                        zip_names=tile_zip.namelist(),
+                        sample_prefix=sample_prefix,
+                        tile_stem=tile_stem,
+                        suffixes=(".png", ".jpg", ".jpeg", ".tif", ".tiff"),
+                    )
+                    if tile_member is None:
+                        continue
+                    with tile_zip.open(tile_member) as tile_handle:
+                        tile_img = Image.open(tile_handle).convert("RGB")
+                        tile_img.load()
+
+                best = {
+                    "sample_prefix": sample_prefix,
+                    "tile_member": tile_member,
+                    "mask_member": mask_member,
+                    "tile_zip_path": tile_zip_path,
+                    "mask_zip_path": mask_zip_path,
+                    "tile_image": tile_img,
+                    "mask_labels": labels,
+                    "foreground_fraction": foreground_fraction,
+                }
+
+    return best
+
+
+def plot_tile_mask_examples(
+    tiles_dir: Union[str, Path],
+    masks_dir: Union[str, Path],
+    metadata_csv: Union[str, Path],
+    output_dir: Union[str, Path],
+    *,
+    patient_col: str = "Patient_ID",
+    subtype_col: str = "Majority_Subtype_mRNA",
+    classes: Optional[List[str]] = None,
+    cmap_name: str = CELL_TYPE_CMAP,
+    figsize: Optional[Tuple[float, float]] = None,
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Path:
+    """Plot one representative H&E tile and mask per subtype.
+
+    The figure uses two rows: the top row shows the RGB tile, and the bottom
+    row shows the discrete classification mask with a fixed legend so the same
+    cell type is always mapped to the same colour across the whole project.
+    """
+    _check_matplotlib()
+    setup_style()
+    import matplotlib.patches as mpatches
+    from matplotlib.colors import ListedColormap
+
+    rng = np.random.default_rng(seed)
+
+    tiles_dir = Path(tiles_dir)
+    masks_dir = Path(masks_dir)
+    metadata_csv = Path(metadata_csv)
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if not tiles_dir.exists():
+        raise FileNotFoundError(f"tiles_dir does not exist: {tiles_dir}")
+    if not masks_dir.exists():
+        raise FileNotFoundError(f"masks_dir does not exist: {masks_dir}")
+
+    df_meta = pd.read_csv(metadata_csv)
+    df_meta["_pid"] = df_meta[patient_col].apply(_extract_patient_id)
+    patient_to_subtype: Dict[str, str] = dict(zip(df_meta["_pid"], df_meta[subtype_col]))
+    available = sorted(df_meta[subtype_col].dropna().unique().tolist())
+
+    if classes is not None:
+        subtypes = [c for c in PAM50_ORDER if c in classes]
+        subtypes += [c for c in classes if c not in PAM50_ORDER]
+    else:
+        subtypes = [c for c in PAM50_ORDER if c in available]
+        subtypes += [c for c in available if c not in PAM50_ORDER]
+
+    class_to_patients: Dict[str, List[str]] = {s: [] for s in subtypes}
+    for pid, subtype in patient_to_subtype.items():
+        if subtype in class_to_patients:
+            class_to_patients[subtype].append(pid)
+
+    examples: List[Dict[str, object]] = []
+    for subtype in subtypes:
+        patients = list(class_to_patients.get(subtype, []))
+        if not patients:
+            continue
+        if len(patients) > 1:
+            patients = list(rng.permutation(sorted(patients)))
+        else:
+            patients = sorted(patients)
+
+        best_patient: Optional[Path] = None
+        best_count = -1
+        for pid in patients:
+            mask_zip_path = masks_dir / f"{pid}.zip"
+            if not mask_zip_path.exists():
+                continue
+            count = _count_mask_tiles(mask_zip_path)
+            if count > best_count:
+                best_patient = mask_zip_path
+                best_count = count
+
+        if best_patient is None:
+            continue
+
+        example = _select_example_from_mask_zip(best_patient, tiles_dir)
+        if example is None:
+            continue
+        example["subtype"] = subtype
+        example["patient_id"] = _extract_patient_id(best_patient.name)
+        examples.append(example)
+
+    if not examples:
+        raise RuntimeError("No matched tile/mask examples were found.")
+
+    n_cols = len(examples)
+    if figsize is None:
+        figsize = (max(12.0, 3.8 * n_cols), 7.5)
+
+    palette = build_cell_type_palette(include_background=True, cmap_name=cmap_name)
+    cmap_values = [palette[CHANNEL_NAMES[i]] for i in range(7)]
+    cmap = ListedColormap(cmap_values, name="cell_types_fixed")
+
+    fig, axes = plt.subplots(2, n_cols, figsize=figsize, squeeze=False)
+    fig.subplots_adjust(wspace=0.04, hspace=0.08, bottom=0.18)
+
+    for col_idx, example in enumerate(examples):
+        tile_ax = axes[0][col_idx]
+        mask_ax = axes[1][col_idx]
+
+        tile_img = np.asarray(example["tile_image"])
+        mask_labels = np.asarray(example["mask_labels"])
+
+        tile_ax.imshow(tile_img)
+        tile_ax.set_axis_off()
+        tile_ax.set_title(
+            f"{example['subtype']}\n{example['patient_id']}",
+            fontsize=11,
+            fontweight="bold",
+            pad=6,
+        )
+
+        mask_ax.imshow(mask_labels, cmap=cmap, vmin=0, vmax=6, interpolation="nearest")
+        mask_ax.set_axis_off()
+        mask_ax.set_xlabel("classification mask", fontsize=9, labelpad=10)
+
+    axes[0][0].set_ylabel("H&E tile", fontsize=10)
+    axes[1][0].set_ylabel("mask", fontsize=10)
+
+    legend_order = CELL_TYPE_ORDER
+    legend_handles = [
+        mpatches.Patch(color=palette[label], label=f"{idx} {label}")
+        for idx, label in enumerate(legend_order)
+    ]
+    fig.legend(
+        handles=legend_handles,
+        loc="lower center",
+        ncol=4,
+        frameon=True,
+        framealpha=0.95,
+        edgecolor="grey",
+        bbox_to_anchor=(0.5, 0.02),
+        title="Mask classes",
+        title_fontsize=10,
+        fontsize=9,
+    )
+
+    fig.suptitle(
+        "Representative H&E tiles and matching classification masks",
+        fontsize=13,
+        fontweight="bold",
+        y=0.98,
+    )
+
+    out = output_dir / "tile_mask_examples.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved tile/mask gallery → {out}")
+    return out
 
 
 # ===================================================================
@@ -1228,7 +1515,10 @@ def plot_nn_distance_violins(
     subtypes = [s for s in PAM50_ORDER if s in stats_by_subtype]
     subtypes += [s for s in stats_by_subtype if s not in PAM50_ORDER]
     ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
-    cell_type_palette = _build_cell_type_palette(ch_labels, cmap_name=cell_type_cmap)
+    cell_type_palette = build_cell_type_palette(
+        include_background=False,
+        cmap_name=cell_type_cmap,
+    )
 
     # Long-form DataFrame; drop NaN (tiles with < 2 cells of that type)
     records: List[Dict] = []
@@ -1452,6 +1742,8 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
         Column name for PAM50 subtypes (default: ``Majority_Subtype_mRNA``).
     classes : list[str] or null
         Subtypes to include; ``null`` = all in metadata CSV.
+    tiles_dir : str
+        Directory containing per-sample tile ZIP archives.
     output_dir : str
         Where to write output PNGs.
     max_tiles_per_subtype : int
@@ -1473,13 +1765,14 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
     plots : list[str]
         Which plots to generate.  Choices:
         ``channel_contributions``, ``radar_contributions``,
-        ``cell_type_boxplots``, ``ternary_composition``,
+        ``cell_type_boxplots``, ``tile_mask_examples``, ``ternary_composition``,
         ``nn_distance_violins``, ``cross_type_proximity``,
         ``ripley_L_by_subtype``, ``voronoi_distribution``,
         ``knn_metrics``.
     """
     results_json = cfg.get("results_json")
     masks_dir = cfg.get("masks_dir")
+    tiles_dir = cfg.get("tiles_dir")
     metadata_csv = cfg.get("metadata_csv")
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1544,6 +1837,29 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 cell_type_cmap=cfg.get("cmap_cell_types", CELL_TYPE_CMAP),
                 figsize=figsize,
                 dpi=dpi,
+                verbose=verbose,
+            )
+
+    if "tile_mask_examples" in plots:
+        if not tiles_dir or not masks_dir or not metadata_csv:
+            logger.warning(
+                "'tiles_dir', 'masks_dir' or 'metadata_csv' not set — skipping tile_mask_examples."
+            )
+        else:
+            if verbose:
+                print("\n[TFD-Viz] Generating tile/mask example gallery…")
+            plot_tile_mask_examples(
+                tiles_dir=tiles_dir,
+                masks_dir=masks_dir,
+                metadata_csv=metadata_csv,
+                output_dir=output_dir,
+                patient_col=cfg.get("patient_col", "Patient_ID"),
+                subtype_col=cfg.get("subtype_col", "Majority_Subtype_mRNA"),
+                classes=cfg.get("classes"),
+                cmap_name=cfg.get("cmap_cell_types", CELL_TYPE_CMAP),
+                figsize=tuple(cfg["figsize_tile_mask_examples"]) if cfg.get("figsize_tile_mask_examples") else None,
+                dpi=dpi,
+                seed=cfg.get("seed", 42),
                 verbose=verbose,
             )
 

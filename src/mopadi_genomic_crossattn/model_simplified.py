@@ -1,5 +1,5 @@
 """
-GenomicLitModel — MoPaDi training with clean genomic conditioning.
+GenomicLitModel — MoPaDi training with genomic conditioning.
 
 Philosophy: Use MoPaDi's built-in dual conditioning (resnet_two_cond=True).
 No wrappers, no auxiliary losses during training. Clean, minimal integration.
@@ -12,11 +12,11 @@ Validation metrics show how much the genomic conditioning helps.
 from __future__ import annotations
 
 import logging
+from typing import Optional
 
 import torch
 import pytorch_lightning as pl
 from pytorch_lightning.utilities.types import STEP_OUTPUT
-from typing import Optional
 
 from mopadi.train_diff_autoenc import LitModel
 from mopadi.utils.dist_utils import get_world_size
@@ -124,6 +124,8 @@ class GenomicLitModel(LitModel):
 
         # Wrap with limit_batches if configured
         if self.conf.val_limit_batches > 0:
+            from torch.utils.data import IterableDataset
+            
             class LimitedDataLoader:
                 def __init__(self, loader, max_batches):
                     self.loader = loader
@@ -191,6 +193,8 @@ class GenomicLitModel(LitModel):
             gap = loss_shuffled - loss_ordered
 
         # Log metrics
+        num_samples = self.num_samples + len(imgs) * get_world_size()
+        
         self.log("loss/val", loss_ordered, on_step=False, on_epoch=True, sync_dist=True)
         self.log("loss/val_shuffled", loss_shuffled, on_step=False, on_epoch=True, sync_dist=True)
         self.log("cond/gap", gap, on_step=False, on_epoch=True, sync_dist=True)

@@ -212,10 +212,10 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         run_build_genomic_features(config["build_genomic_features"], verbose=verbose)
 
     elif stage == "mopadi_genomic_crossattn":
-        from src.mopadi_genomic_crossattn.run_training import run_genomic_crossattn_training
+        from src.mopadi_genomic_crossattn.run_training import run_genomic_training
         if "mopadi_genomic_crossattn" not in config:
             raise ValueError("No 'mopadi_genomic_crossattn' section in config.yaml")
-        run_genomic_crossattn_training(config["mopadi_genomic_crossattn"], verbose=verbose)
+        run_genomic_training(config["mopadi_genomic_crossattn"], verbose=verbose)
 
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")

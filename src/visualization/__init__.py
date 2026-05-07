@@ -85,9 +85,11 @@ from .training_plots import (
     plot_training_summary,
 )
 from .tfd_separability import (
+    build_cell_type_palette,
     plot_channel_contributions,
     plot_radar_channel_contributions,
     plot_cell_type_boxplots,
+    plot_tile_mask_examples,
     plot_ternary_composition,
     plot_nn_distance_violins,
     plot_cross_type_proximity_heatmaps,
@@ -102,6 +104,7 @@ __all__ = [
     "save_figure",
     "show_or_save",
     "build_label_palette",
+    "build_cell_type_palette",
     # embedding I/O
     "load_embedding",
     "collect_embeddings",
@@ -140,6 +143,7 @@ __all__ = [
     "plot_channel_contributions",
     "plot_radar_channel_contributions",
     "plot_cell_type_boxplots",
+    "plot_tile_mask_examples",
     "plot_ternary_composition",
     "plot_nn_distance_violins",
     "plot_cross_type_proximity_heatmaps",

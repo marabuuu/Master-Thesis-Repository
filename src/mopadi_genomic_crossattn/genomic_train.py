@@ -255,29 +255,21 @@ class GenomicLitModel(LitModel):
 
         out = super().training_step(batch, batch_idx)
 
-        # --- Counterfactual conditioning objective ---
-        # Maximises the gap (loss_shuffled − loss_cond) using a softplus penalty
-        # instead of a hard hinge.  Softplus(-gap/T) always provides gradient:
-        # near log(2) ≈ 0.69 when gap ≈ 0, decays to ≈0 when gap >> T.
-        # This avoids the hinge's saturation problem where gradient drops to zero
-        # once gap > margin, letting the model drift back toward ignoring genomics.
-        cf_weight = float(getattr(self.conf, "counterfactual_loss_weight", 0.0))
-        cf_temperature = max(1e-6, float(getattr(self.conf, "counterfactual_temperature", 0.05)))
+        # ── Counterfactual gap metric (diagnostic only — not a training loss) ──
+        # Measures loss(shuffled_cond) − loss(correct_cond) to track whether the
+        # model is learning to use genomic conditioning.  Both passes run under
+        # no_grad so they save memory and do not influence the gradient.
         cf_every = max(1, int(getattr(self.conf, "counterfactual_every_n_steps", 1)))
-        cf_warmup = max(0, int(getattr(self.conf, "counterfactual_warmup_steps", 0)))
+        cf_temperature = max(1e-6, float(getattr(self.conf, "counterfactual_temperature", 0.05)))
 
         loss_val = out["loss"] if isinstance(out, dict) else out
         if (
-            cf_weight > 0.0
-            and self.global_step >= cf_warmup
-            and (self.global_step % cf_every == 0)
+            (self.global_step % cf_every == 0)
             and batch["feat"].shape[0] > 1
         ):
             imgs = batch["img"].to(self.device)
             feats = batch["feat"].to(self.device, dtype=torch.float32)
 
-            # Shuffle at the patient (bag) level: all N tiles from patient i
-            # always go with a different patient's genomic vector.
             if _bag_n > 1:
                 B_bags = feats.shape[0] // _bag_n
                 bag_perm = self._non_identity_permutation(B_bags, feats.device)
@@ -289,48 +281,28 @@ class GenomicLitModel(LitModel):
                 perm = self._non_identity_permutation(feats.size(0), feats.device)
                 feats_shuffled = feats[perm]
 
-            # Draw shared t/noise used for BOTH conditioned and shuffled CF passes.
-            # Using the same t/noise eliminates timestep variance from the gap
-            # estimate: the only source of difference is conditioning correctness.
-            # Both passes run WITH gradient so:
-            #   ∂(cf_term)/∂θ pushes loss_cond_cf DOWN (use correct conditioning)
-            #   ∂(cf_term)/∂θ pushes loss_shuffled_cf UP (perform worse with wrong cond)
-            # This is the correct contrastive signal absent from the previous no_grad design.
-            t_cf, _ = self.T_sampler.sample(len(imgs), imgs.device)
-            noise_cf = torch.randn_like(imgs)
+            with torch.no_grad():
+                t_cf, _ = self.T_sampler.sample(len(imgs), imgs.device)
+                noise_cf = torch.randn_like(imgs)
 
-            # Both CF passes run with gradient: ∂(cf_term)/∂θ pushes loss_cond_cf down
-            # (use correct conditioning) and loss_shuffled_cf up (fail on wrong cond).
-            # Memory fits because n_tiles_per_bag=1: 3 passes × ~19 GB = ~57 GB < 80 GB.
-            losses_cond_cf = self.sampler.training_losses(
-                model=self.model,
-                x_start=imgs,
-                cond=feats,
-                t=t_cf,
-                noise=noise_cf,
-                model_kwargs={"cond": feats},
-            )
-            loss_cond_cf = losses_cond_cf["loss"].mean()
-
-            losses_shuffled = self.sampler.training_losses(
-                model=self.model,
-                x_start=imgs,
-                cond=feats_shuffled,
-                t=t_cf,
-                noise=noise_cf,
-                model_kwargs={"cond": feats_shuffled},
-            )
-            loss_shuffled_cf = losses_shuffled["loss"].mean()
-
-            gap = loss_shuffled_cf - loss_cond_cf
-            cf_penalty = F.softplus(-gap / cf_temperature)
-            cf_term = cf_weight * cf_penalty
-            loss_val = loss_val + cf_term
-
-            if isinstance(out, dict):
-                out["loss"] = loss_val
-            else:
-                out = loss_val
+                losses_cond_cf = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats,
+                    t=t_cf,
+                    noise=noise_cf,
+                    model_kwargs={"cond": feats},
+                )
+                losses_shuffled = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats_shuffled,
+                    t=t_cf,
+                    noise=noise_cf,
+                    model_kwargs={"cond": feats_shuffled},
+                )
+                gap = losses_shuffled["loss"].mean() - losses_cond_cf["loss"].mean()
+                cf_penalty_metric = F.softplus(-gap / cf_temperature)
 
             self.log(
                 "cond/gap_train",
@@ -342,7 +314,7 @@ class GenomicLitModel(LitModel):
             )
             self.log(
                 "loss/counterfactual",
-                cf_term,
+                cf_penalty_metric,
                 on_step=True,
                 on_epoch=False,
                 prog_bar=False,

@@ -61,46 +61,23 @@ class GenomicTrainConfig(TrainConfig):
     val_limit_batches: int = 100
 
     # ── Image pre-processing overrides ───────────────────────────────────
-    # No image feature extractor → no forced resize.
-    # do_normalize stays True (diffusion training requires [-1, 1] images).
     do_normalize: bool = True
     do_resize: bool = False
 
-    # ── Counterfactual conditioning objective ─────────────────────────
-    # These are optional; when loss weight is 0 the objective is disabled.
-    counterfactual_loss_weight: float = 0.0
-    counterfactual_margin: float = 0.0       # kept for backwards compat; unused when temperature > 0
-    counterfactual_temperature: float = 0.05  # softplus temperature; effective soft-margin ≈ this value
-    counterfactual_every_n_steps: int = 1
-    counterfactual_warmup_steps: int = 0
-
-    # ── Multi-tile bag training ───────────────────────────────────────
-    # Number of tiles sampled from the same patient per training example.
-    # When > 1, __getitem__ returns img: (n_tiles_per_bag, C, H, W) and the
-    # training_step flattens to (B*n_tiles_per_bag, C, H, W) before the UNet
-    # forward pass.  The counterfactual loss shuffles at the patient (bag) level
-    # so all tiles from patient i always receive a different patient's features.
-    # Set to 1 to disable bag mode (default, backward-compatible behaviour).
-    n_tiles_per_bag: int = 1
-
-    # ── Classifier-free guidance dropout ──────────────────────────────
-    # Probability of zeroing the conditioning vector per sample during training.
-    # Required for CFG at inference and creates a structural incentive to use
-    # genomic conditioning when it is present.
-    cond_dropout_prob: float = 0.0
-
     def __post_init__(self):
         super().__post_init__()
-        # Genomic conditioning uses the full embed_channels width directly.
-        # Enforce that feat_dim matches style_ch / embed_channels so the
-        # 512-dim gene vector slots into the UNet's style pathway without
-        # any mismatch at runtime.
+        # Enforce that feat_dim matches style_ch so the 512-dim gene vector
+        # slots into the UNet's conditioning pathway without mismatch.
         if self.feat_dim != self.style_ch:
             raise ValueError(
                 f"GenomicTrainConfig requires feat_dim == style_ch "
                 f"(got feat_dim={self.feat_dim}, style_ch={self.style_ch}). "
                 "Both should be 512 to match the gene-expression vector size."
             )
+        
+        # Enable dual conditioning: time + genomic features
+        # This is MoPaDi's built-in mechanism; no wrapper needed.
+        self.net_beatgans_resnet_two_cond = True
 
     # ------------------------------------------------------------------
     # Factory
