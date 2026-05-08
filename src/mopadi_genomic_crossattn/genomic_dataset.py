@@ -341,6 +341,7 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
                 break
         pid = patient_id_from_tile_path(item["filename"])
         item["feat"] = self._genomic_cache[pid]    # (n_genes,) float32 tensor
+        item["subtype"] = self._subtype_map.get(pid, "unknown")
         return item
 
     def _getitem_bag(self, index: int) -> Dict:

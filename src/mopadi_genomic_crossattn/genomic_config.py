@@ -55,6 +55,15 @@ class GenomicTrainConfig(TrainConfig):
     max_tiles_by_subtype: Optional[Dict[str, Optional[int]]] = None
     tile_sampling_seed: int = 42
 
+    # ── Counterfactual gap loss ───────────────────────────────────────────
+    # λ weight on the hinge loss relu(margin - gap); 0 disables entirely.
+    cfl_lambda: float = 0.1
+    # Margin: how large a gap (loss_shuffled - loss_correct) we demand before
+    # the penalty goes to zero.
+    cfl_margin: float = 0.005
+    # Run counterfactual pass every N training steps to amortise compute.
+    cfl_every_n_steps: int = 4
+
     # ── Validation ───────────────────────────────────────────────────────
     # Cap val batches in val_dataloader() directly (Lightning's limit_val_batches
     # is unreliable with integer val_check_interval in 2.5.x).

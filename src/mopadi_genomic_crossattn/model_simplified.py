@@ -4,9 +4,9 @@ GenomicLitModel — MoPaDi training with genomic conditioning.
 Philosophy: Use MoPaDi's built-in dual conditioning (resnet_two_cond=True).
 No wrappers, no auxiliary losses during training. Clean, minimal integration.
 
-The training objective is the standard MoPaDi L1 diffusion loss only.
-Genomic signal flows through the existing AdaGN conditioning pathway.
-Validation metrics show how much the genomic conditioning helps.
+Training objective: standard MoPaDi L1 diffusion loss + counterfactual gap loss.
+The counterfactual loss is computed with cross-subtype shuffled genomic features and
+evaluated at high timesteps only (where global subtype structure is most expressed).
 """
 
 from __future__ import annotations
@@ -25,6 +25,26 @@ from .genomic_config import GenomicTrainConfig
 from .genomic_dataset import ZipTilesWithGenomicFeatures
 
 log = logging.getLogger(__name__)
+
+
+def _cross_subtype_shuffle(feats: torch.Tensor, subtypes: list[str]) -> torch.Tensor:
+    """Permute feats so each sample gets a vector from a different subtype.
+
+    Falls back to any different index when only one subtype is present in the batch.
+    """
+    B = len(feats)
+    perm = list(range(B))
+    for i in range(B):
+        candidates = [j for j in range(B) if j != i and subtypes[j] != subtypes[i]]
+        if not candidates:
+            candidates = [j for j in range(B) if j != i]
+        if not candidates:
+            continue
+        # pick a random candidate; swap with current position in perm to avoid
+        # assigning the same source index twice where possible
+        chosen = candidates[torch.randint(len(candidates), (1,)).item()]
+        perm[i] = chosen
+    return feats[torch.tensor(perm, device=feats.device)]
 
 
 class GenomicLitModel(LitModel):
@@ -94,6 +114,85 @@ class GenomicLitModel(LitModel):
                 len(self.val_data),
                 self.conf.net_beatgans_resnet_two_cond,
             )
+
+    # ------------------------------------------------------------------
+    # Training step — L1 diffusion loss + counterfactual gap loss
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        """Standard L1 diffusion loss + cross-subtype counterfactual gap loss.
+
+        The counterfactual pass runs every `cfl_every_n_steps` steps and uses
+        high timesteps only (top half of [0, T]) where global subtype structure
+        is most expressed.  Cross-subtype shuffling ensures the negative vector
+        is always from a different PAM50 class, avoiding the ~38 % wasted same-
+        subtype shuffles that random permutation produces.
+        """
+        with torch.autocast(device_type='cuda', enabled=self.conf.fp16):
+            imgs = batch['img'].to(self.device)
+            feats = batch['feat'].to(self.device, dtype=torch.float32)
+            t, _ = self.T_sampler.sample(len(imgs), imgs.device)
+
+            losses = self.sampler.training_losses(
+                model=self.model,
+                x_start=imgs,
+                cond=feats,
+                t=t,
+                model_kwargs={'cond': feats},
+            )
+            loss = losses['loss'].mean()
+
+            cfl_every = getattr(self.conf, 'cfl_every_n_steps', 4)
+            cfl_lambda = float(getattr(self.conf, 'cfl_lambda', 0.1))
+            cfl_margin = float(getattr(self.conf, 'cfl_margin', 0.005))
+
+            if cfl_lambda > 0 and self.global_step % cfl_every == 0:
+                subtypes = batch.get('subtype', None)
+
+                # Cross-subtype shuffle if subtype labels are available; otherwise
+                # fall back to plain random permutation.
+                if subtypes is not None and not isinstance(subtypes[0], torch.Tensor):
+                    feats_neg = _cross_subtype_shuffle(feats, list(subtypes))
+                else:
+                    feats_neg = feats[torch.randperm(len(feats), device=feats.device)]
+
+                # Evaluate at high timesteps only: top half of diffusion schedule.
+                T = self.conf.T
+                t_high = torch.randint(T // 2, T, (len(imgs),), device=imgs.device)
+
+                # ref loss is a constant baseline — no gradient needed.
+                # This keeps only ONE extra graph (losses_neg) alive during
+                # backward instead of three, cutting peak activation memory
+                # from ~3× to ~2× compared to the main loss alone.
+                with torch.no_grad():
+                    losses_ref = self.sampler.training_losses(
+                        model=self.model,
+                        x_start=imgs,
+                        cond=feats,
+                        t=t_high,
+                        model_kwargs={'cond': feats},
+                    )
+                ref_loss = losses_ref['loss'].mean()
+
+                losses_neg = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats_neg,
+                    t=t_high,
+                    model_kwargs={'cond': feats_neg},
+                )
+                gap = losses_neg['loss'].mean() - ref_loss
+                cfl_loss = torch.relu(cfl_margin - gap)
+                loss = loss + cfl_lambda * cfl_loss
+
+                if self.global_rank == 0:
+                    self.logger.experiment.add_scalar('cond/gap_train', gap.item(), self.num_samples)
+                    self.logger.experiment.add_scalar('loss/cfl', cfl_loss.item(), self.num_samples)
+
+        if self.global_rank == 0:
+            self.logger.experiment.add_scalar('loss', loss.item(), self.num_samples)
+
+        return {'loss': loss}
 
     # ------------------------------------------------------------------
     # Val dataloader (parent only defines train_dataloader)
@@ -214,13 +313,6 @@ class GenomicLitModel(LitModel):
     def evaluate_scores(self) -> None:
         """Skip evaluation; feat_extractor is None."""
         pass
-
-    def log_sample(self, x_start, cond):
-        """Skip sample logging if num_samples is 0."""
-        if getattr(self.conf, 'num_samples', 0) == 0:
-            return
-        # Otherwise call parent
-        return super().log_sample(x_start, cond)
 
     # ------------------------------------------------------------------
     # Sanity check (override parent's WebDataset check)

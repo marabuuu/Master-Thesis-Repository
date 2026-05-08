@@ -29,11 +29,11 @@ from mopadi.configs.choices import ModelName
 
 try:
     from .genomic_config import GenomicTrainConfig
-    from .model import GenomicLitModel
+    from .model_simplified import GenomicLitModel
     from .checkpoint_callback import CompositeMetricCheckpoint
 except ImportError:
     from mopadi_genomic_crossattn.genomic_config import GenomicTrainConfig
-    from mopadi_genomic_crossattn.model import GenomicLitModel
+    from mopadi_genomic_crossattn.model_simplified import GenomicLitModel
     from mopadi_genomic_crossattn.checkpoint_callback import CompositeMetricCheckpoint
 
 log = logging.getLogger(__name__)
