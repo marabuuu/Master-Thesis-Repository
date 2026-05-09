@@ -151,6 +151,10 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
     tiles_folder = os.path.splitext(zip_fname)[0]
     filtered_tiles_dir = os.path.join(save_dir, tiles_folder)
 
+    archive_path_check = os.path.join(save_dir, f"{tiles_folder}.zip")
+    if os.path.exists(archive_path_check):
+        print(f'Skipping {tiles_folder}: output zip already exists')
+        return True
     if os.path.exists(filtered_tiles_dir) and len(os.listdir(filtered_tiles_dir)) > 0:
         print(f'Skipping {tiles_folder}: output directory already exists and is non-empty')
         return True
@@ -333,7 +337,7 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
 
     # run diagnostic evaluation (small sample to keep it fast)
     # pass raw annotations (unscaled) so hypotheses test both unit interpretations
-    eval_results = evaluate_coord_hypotheses(tile_fnames, ann_raw, extraction_mpp, target_mpp, tile_size_px, max_samples=200)
+    eval_results = evaluate_coord_hypotheses(tile_fnames, ann_raw, native_slide_mpp, target_mpp, tile_size_px, max_samples=200)
     if eval_results:
         print("Coordinate hypothesis evaluation (sorted by fraction annotation covered):")
         for r in eval_results:
@@ -442,22 +446,30 @@ def process_zip(zip_fname, zip_dir, save_dir, roi_dir, target_mpp, generate_plot
             (tiles_overall_bounds[0], tiles_overall_bounds[3])
         ])
         
-        overlap = tiles_box.intersection(scaled_annPolys)
-        overlap_ratio = overlap.area / scaled_annPolys.area if scaled_annPolys.area > 0 else 0
-        
+        # Repair invalid annotation geometry before intersection to avoid TopologyException
+        ann_for_check = scaled_annPolys
+        if not ann_for_check.is_valid:
+            ann_for_check = ann_for_check.buffer(0)
+
+        overlap = tiles_box.intersection(ann_for_check)
+        overlap_ratio = overlap.area / ann_for_check.area if ann_for_check.area > 0 else 0
+
         print(f"Tiles region: {tiles_overall_bounds}")
         print(f"Annotation region: {ann_bounds}")
         print(f"Overlap ratio (annotation covered by tiles): {overlap_ratio:.3f}")
-        
-        # If less than 10% of annotation overlaps with tiles, translate annotation to tile region
+
         if overlap_ratio < 0.1:
-            # Translate annotation so its min corner aligns with tile region min corner
-            # (This assumes annotation should be somewhere within the tile extraction area)
-            dx = tiles_overall_bounds[0] - ann_bounds[0]
-            dy = tiles_overall_bounds[1] - ann_bounds[1]
-            print(f"Poor overlap detected. Translating annotation by dx={dx:.1f}, dy={dy:.1f} to align with tile region.")
-            scaled_annPolys = translate(scaled_annPolys, xoff=dx, yoff=dy)
-            print(f"Annotation bounds after translation: {scaled_annPolys.bounds}")
+            # Annotation barely overlaps with the tile region — this almost certainly means
+            # the coordinate spaces are mismatched (wrong hypothesis or wrong MPP values).
+            # Silently translating the annotation here would place it in the wrong tissue
+            # region and allow non-tumor tiles to pass the overlap test, so we skip instead.
+            print(
+                f"WARNING: Only {overlap_ratio:.1%} of the annotation overlaps with the tile "
+                f"region for {tiles_folder}. This likely indicates a coordinate-space mismatch "
+                f"(check native_slide_mpp, target_mpp, and tile coordinate units). "
+                f"Skipping this slide to avoid selecting non-tumor tiles."
+            )
+            return False
         else:
             print(f"Good overlap ({overlap_ratio:.1%}), no translation needed.")
     except Exception as e:
