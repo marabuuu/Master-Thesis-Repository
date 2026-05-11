@@ -24,6 +24,7 @@ from pytorch_lightning import loggers as pl_loggers
 from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from pytorch_lightning.strategies import DDPStrategy
 from torch.nn.parallel import DistributedDataParallel
+from datetime import timedelta
 
 from mopadi.configs.choices import ModelName
 
@@ -169,15 +170,16 @@ def run_genomic_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     # always exercised on every step.
     strategy = (
         _DefaultStreamDDPStrategy(
-            find_unused_parameters=True,
+            find_unused_parameters=False,  # all params used every step (confirmed by DDP warning)
             init_sync=False,
             broadcast_buffers=False,
             static_graph=False,
+            timeout=timedelta(hours=2),    # default 30 min caused crash during 2.2 GB NFS checkpoint save
         )
         if len(devices) > 1 else "auto"
     )
     log.info(
-        "DDP static_graph=False find_unused=True (gradient_checkpoint=%s)",
+        "DDP static_graph=False find_unused=False timeout=2h (gradient_checkpoint=%s)",
         conf.net_beatgans_gradient_checkpoint,
     )
 

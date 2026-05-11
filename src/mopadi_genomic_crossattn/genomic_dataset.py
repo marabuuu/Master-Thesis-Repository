@@ -465,6 +465,14 @@ def _build_genomic_cache(
             continue
         with h5py.File(h5_path, "r") as f:
             vec = np.asarray(f["feats"][:], dtype=np.float32).squeeze()
+        # L2-normalise to unit sphere: removes patient-level magnitude variation
+        # (an artefact of per-gene z-scoring, not biologically meaningful) and
+        # matches the ~L2=1 scale that MoPaDi's AdaGN pathway was designed for
+        # with CONCH image embeddings.  Subtype-discriminative directions are
+        # fully preserved (Basal vs LumA cos≈−0.94, etc.).
+        norm = np.linalg.norm(vec)
+        if norm > 0:
+            vec = vec / norm
         cache[pid] = torch.from_numpy(vec)
 
     if missing:
