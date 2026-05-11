@@ -20,18 +20,27 @@ from .metrics import (
     compute_ssim,
     compute_all_metrics,
 )
-from .evaluate_reconstruction import (
-    ReconstructionEvaluator,
-    evaluate_patient_tiles,
-)
-from visualization.reconstruction_eval import (
-    plot_metrics_summary,
-    plot_comparison_grid,
-    plot_per_patient_metrics,
-    plot_metric_correlation,
-    plot_single_comparison,
-    save_figure,
-)
+
+try:
+    from .evaluate_reconstruction import (
+        ReconstructionEvaluator,
+        evaluate_patient_tiles,
+    )
+except Exception:
+    pass
+
+try:
+    from visualization.reconstruction_eval import (
+        plot_metrics_summary,
+        plot_comparison_grid,
+        plot_per_patient_metrics,
+        plot_metric_correlation,
+        plot_single_comparison,
+        save_figure,
+    )
+except Exception:
+    pass
+
 from .topological_frechet_distance import (
     compute_topofd,
     compute_topofd_from_folders,
@@ -44,10 +53,14 @@ from .tfd_separability import (
     compute_tfd_separability,
     run_tfd_separability,
 )
-from .run_evaluation import (
-    run_evaluation,
-    load_config,
-)
+
+try:
+    from .run_evaluation import (
+        run_evaluation,
+        load_config,
+    )
+except Exception:
+    pass
 
 __all__ = [
     # Metrics

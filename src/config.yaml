@@ -119,9 +119,11 @@ mopadi_genomic_crossattn:
   # Every cfl_every_n_steps the training loss includes:
   #   lambda * relu(margin - (loss_neg_high_t - loss_ref_high_t))
   # where neg uses cross-subtype shuffled genomic vectors evaluated at t ~ U[T/2, T].
-  # λ=0.3 is intentionally aggressive: with fresh weights + scale+shift + learned
-  # projection all active from step 1, the model is plastic enough to establish
-  # the gap quickly without destabilising image quality.
+  # Genomic vectors are L2-normalised to the unit sphere before entering the style
+  # MLP (see genomic_dataset.py), so the SiLU activations operate in their linear
+  # regime (~0.044 per-dim std) and preserve the subtype anti-correlation structure
+  # (Basal vs LumA cos≈−0.94).  Without normalisation the SiLU zeroed out negatives
+  # and collapsed all subtypes to positive-only directions → gap stayed at zero.
   cfl_lambda: 0.3
   cfl_margin: 0.005
   cfl_every_n_steps: 4
@@ -147,21 +149,21 @@ mopadi_genomic_crossattn:
   - 1
   - 2
   - 3
-  base_dir: ./experiments/20260509_adagn_scaleshift_cfl
+  base_dir: ./experiments/20260511_adagn_l2norm_cfl
   save_top_k: 3
-  out_dir: ./experiments/20260509_adagn_scaleshift_cfl/train
-  checkpoint_dir: ./experiments/20260509_adagn_scaleshift_cfl/checkpoints
-  logdir: ./experiments/20260509_adagn_scaleshift_cfl/logs
-  tensorboard_dir: ./experiments/20260509_adagn_scaleshift_cfl/tensorboard
-  sample_dir: ./experiments/20260509_adagn_scaleshift_cfl/samples
-  reconstructions_dir: ./experiments/20260509_adagn_scaleshift_cfl/reconstructions
+  out_dir: ./experiments/20260511_adagn_l2norm_cfl/train
+  checkpoint_dir: ./experiments/20260511_adagn_l2norm_cfl/checkpoints
+  logdir: ./experiments/20260511_adagn_l2norm_cfl/logs
+  tensorboard_dir: ./experiments/20260511_adagn_l2norm_cfl/tensorboard
+  sample_dir: ./experiments/20260511_adagn_l2norm_cfl/samples
+  reconstructions_dir: ./experiments/20260511_adagn_l2norm_cfl/reconstructions
   # Composite checkpoint: saves best ckpt by (loss/val - alpha * cond/gap_norm)
   use_composite_metric_checkpoint: true
   composite_alpha: 1.0
 
 training_stats:
-  logdir: ./experiments/20260509_adagn_scaleshift_cfl
-  output_dir: ./experiments/20260509_adagn_scaleshift_cfl/training_stats
+  logdir: ./experiments/20260511_adagn_l2norm_cfl
+  output_dir: ./experiments/20260511_adagn_l2norm_cfl/training_stats
   plots:
   - loss_curves
   - genomic_diagnostics
@@ -190,7 +192,7 @@ tfd_separability:
     Basal: 135
     Her2: 300
     Normal: null
-  masks_dir: ./experiments/20260509_tfd_separability/masks
+  masks_dir: ../experiments/20260509_tfd_separability/masks
   auto_segment: true
   force_resegment: false
   num_classes: 32
@@ -204,33 +206,35 @@ tfd_separability:
   min_cells_per_image: 3
   compute_noise_floor: true
   n_noise_floor_splits: 5
-  output_dir: ./experiments/20260509_tfd_separability/results
+  output_dir: ../experiments/20260509_tfd_separability/results
   save_heatmap: true
   figsize: null
 
 tfd_separability_viz:
   # ── Input ─────────────────────────────────────────────────────────────────
-  results_json: ./experiments/20260420_tfd_separability/results_all_subtypes/tfd_separability_results.json
+  results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
   tiles_dir: ../data/BRCA-tumor-tiles-corrected
-  masks_dir: ./experiments/20260420_tfd_separability/masks
+  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
   metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_col: Patient_ID
   subtype_col: Majority_Subtype_mRNA
   classes: null
-  output_dir: ./experiments/20260420_tfd_separability/plots_fast
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/plots
 
   # ── Plots to generate ─────────────────────────────────────────────────────
+  # Each plot that involves per-tile data also saves a sidecar JSON with
+  # patient-level Kruskal-Wallis + pairwise Mann-Whitney U (BH FDR) results.
   plots:
-    #- radar_contributions     # radar/spider chart with blended subtype colours
-    #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
-    #- cell_type_boxplots      # pixel-fraction boxplots per subtype
-    - tile_mask_examples       # matched H&E tiles + classification masks
-    #- ternary_composition     # epithelium-immune-connective triangle plot
-    #- nn_distance_violins     # intra-type NN distance violins (spatial clustering)
-    #- cross_type_proximity    # cross-cell-type NN distance heatmaps (spatial interface)
-    #- ripley_L_by_subtype     # Scale-dependent clustering (L-function curves)
-    #- voronoi_distribution    # Cell dispersion via Voronoi areas
-    #- knn_metrics             # kNN connectivity & clustering coefficient
+    - channel_contributions   # per-channel TFD heatmaps (absolute + relative)
+    - cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
+    - tile_mask_examples      # matched H&E tiles + classification masks
+    - ternary_composition     # epithelium-immune-connective triangle plot
+    - nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
+    - cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
+    - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
+    - voronoi_distribution    # cell dispersion via Voronoi areas
+    - knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
+    #- radar_contributions    # radar/spider chart with blended subtype colours
 
   # ── Tile sampling ──────────────────────────────────────────────────────────
   max_tiles_per_subtype: 2000   # cap for boxplots + ternary (fast pixel ops)

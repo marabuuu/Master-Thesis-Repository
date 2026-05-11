@@ -52,10 +52,13 @@ from .core import (
     setup_style,
 )
 from .spatial_metrics_viz import (
+    aggregate_metrics_per_patient,
+    compare_metrics_across_subtypes,
     compute_spatial_metrics_per_tile,
     plot_knn_metrics_comparison,
     plot_ripley_L_by_subtype,
     plot_voronoi_distribution,
+    run_subtype_tests,
 )
 
 try:
@@ -429,44 +432,41 @@ CELL_TYPE_ORDER = [
 ]
 
 
-def _collect_tissue_fractions(
+def _collect_tissue_fractions_by_patient(
     masks_dir: Path,
     patient_ids: List[str],
-    max_tiles: Optional[int],
+    max_per_patient: Optional[int],
     seed: int = 42,
-) -> np.ndarray:
-    """Return (N_tiles, n_channels) tissue-area fraction array.
+) -> Dict[str, np.ndarray]:
+    """Return ``{pid: (n_tiles, n_channels)}`` tissue-area fraction arrays.
 
     For each tile mask (C, H, W):
+
     1. Per-pixel argmax assigns each pixel to its most probable class.
     2. Each channel's pixel count is divided by the total **non-background**
        pixel count (channel 0 excluded), yielding fractions that sum to 1
        across channels 1–6.
     3. Tiles where no non-background pixels are found are dropped.
 
-    Normalising by non-background pixels removes the dominant background
-    channel (~90 % of tile area) and gives stable, comparable fractions
-    that directly reflect the tissue composition of each tile.
+    Patient ID is preserved as the outer key so callers can aggregate to
+    patient level before statistical testing (call :func:`_patient_medians`)
+    or flatten back to tile level for visualization (call
+    :func:`_flatten_pid_arrays`).
     """
     rng = np.random.default_rng(seed)
     n_ch_total = len(CHANNEL_NAMES)
-    all_fracs: List[np.ndarray] = []
-
-    per_patient: Optional[int] = (
-        max(1, int(np.ceil(max_tiles / len(patient_ids))))
-        if max_tiles is not None and len(patient_ids) > 0
-        else None
-    )
+    result: Dict[str, np.ndarray] = {}
 
     for pid in patient_ids:
         zip_path = masks_dir / f"{pid}.zip"
         if not zip_path.exists():
             continue
+        tile_fracs: List[np.ndarray] = []
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
-                if per_patient is not None and len(tile_names) > per_patient:
-                    chosen = rng.choice(len(tile_names), per_patient, replace=False)
+                if max_per_patient is not None and len(tile_names) > max_per_patient:
+                    chosen = rng.choice(len(tile_names), max_per_patient, replace=False)
                     tile_names = [tile_names[i] for i in chosen]
 
                 for name in tile_names:
@@ -475,33 +475,44 @@ def _collect_tissue_fractions(
                             mask = np.load(BytesIO(f.read()))
                         if mask.ndim == 2:
                             continue
-                        # Ensure (C, H, W)
                         if mask.ndim == 3 and mask.shape[0] >= mask.shape[1]:
                             mask = np.transpose(mask, (2, 0, 1))
 
                         n_ch = mask.shape[0]
                         pixel_classes = np.argmax(mask, axis=0).ravel()
                         counts = np.bincount(pixel_classes, minlength=n_ch).astype(float)
-
-                        # Normalise by non-background pixels only
                         total_tissue = counts[1:].sum()
                         if total_tissue == 0:
                             continue
                         fracs = counts / total_tissue
-                        all_fracs.append(fracs[:n_ch_total])
+                        tile_fracs.append(fracs[:n_ch_total])
                     except Exception:
                         logger.debug("Failed to load %s from %s", name, zip_path)
         except Exception:
             logger.debug("Failed to open %s", zip_path)
 
-    if not all_fracs:
-        return np.empty((0, n_ch_total), dtype=float)
+        if tile_fracs:
+            result[pid] = np.stack(tile_fracs)  # (n_tiles, n_ch)
+    return result
 
-    arr = np.stack(all_fracs)
-    if max_tiles is not None and arr.shape[0] > max_tiles:
-        idx = rng.choice(arr.shape[0], max_tiles, replace=False)
-        arr = arr[idx]
-    return arr
+
+def _flatten_pid_arrays(pid_to_tiles: Dict[str, np.ndarray]) -> np.ndarray:
+    """Concatenate ``{pid: (n_tiles, n_ch)}`` into a single ``(N, n_ch)`` array."""
+    arrays = [arr for arr in pid_to_tiles.values() if len(arr) > 0]
+    if not arrays:
+        return np.empty((0, len(CHANNEL_NAMES)), dtype=float)
+    return np.concatenate(arrays, axis=0)
+
+
+def _patient_medians(
+    pid_to_tiles: Dict[str, np.ndarray],
+) -> Dict[str, np.ndarray]:
+    """Aggregate ``{pid: (n_tiles, n_ch)}`` → ``{pid: (n_ch,)}`` via nanmedian."""
+    return {
+        pid: np.nanmedian(tiles, axis=0)
+        for pid, tiles in pid_to_tiles.items()
+        if len(tiles) > 0
+    }
 
 
 def build_cell_type_palette(
@@ -650,20 +661,30 @@ def plot_cell_type_boxplots(
 
     # --- Collect tissue-area fractions per subtype ---
     records: List[Dict] = []
+    pid_fracs_by_subtype: Dict[str, Dict[str, np.ndarray]] = {}
+
     for subtype in subtypes:
         pids = class_to_patients[subtype]
         if not pids:
             continue
         if verbose:
             print(f"  [{subtype}] Loading masks for {len(pids)} patients…")
-        fracs_arr = _collect_tissue_fractions(
-            masks_dir, pids, max_tiles_per_subtype, seed=seed,
+
+        per_patient = (
+            max(1, max_tiles_per_subtype // len(pids))
+            if max_tiles_per_subtype is not None else None
         )
-        if fracs_arr.shape[0] == 0:
+        pid_to_tiles = _collect_tissue_fractions_by_patient(
+            masks_dir, pids, per_patient, seed=seed,
+        )
+        if not pid_to_tiles:
             logger.warning("%s: no masks found in %s", subtype, masks_dir)
             continue
+
+        pid_fracs_by_subtype[subtype] = pid_to_tiles
+        fracs_arr = _flatten_pid_arrays(pid_to_tiles)
         if verbose:
-            print(f"  [{subtype}] {fracs_arr.shape[0]} tiles processed")
+            print(f"  [{subtype}] {fracs_arr.shape[0]} tiles from {len(pid_to_tiles)} patients")
 
         for tile_fracs in fracs_arr:
             for ch in ch_indices:
@@ -730,6 +751,26 @@ def plot_cell_type_boxplots(
     save_figure(fig, out, dpi=dpi)
     if verbose:
         print(f"[OK] Saved cell-type boxplots → {out}")
+
+    # --- Patient-level statistical tests (Kruskal-Wallis + pairwise MWU + BH FDR) ---
+    # One value per patient = median of that patient's tile fractions.
+    stats_results: Dict[str, Dict] = {}
+    for ch, ch_name in channels_to_plot:
+        patient_vals: Dict[str, np.ndarray] = {
+            subtype: np.array([
+                float(np.nanmedian(tiles[:, ch]))
+                for tiles in pid_to_tiles.values()
+                if ch < tiles.shape[1]
+            ])
+            for subtype, pid_to_tiles in pid_fracs_by_subtype.items()
+        }
+        stats_results[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
+
+    stats_path = output_dir / "tfd_cell_type_composition_stats.json"
+    with open(stats_path, "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved composition stats → {stats_path}")
 
 
 def _normalise_multichannel_mask(mask: np.ndarray) -> np.ndarray:
@@ -1146,10 +1187,17 @@ def plot_ternary_composition(
             continue
         if verbose:
             print(f"  [{subtype}] Loading masks for {len(pids)} patients…")
-        fracs_arr = _collect_tissue_fractions(masks_dir, pids, max_tiles_per_subtype, seed=seed)
-        if fracs_arr.shape[0] == 0:
+        per_patient = (
+            max(1, max_tiles_per_subtype // len(pids))
+            if max_tiles_per_subtype is not None else None
+        )
+        pid_to_tiles = _collect_tissue_fractions_by_patient(
+            masks_dir, pids, per_patient, seed=seed,
+        )
+        if not pid_to_tiles:
             logger.warning("%s: no masks found in %s", subtype, masks_dir)
             continue
+        fracs_arr = _flatten_pid_arrays(pid_to_tiles)
 
         epi  = fracs_arr[:, _EPITHELIUM_CH].copy()
         imm  = fracs_arr[:, sorted(_IMMUNE_CHANNELS)].sum(axis=1)
@@ -1230,30 +1278,30 @@ def plot_ternary_composition(
 # § 6  Spatial topology: nearest-neighbour distances
 # ===================================================================
 
-def _collect_spatial_stats(
+def _collect_spatial_stats_by_patient(
     masks_dir: Path,
     patient_ids: List[str],
     non_bg_channels: List[int],
-    max_tiles: Optional[int],
+    max_per_patient: Optional[int],
     seed: int = 42,
-) -> Dict[str, np.ndarray]:
-    """Return per-tile nearest-neighbour distances between cell types.
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Return ``{pid: {nn_intra, nn_cross}}`` nearest-neighbour distance arrays.
 
     For each tile:
+
     1. Per-pixel argmax assigns each pixel to the most probable class.
-    2. Connected-component centroids are extracted for each non-background
-       channel via ``scipy.ndimage``.
-    3. Two arrays are built:
+    2. Connected-component centroids are extracted per non-background channel
+       via ``scipy.ndimage`` (4-connected / von Neumann neighbourhood).
+    3. Two arrays are built per tile:
 
-       * ``nn_intra`` (N, n_ch): mean distance from each cell to its nearest
-         same-type neighbour.  ``NaN`` when fewer than 2 cells of that type
-         are present in the tile.
-       * ``nn_cross`` (N, n_ch, n_ch): ``[i, j]`` = mean distance from every
-         cell of type *i* to the nearest cell of type *j* (``NaN`` if either
-         type has zero cells; diagonal = intra-type, requires ≥ 2 cells).
+       * ``nn_intra`` ``(n_ch,)``: mean distance from each cell to its nearest
+         same-type neighbour (NaN when < 2 cells of that type are present).
+       * ``nn_cross`` ``(n_ch, n_ch)``: entry ``[i, j]`` = mean distance from
+         every cell of type *i* to the nearest cell of type *j* (NaN if either
+         type has zero cells; diagonal equals ``nn_intra``).
 
-    All distances are in pixels.  ``nn_intra`` equals the diagonal of
-    ``nn_cross``.
+    Patient ID is kept as the outer key so callers can compute patient-level
+    medians for statistical testing separately from flattening for visualization.
 
     Parameters
     ----------
@@ -1261,8 +1309,8 @@ def _collect_spatial_stats(
     patient_ids : list[str]
     non_bg_channels : list[int]
         Channel indices to analyse (typically 1–6; background excluded).
-    max_tiles : int or None
-        Total tile budget across all patients; ``None`` = use all.
+    max_per_patient : int or None
+        Tile budget per patient; ``None`` = use all tiles.
     seed : int
     """
     try:
@@ -1274,24 +1322,21 @@ def _collect_spatial_stats(
 
     rng = np.random.default_rng(seed)
     n_ch = len(non_bg_channels)
-    nn_intra_all: List[np.ndarray] = []
-    nn_cross_all: List[np.ndarray] = []
-
-    per_patient: Optional[int] = (
-        max(1, int(np.ceil(max_tiles / len(patient_ids))))
-        if max_tiles is not None and len(patient_ids) > 0
-        else None
-    )
+    result: Dict[str, Dict[str, np.ndarray]] = {}
 
     for pid in patient_ids:
         zip_path = masks_dir / f"{pid}.zip"
         if not zip_path.exists():
             continue
+
+        nn_intra_pid: List[np.ndarray] = []
+        nn_cross_pid: List[np.ndarray] = []
+
         try:
             with zipfile.ZipFile(zip_path, "r") as zf:
                 tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
-                if per_patient is not None and len(tile_names) > per_patient:
-                    chosen = rng.choice(len(tile_names), per_patient, replace=False)
+                if max_per_patient is not None and len(tile_names) > max_per_patient:
+                    chosen = rng.choice(len(tile_names), max_per_patient, replace=False)
                     tile_names = [tile_names[i] for i in chosen]
 
                 for name in tile_names:
@@ -1305,7 +1350,6 @@ def _collect_spatial_stats(
 
                         pixel_classes = np.argmax(mask, axis=0)
 
-                        # Centroids per channel via connected components
                         centroids: List[Optional[np.ndarray]] = []
                         for ch in non_bg_channels:
                             binary = (pixel_classes == ch)
@@ -1314,9 +1358,8 @@ def _collect_spatial_stats(
                                 centroids.append(None)
                                 continue
                             coms = nd_com(binary, labeled, list(range(1, n_comp + 1)))
-                            centroids.append(np.array(coms))  # (n_comp, 2) in (row, col)
+                            centroids.append(np.array(coms))
 
-                        # Cross-type NN matrix; diagonal = intra-type
                         nn_cross_tile = np.full((n_ch, n_ch), np.nan)
                         for i, cents_a in enumerate(centroids):
                             if cents_a is None or len(cents_a) == 0:
@@ -1333,29 +1376,22 @@ def _collect_spatial_stats(
                                 else:
                                     tree = KDTree(cents_b)
                                     dists, _ = tree.query(cents_a, k=1)
-                                    nn_cross_tile[i, j] = dists.mean()  # k=1 → 1D
+                                    nn_cross_tile[i, j] = dists.mean()
 
-                        nn_intra_all.append(np.diag(nn_cross_tile).copy())
-                        nn_cross_all.append(nn_cross_tile)
+                        nn_intra_pid.append(np.diag(nn_cross_tile).copy())
+                        nn_cross_pid.append(nn_cross_tile)
 
                     except Exception:
                         logger.debug("Spatial stats failed: %s in %s", name, zip_path)
         except Exception:
             logger.debug("Cannot open %s", zip_path)
 
-    if not nn_intra_all:
-        return {
-            "nn_intra": np.empty((0, n_ch), dtype=float),
-            "nn_cross": np.empty((0, n_ch, n_ch), dtype=float),
-        }
-
-    nn_intra_arr = np.stack(nn_intra_all)
-    nn_cross_arr = np.stack(nn_cross_all)
-    if max_tiles is not None and nn_intra_arr.shape[0] > max_tiles:
-        idx = rng.choice(nn_intra_arr.shape[0], max_tiles, replace=False)
-        nn_intra_arr = nn_intra_arr[idx]
-        nn_cross_arr = nn_cross_arr[idx]
-    return {"nn_intra": nn_intra_arr, "nn_cross": nn_cross_arr}
+        if nn_intra_pid:
+            result[pid] = {
+                "nn_intra": np.stack(nn_intra_pid),   # (n_tiles, n_ch)
+                "nn_cross": np.stack(nn_cross_pid),   # (n_tiles, n_ch, n_ch)
+            }
+    return result
 
 
 def _collect_spatial_stats_for_subtypes(
@@ -1367,28 +1403,71 @@ def _collect_spatial_stats_for_subtypes(
     seed: int = 42,
     verbose: bool = True,
 ) -> Dict[str, Dict[str, np.ndarray]]:
-    """Collect spatial NN stats for each subtype; returns ``{subtype: stats}``."""
+    """Collect spatial NN stats for each subtype.
+
+    Returns
+    -------
+    dict[subtype, dict] with keys:
+
+    * ``nn_intra``         ``(N_tiles, n_ch)``       — flat tile array for violin plots
+    * ``nn_cross``         ``(N_tiles, n_ch, n_ch)``  — flat tile array for heatmaps
+    * ``patient_nn_intra`` ``{pid: (n_ch,)}``         — per-patient medians for stats
+    * ``patient_nn_cross`` ``{pid: (n_ch, n_ch)}``    — per-patient medians for stats
+    """
     class_to_patients: Dict[str, List[str]] = {s: [] for s in subtypes}
     for p, st in patient_to_subtype.items():
         if st in class_to_patients:
             class_to_patients[st].append(p)
 
+    n_ch = len(non_bg_channels)
     stats_by_subtype: Dict[str, Dict[str, np.ndarray]] = {}
+
     for subtype in subtypes:
         pids = class_to_patients[subtype]
         if not pids:
             continue
         if verbose:
             print(f"  [{subtype}] Computing spatial NN stats ({len(pids)} patients)…")
-        stats = _collect_spatial_stats(
-            masks_dir, pids, non_bg_channels, max_tiles, seed=seed
+
+        per_patient = (
+            max(1, max_tiles // len(pids)) if max_tiles is not None else None
         )
-        if stats["nn_intra"].shape[0] == 0:
+        pid_stats = _collect_spatial_stats_by_patient(
+            masks_dir, pids, non_bg_channels, per_patient, seed=seed,
+        )
+        if not pid_stats:
             logger.warning("%s: no spatial stats collected", subtype)
             continue
-        stats_by_subtype[subtype] = stats
+
+        # Flatten for visualization
+        nn_intra_flat = np.concatenate(
+            [d["nn_intra"] for d in pid_stats.values()], axis=0
+        )
+        nn_cross_flat = np.concatenate(
+            [d["nn_cross"] for d in pid_stats.values()], axis=0
+        )
+
+        # Patient-level medians for statistical testing
+        patient_nn_intra = {
+            pid: np.nanmedian(d["nn_intra"], axis=0)  # (n_ch,)
+            for pid, d in pid_stats.items()
+        }
+        patient_nn_cross = {
+            pid: np.nanmedian(d["nn_cross"], axis=0)  # (n_ch, n_ch)
+            for pid, d in pid_stats.items()
+        }
+
+        stats_by_subtype[subtype] = {
+            "nn_intra":          nn_intra_flat,
+            "nn_cross":          nn_cross_flat,
+            "patient_nn_intra":  patient_nn_intra,
+            "patient_nn_cross":  patient_nn_cross,
+        }
         if verbose:
-            print(f"  [{subtype}] {stats['nn_intra'].shape[0]} tiles processed")
+            print(
+                f"  [{subtype}] {nn_intra_flat.shape[0]} tiles "
+                f"from {len(pid_stats)} patients"
+            )
     return stats_by_subtype
 
 
@@ -1401,11 +1480,18 @@ def _collect_spatial_topology_for_subtypes(
     n_bootstrap: int = 99,
     seed: int = 42,
     verbose: bool = True,
-) -> Dict[str, List[Dict[str, object]]]:
+) -> Dict[str, Dict[str, object]]:
     """Collect tile-level topology metrics for each subtype.
 
-    Returns a mapping ``{subtype: [tile_metrics, ...]}`` compatible with the
-    spatial summary plot functions in ``spatial_metrics_viz.py``.
+    Returns
+    -------
+    dict[subtype, dict] with keys:
+
+    * ``"tiles"``       ``list[dict]``            — flat tile metrics for visualization
+    * ``"per_patient"`` ``{pid: list[dict]}``     — per-patient tile lists for
+      patient-level aggregation and statistical testing via
+      :func:`~spatial_metrics_viz.aggregate_metrics_per_patient` and
+      :func:`~spatial_metrics_viz.compare_metrics_across_subtypes`.
     """
     rng = np.random.default_rng(seed)
     class_to_patients: Dict[str, List[str]] = {s: [] for s in subtypes}
@@ -1413,9 +1499,9 @@ def _collect_spatial_topology_for_subtypes(
         if st in class_to_patients:
             class_to_patients[st].append(p)
 
-    stats_by_subtype: Dict[str, List[Dict[str, object]]] = {}
+    stats_by_subtype: Dict[str, Dict[str, object]] = {}
     per_patient: Optional[int] = (
-        max(1, int(np.ceil(max_tiles / len(subtypes))))
+        max(1, max_tiles // len(subtypes))
         if max_tiles is not None and len(subtypes) > 0
         else None
     )
@@ -1427,11 +1513,12 @@ def _collect_spatial_topology_for_subtypes(
         if verbose:
             print(f"  [{subtype}] Computing spatial topology stats ({len(pids)} patients)…")
 
-        tile_metrics: List[Dict[str, object]] = []
+        per_patient_tiles: Dict[str, List[Dict[str, object]]] = {}
         for pid in pids:
             zip_path = masks_dir / f"{pid}.zip"
             if not zip_path.exists():
                 continue
+            pid_tile_metrics: List[Dict[str, object]] = []
             try:
                 with zipfile.ZipFile(zip_path, "r") as zf:
                     tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
@@ -1450,8 +1537,6 @@ def _collect_spatial_topology_for_subtypes(
                             if mask.ndim != 3:
                                 continue
 
-                            # Use the union of all non-background classes as the
-                            # foreground cell mask for topology metrics.
                             foreground = np.sum(mask[non_bg_channels, :, :], axis=0)
                             metrics = compute_spatial_metrics_per_tile(
                                 foreground,
@@ -1459,16 +1544,26 @@ def _collect_spatial_topology_for_subtypes(
                                 bounding_box=(foreground.shape[1], foreground.shape[0]),
                                 n_bootstrap=n_bootstrap,
                             )
-                            tile_metrics.append(metrics)
+                            pid_tile_metrics.append(metrics)
                         except Exception:
                             logger.debug("Topology stats failed: %s in %s", name, zip_path)
             except Exception:
                 logger.debug("Cannot open %s", zip_path)
 
-        if tile_metrics:
-            stats_by_subtype[subtype] = tile_metrics
+            if pid_tile_metrics:
+                per_patient_tiles[pid] = pid_tile_metrics
+
+        if per_patient_tiles:
+            all_tiles = [m for tiles in per_patient_tiles.values() for m in tiles]
+            stats_by_subtype[subtype] = {
+                "tiles":       all_tiles,
+                "per_patient": per_patient_tiles,
+            }
             if verbose:
-                print(f"  [{subtype}] {len(tile_metrics)} tiles processed")
+                print(
+                    f"  [{subtype}] {len(all_tiles)} tiles "
+                    f"from {len(per_patient_tiles)} patients"
+                )
 
     return stats_by_subtype
 
@@ -1587,6 +1682,27 @@ def plot_nn_distance_violins(
     if verbose:
         print(f"[OK] Saved NN distance violin plots → {out}")
 
+    # --- Patient-level statistical tests ---
+    nn_stats: Dict[str, Dict] = {}
+    for i, ch in enumerate(non_bg_channels):
+        ch_name = CHANNEL_NAMES[ch]
+        patient_vals: Dict[str, np.ndarray] = {
+            subtype: np.array([
+                float(v[i])
+                for v in stats_by_subtype[subtype].get("patient_nn_intra", {}).values()
+                if np.isfinite(v[i])
+            ])
+            for subtype in subtypes
+            if subtype in stats_by_subtype
+        }
+        nn_stats[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
+
+    stats_path = output_dir / "tfd_nn_distance_stats.json"
+    with open(stats_path, "w") as _f:
+        json.dump(nn_stats, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved NN distance stats → {stats_path}")
+
 
 def plot_cross_type_proximity_heatmaps(
     stats_by_subtype: Dict[str, Dict[str, np.ndarray]],
@@ -1647,13 +1763,21 @@ def plot_cross_type_proximity_heatmaps(
     except Exception:
         cmap = get_crameri_cmap(cmap_name)
 
-    # Per-subtype median cross-type distance matrix
+    # Per-subtype median cross-type distance matrix.
+    # Prefer patient-level medians (median of per-patient medians) to avoid
+    # patients with many tiles dominating the result.
     matrices: Dict[str, np.ndarray] = {}
     for subtype in subtypes:
         if subtype not in stats_by_subtype:
             continue
-        nn_cross = stats_by_subtype[subtype]["nn_cross"]  # (N, n_ch, n_ch)
-        matrices[subtype] = np.nanmedian(nn_cross, axis=0)
+        patient_cross = stats_by_subtype[subtype].get("patient_nn_cross", {})
+        if patient_cross:
+            mat_stack = np.stack(list(patient_cross.values()))  # (n_patients, n_ch, n_ch)
+            matrices[subtype] = np.nanmedian(mat_stack, axis=0)
+        else:
+            matrices[subtype] = np.nanmedian(
+                stats_by_subtype[subtype]["nn_cross"], axis=0
+            )
 
     if not matrices:
         logger.error("No cross-type proximity data — skipping heatmaps.")
@@ -1710,7 +1834,7 @@ def plot_cross_type_proximity_heatmaps(
 
     fig.suptitle(
         "Cross–Cell-Type Nearest-Neighbour Distances per PAM50 Subtype\n"
-        "row = source type  ·  col = target type  ·  median over tiles (px)",
+        "row = source type  ·  col = target type  ·  median of patient medians (px)",
         fontsize=11, y=1.03,
     )
     fig.tight_layout()
@@ -1719,6 +1843,30 @@ def plot_cross_type_proximity_heatmaps(
     save_figure(fig, out, dpi=dpi)
     if verbose:
         print(f"[OK] Saved cross-type proximity heatmaps → {out}")
+
+    # --- Patient-level statistical tests for each (source, target) cell-type pair ---
+    cross_stats: Dict[str, Dict] = {}
+    for i, src in enumerate(ch_labels):
+        for j, tgt in enumerate(ch_labels):
+            if i == j:
+                continue  # intra-type distances are covered by nn_distance_stats
+            key = f"{src}_to_{tgt}"
+            patient_vals: Dict[str, np.ndarray] = {
+                subtype: np.array([
+                    float(mat[i, j])
+                    for mat in stats_by_subtype[subtype].get("patient_nn_cross", {}).values()
+                    if np.isfinite(mat[i, j])
+                ])
+                for subtype in subtypes
+                if subtype in stats_by_subtype
+            }
+            cross_stats[key] = run_subtype_tests(patient_vals, metric_name=key)
+
+    stats_path = output_dir / "tfd_cross_type_proximity_stats.json"
+    with open(stats_path, "w") as _f:
+        json.dump(cross_stats, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved cross-type proximity stats → {stats_path}")
 
 
 # ===================================================================
@@ -1967,7 +2115,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
 
             # The newer spatial summary plots need tile-level topology metrics,
             # so we collect them separately from the NN summary stats.
-            _topology_stats: Optional[Dict[str, List[Dict[str, object]]]] = None
+            _topology_stats: Optional[Dict[str, Dict[str, object]]] = None
             if "ripley_L_by_subtype" in plots:
                 if verbose:
                     print("\n[TFD-Viz] Generating Ripley L(r) curves by subtype…")
@@ -2026,3 +2174,21 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     output_dir=output_dir,
                     dpi=dpi,
                 )
+
+            # After all topology plots are done, run patient-level stats
+            if _topology_stats is not None:
+                if verbose:
+                    print("\n[TFD-Viz] Computing topology statistical tests…")
+                subtype_patient_metrics = {
+                    subtype: {
+                        pid: aggregate_metrics_per_patient(tile_list)
+                        for pid, tile_list in subtype_data["per_patient"].items()
+                    }
+                    for subtype, subtype_data in _topology_stats.items()
+                }
+                topo_test_results = compare_metrics_across_subtypes(subtype_patient_metrics)
+                topo_stats_path = output_dir / "tfd_topology_stats.json"
+                with open(topo_stats_path, "w") as _f:
+                    json.dump(topo_test_results, _f, indent=2)
+                if verbose:
+                    print(f"[OK] Saved topology stats → {topo_stats_path}")

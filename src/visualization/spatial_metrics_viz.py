@@ -21,7 +21,7 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
-from ..spatial_metrics import (
+from ..statistics.spatial_metrics import (
     compute_ripley_L_bootstrap,
     compute_voronoi_areas,
     compute_knn_metrics,
@@ -145,96 +145,192 @@ def compute_spatial_metrics_per_tile(
 def aggregate_metrics_per_patient(
     tile_metrics_list: List[Dict],
 ) -> Dict[str, float]:
-    """Aggregate per-tile metrics to patient level (median + quartiles).
-    
+    """Aggregate per-tile topology metrics to a single patient-level summary.
+
     Parameters
     ----------
     tile_metrics_list : list[dict]
-        Output from compute_spatial_metrics_per_tile for each tile.
-    
+        Output from :func:`compute_spatial_metrics_per_tile` for each tile
+        belonging to one patient.
+
     Returns
     -------
-    patient_metrics : dict
-        'voronoi_median_area_median': float
-        'voronoi_std_area_median': float
-        'knn_mean_degree_median': float
-        'knn_mean_clustering_median': float
-        'knn_largest_component_frac_median': float
-        'n_tiles': int
-        ... (percentiles and counts)
+    dict
+        Keys: ``{metric}_median``, ``{metric}_q1``, ``{metric}_q3``,
+        ``{metric}_count``, and ``n_tiles`` for the five scalar topology
+        metrics (Voronoi area, kNN clustering, etc.).
     """
     if not tile_metrics_list:
         return {}
-    
-    agg = {}
-    for key in ['voronoi_median_area', 'voronoi_std_area', 'knn_mean_degree',
-                'knn_mean_clustering', 'knn_largest_component_frac']:
+
+    agg: Dict[str, float] = {}
+    for key in [
+        "voronoi_median_area", "voronoi_std_area",
+        "knn_mean_degree", "knn_mean_clustering",
+        "knn_largest_component_frac",
+    ]:
         vals = [m[key] for m in tile_metrics_list if np.isfinite(m.get(key, np.nan))]
         if vals:
-            agg[f'{key}_median'] = float(np.median(vals))
-            agg[f'{key}_q1'] = float(np.percentile(vals, 25))
-            agg[f'{key}_q3'] = float(np.percentile(vals, 75))
-            agg[f'{key}_count'] = len(vals)
-    
-    agg['n_tiles'] = len(tile_metrics_list)
+            agg[f"{key}_median"] = float(np.median(vals))
+            agg[f"{key}_q1"]     = float(np.percentile(vals, 25))
+            agg[f"{key}_q3"]     = float(np.percentile(vals, 75))
+            agg[f"{key}_count"]  = len(vals)
+
+    agg["n_tiles"] = len(tile_metrics_list)
     return agg
 
 
-def compare_metrics_across_subtypes(
-    subtype_metrics: Dict[str, Dict[str, float]],
-) -> Dict[str, Dict]:
-    """Statistical comparison of aggregated metrics across subtypes.
-    
+# ---------------------------------------------------------------------------
+# BH FDR helper (statsmodels preferred; Bonferroni fallback)
+# ---------------------------------------------------------------------------
+
+try:
+    from statsmodels.stats.multitest import multipletests as _sm_multipletests
+
+    def _fdr_bh(pvals: List[float]) -> np.ndarray:
+        if not pvals:
+            return np.array([])
+        _, q, _, _ = _sm_multipletests(pvals, method="fdr_bh")
+        return np.asarray(q)
+
+except ImportError:
+    def _fdr_bh(pvals: List[float]) -> np.ndarray:  # type: ignore[misc]
+        """Bonferroni correction as fallback when statsmodels is unavailable."""
+        if not pvals:
+            return np.array([])
+        return np.minimum(np.asarray(pvals) * len(pvals), 1.0)
+
+
+def run_subtype_tests(
+    patient_vals_by_subtype: Dict[str, np.ndarray],
+    metric_name: str = "",
+    alpha: float = 0.05,
+) -> Dict:
+    """Kruskal-Wallis + pairwise Mann-Whitney U with Benjamini-Hochberg FDR.
+
+    The unit of observation is **one value per patient** (typically the
+    median of tile-level measurements within that patient).  This avoids
+    pseudo-replication from pooling tiles directly.
+
     Parameters
     ----------
-    subtype_metrics : dict[str, dict]
-        Per-subtype aggregated metrics (output of aggregate_metrics_per_patient).
-    
+    patient_vals_by_subtype : {subtype: (n_patients,)}
+        One finite scalar per patient per subtype.  NaN entries are dropped.
+        Groups with fewer than 3 valid patients are excluded.
+    metric_name : str
+        Label stored in the result dict for traceability.
+    alpha : float
+        Significance threshold for ``significant_pairs``.
+
     Returns
     -------
-    comparisons : dict
-        Pairwise Kruskal–Wallis and Mann–Whitney U test results.
+    dict with keys:
+        ``metric``, ``n_patients``, ``kruskal_H``, ``kruskal_p``,
+        ``pairwise_q`` ({"{s1}_vs_{s2}": q}), ``significant_pairs``.
     """
-    comparisons = {}
-    metrics_to_test = [
-        'voronoi_median_area', 'voronoi_std_area', 'knn_mean_degree',
-        'knn_mean_clustering', 'knn_largest_component_frac'
-    ]
-    
-    for metric in metrics_to_test:
-        vals_by_subtype = {}
-        for subtype, metrics_dict in subtype_metrics.items():
-            key = f'{metric}_median'
-            if key in metrics_dict:
-                vals_by_subtype[subtype] = metrics_dict[key]
-        
-        if len(vals_by_subtype) < 2:
-            continue
-        
-        # Kruskal–Wallis test
-        all_vals = [vals_by_subtype[s] for s in sorted(vals_by_subtype)]
-        h_stat, h_pval = stats.kruskal(*all_vals) if len(all_vals) > 1 else (np.nan, np.nan)
-        
-        comparisons[metric] = {
-            'kruskal_wallis_h': h_stat,
-            'kruskal_wallis_pval': h_pval,
-            'per_subtype_median': vals_by_subtype,
+    from scipy.stats import kruskal, mannwhitneyu
+
+    valid = {
+        s: arr[np.isfinite(arr)]
+        for s, arr in patient_vals_by_subtype.items()
+        if np.isfinite(np.asarray(arr, dtype=float)).sum() >= 3
+    }
+    if len(valid) < 2:
+        return {"metric": metric_name, "error": "fewer than 2 groups with ≥3 patients"}
+
+    subtypes = list(valid.keys())
+    groups   = [valid[s] for s in subtypes]
+
+    h_stat, p_kw = kruskal(*groups)
+
+    pairs:  List[tuple] = []
+    raw_p:  List[float] = []
+    for i, s1 in enumerate(subtypes):
+        for s2 in subtypes[i + 1:]:
+            _, p = mannwhitneyu(valid[s1], valid[s2], alternative="two-sided")
+            pairs.append((s1, s2))
+            raw_p.append(float(p))
+
+    q_vals      = _fdr_bh(raw_p)
+    pairwise_q  = {f"{a}_vs_{b}": float(q) for (a, b), q in zip(pairs, q_vals)}
+
+    return {
+        "metric":           metric_name,
+        "n_patients":       {s: int(len(v)) for s, v in valid.items()},
+        "kruskal_H":        float(h_stat),
+        "kruskal_p":        float(p_kw),
+        "pairwise_q":       pairwise_q,
+        "significant_pairs": [k for k, q in pairwise_q.items() if q < alpha],
+    }
+
+
+def compare_metrics_across_subtypes(
+    subtype_patient_metrics: Dict[str, Dict[str, Dict[str, float]]],
+    metrics: Optional[List[str]] = None,
+    alpha: float = 0.05,
+) -> Dict[str, Dict]:
+    """Statistical comparison of topology metrics across PAM50 subtypes.
+
+    Parameters
+    ----------
+    subtype_patient_metrics : {subtype: {pid: aggregate_dict}}
+        Per-patient aggregated metrics from :func:`aggregate_metrics_per_patient`,
+        grouped by subtype.  Each inner dict is the output for one patient.
+    metrics : list[str] or None
+        Metric base names to test.  Defaults to the four key topology scalars.
+    alpha : float
+
+    Returns
+    -------
+    {metric_name: :func:`run_subtype_tests` result dict}
+    """
+    if metrics is None:
+        metrics = [
+            "voronoi_median_area",
+            "voronoi_std_area",
+            "knn_mean_clustering",
+            "knn_largest_component_frac",
+        ]
+
+    results: Dict[str, Dict] = {}
+    for metric in metrics:
+        key = f"{metric}_median"
+        patient_vals: Dict[str, np.ndarray] = {
+            subtype: np.array([
+                pid_dict[key]
+                for pid_dict in pid_to_dict.values()
+                if np.isfinite(pid_dict.get(key, np.nan))
+            ])
+            for subtype, pid_to_dict in subtype_patient_metrics.items()
         }
-    
-    return comparisons
+        results[metric] = run_subtype_tests(patient_vals, metric_name=metric, alpha=alpha)
+    return results
+
+
+def _tile_list(subtype_result: Union[List[Dict], Dict]) -> List[Dict]:
+    """Extract the flat tile list from either format.
+
+    Accepts the old format (plain ``list[dict]``) or the new enriched format
+    (``{"tiles": list[dict], "per_patient": {pid: list[dict]}}``).
+    """
+    if isinstance(subtype_result, dict):
+        return subtype_result.get("tiles", [])
+    return subtype_result  # type: ignore[return-value]
 
 
 def plot_ripley_L_by_subtype(
-    results: Dict[str, List[Dict]],
+    results: Dict[str, Union[List[Dict], Dict]],
     output_dir: Union[str, Path],
     dpi: int = 150,
 ) -> None:
     """Plot Ripley's L(r) curves with CSR envelope for each subtype.
-    
+
     Parameters
     ----------
-    results : dict[str, list[dict]]
-        Per-subtype list of tile-level metrics (from compute_spatial_metrics_per_tile).
+    results : dict[str, list[dict] | dict]
+        Per-subtype tile-level metrics from
+        :func:`~tfd_separability._collect_spatial_topology_for_subtypes`.
+        Accepts both the old flat-list format and the new enriched dict format.
     output_dir : path
     dpi : int
     """
@@ -243,16 +339,17 @@ def plot_ripley_L_by_subtype(
     except ImportError:
         logger.warning("matplotlib not available; skipping Ripley plot.")
         return
-    
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     n_subtypes = len(results)
     fig, axes = plt.subplots(1, n_subtypes, figsize=(n_subtypes * 4, 4), sharex=True, sharey=True)
     if n_subtypes == 1:
         axes = [axes]
-    
-    for ax, (subtype, tile_list) in zip(axes, sorted(results.items())):
+
+    for ax, (subtype, subtype_data) in zip(axes, sorted(results.items())):
+        tile_list = _tile_list(subtype_data)
         # Collect L curves from all tiles
         radii_all = []
         L_obs_all = []
@@ -298,16 +395,17 @@ def plot_ripley_L_by_subtype(
 
 
 def plot_voronoi_distribution(
-    results: Dict[str, List[Dict]],
+    results: Dict[str, Union[List[Dict], Dict]],
     output_dir: Union[str, Path],
     dpi: int = 150,
 ) -> None:
     """Plot Voronoi cell area distributions per subtype.
-    
+
     Parameters
     ----------
-    results : dict[str, list[dict]]
-        Per-subtype tile metrics.
+    results : dict[str, list[dict] | dict]
+        Per-subtype tile metrics (flat list or enriched dict — see
+        :func:`_tile_list`).
     output_dir : path
     dpi : int
     """
@@ -317,46 +415,46 @@ def plot_voronoi_distribution(
     except ImportError:
         logger.warning("matplotlib/seaborn not available; skipping Voronoi plot.")
         return
-    
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     records = []
-    for subtype, tile_list in results.items():
-        for tile_dict in tile_list:
-            areas = tile_dict['voronoi_areas']
-            for area in areas:
+    for subtype, subtype_data in results.items():
+        for tile_dict in _tile_list(subtype_data):
+            for area in tile_dict["voronoi_areas"]:
                 if np.isfinite(area):
-                    records.append({'Subtype': subtype, 'Voronoi Area (px²)': area})
-    
+                    records.append({"Subtype": subtype, "Voronoi Area (px²)": area})
+
     if not records:
         logger.warning("No Voronoi data to plot.")
         return
-    
+
     df = pd.DataFrame(records)
-    
+
     fig, ax = plt.subplots(figsize=(10, 5))
-    sns.violinplot(data=df, x='Subtype', y='Voronoi Area (px²)', ax=ax, palette='Set2')
+    sns.violinplot(data=df, x="Subtype", y="Voronoi Area (px²)", ax=ax, palette="Set2")
     ax.set_ylabel("Voronoi Cell Area (px²)")
     ax.set_title("Cell Dispersion: Voronoi Area Distribution per PAM50 Subtype")
     fig.tight_layout()
     out = output_dir / "spatial_voronoi_areas_by_subtype.png"
-    fig.savefig(out, dpi=dpi, bbox_inches='tight')
+    fig.savefig(out, dpi=dpi, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved Voronoi plot → {out}")
 
 
 def plot_knn_metrics_comparison(
-    results: Dict[str, List[Dict]],
+    results: Dict[str, Union[List[Dict], Dict]],
     output_dir: Union[str, Path],
     dpi: int = 150,
 ) -> None:
-    """Plot kNN metrics (clustering coeff, degree) distributions per subtype.
-    
+    """Plot kNN graph metrics (clustering coeff, largest component) per subtype.
+
     Parameters
     ----------
-    results : dict[str, list[dict]]
-        Per-subtype tile metrics.
+    results : dict[str, list[dict] | dict]
+        Per-subtype tile metrics (flat list or enriched dict — see
+        :func:`_tile_list`).
     output_dir : path
     dpi : int
     """
@@ -366,36 +464,38 @@ def plot_knn_metrics_comparison(
     except ImportError:
         logger.warning("matplotlib/seaborn not available; skipping kNN plot.")
         return
-    
+
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
-    
+
     records = []
-    for subtype, tile_list in results.items():
-        for tile_dict in tile_list:
+    for subtype, subtype_data in results.items():
+        for tile_dict in _tile_list(subtype_data):
             records.append({
-                'Subtype': subtype,
-                'kNN Mean Clustering Coeff': tile_dict['knn_mean_clustering'],
-                'kNN Mean Degree': tile_dict['knn_mean_degree'],
-                'Largest Component Frac': tile_dict['knn_largest_component_frac'],
+                "Subtype":                  subtype,
+                "kNN Mean Clustering Coeff": tile_dict["knn_mean_clustering"],
+                "kNN Mean Degree":           tile_dict["knn_mean_degree"],
+                "Largest Component Frac":    tile_dict["knn_largest_component_frac"],
             })
-    
+
     if not records:
         logger.warning("No kNN data to plot.")
         return
-    
+
     df = pd.DataFrame(records)
-    
+
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
-    
-    for ax, col in zip(axes, ['kNN Mean Clustering Coeff', 'kNN Mean Degree', 'Largest Component Frac']):
-        sns.boxplot(data=df, x='Subtype', y=col, ax=ax, palette='Set2')
+    for ax, col in zip(
+        axes,
+        ["kNN Mean Clustering Coeff", "kNN Mean Degree", "Largest Component Frac"],
+    ):
+        sns.boxplot(data=df, x="Subtype", y=col, ax=ax, palette="Set2")
         ax.set_ylabel(col)
         ax.set_title(f"{col} by Subtype")
-    
+
     fig.suptitle("kNN Graph Metrics per PAM50 Subtype", fontsize=11, y=1.02)
     fig.tight_layout()
     out = output_dir / "spatial_knn_metrics_by_subtype.png"
-    fig.savefig(out, dpi=dpi, bbox_inches='tight')
+    fig.savefig(out, dpi=dpi, bbox_inches="tight")
     plt.close()
     logger.info(f"Saved kNN metrics plot → {out}")
