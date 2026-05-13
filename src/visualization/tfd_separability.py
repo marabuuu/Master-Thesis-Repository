@@ -111,6 +111,19 @@ CHANNEL_NAMES: Dict[int, str] = {
 #: Canonical display order for PAM50 subtypes
 PAM50_ORDER = ["Basal", "Her2", "LumA", "LumB", "Normal"]
 
+ALL_TFD_VIZ_PLOTS = [
+    "channel_contributions",
+    "radar_contributions",
+    "cell_type_boxplots",
+    "tile_mask_examples",
+    "ternary_composition",
+    "nn_distance_violins",
+    "cross_type_proximity",
+    "ripley_L_by_subtype",
+    "voronoi_distribution",
+    "knn_metrics",
+]
+
 
 # ===================================================================
 # § 1  Channel contribution heatmap
@@ -488,8 +501,10 @@ def _collect_tissue_fractions_by_patient(
                         tile_fracs.append(fracs[:n_ch_total])
                     except Exception:
                         logger.debug("Failed to load %s from %s", name, zip_path)
-        except Exception:
-            logger.debug("Failed to open %s", zip_path)
+        except (zipfile.BadZipFile, OSError) as e:
+            logger.warning("Corrupted or unreadable mask zip file %s: %s. Skipping.", zip_path, e)
+        except Exception as e:
+            logger.debug("Failed to open %s: %s", zip_path, e)
 
         if tile_fracs:
             result[pid] = np.stack(tile_fracs)  # (n_tiles, n_ch)
@@ -556,6 +571,19 @@ def _build_cell_type_palette(
         cmap_name=cmap_name,
     )
     return {label: palette[label] for label in ch_labels if label in palette}
+
+
+def _build_high_contrast_mask_palette() -> Dict[str, str]:
+    """Return a high-contrast fixed palette for discrete mask rendering."""
+    return {
+        "Background": "#2b2b2b",
+        "Neutrophils": "#e69f00",
+        "Epithelium": "#56b4e9",
+        "Lymphocytes": "#009e73",
+        "Plasma Cells": "#f0e442",
+        "Eosinophils": "#0072b2",
+        "Connective": "#d55e00",
+    }
 
 
 def plot_cell_type_boxplots(
@@ -725,8 +753,10 @@ def plot_cell_type_boxplots(
             data=subset,
             x="Cell Type",
             y="Tissue Fraction",
+            hue="Cell Type",
             order=present,
             palette=cell_type_palette,
+            legend=False,
             linewidth=0.8,
             fliersize=1.5,
             flierprops=dict(alpha=0.3, marker="o", markersize=1.5),
@@ -813,8 +843,12 @@ def _find_zip_member(
 
 
 def _count_mask_tiles(mask_zip_path: Path) -> int:
-    with zipfile.ZipFile(mask_zip_path, "r") as zf:
-        return sum(name.endswith("_cls.npy") for name in zf.namelist())
+    try:
+        with zipfile.ZipFile(mask_zip_path, "r") as zf:
+            return sum(name.endswith("_cls.npy") for name in zf.namelist())
+    except (zipfile.BadZipFile, OSError, Exception) as e:
+        logger.warning("Corrupted or unreadable mask zip file %s: %s. Skipping.", mask_zip_path, e)
+        return 0
 
 
 def _select_example_from_mask_zip(
@@ -823,47 +857,49 @@ def _select_example_from_mask_zip(
 ) -> Optional[Dict[str, object]]:
     """Pick the most tissue-rich tile from one patient mask ZIP."""
     best: Optional[Dict[str, object]] = None
-    with zipfile.ZipFile(mask_zip_path, "r") as mask_zip:
-        mask_names = sorted(name for name in mask_zip.namelist() if name.endswith("_cls.npy"))
-        for mask_member in mask_names:
-            if "__tile_" not in mask_member:
-                continue
-            sample_prefix, remainder = mask_member.split("__tile_", 1)
-            tile_stem = f"tile_{remainder.removesuffix('_cls.npy')}"
-            tile_zip_path = tiles_dir / f"{sample_prefix}.zip"
-            if not tile_zip_path.exists():
-                continue
+    try:
+        with zipfile.ZipFile(mask_zip_path, "r") as mask_zip:
+            mask_names = sorted(name for name in mask_zip.namelist() if name.endswith("_cls.npy"))
+            for mask_member in mask_names:
+                if "__tile_" not in mask_member:
+                    continue
+                sample_prefix, remainder = mask_member.split("__tile_", 1)
+                tile_stem = f"tile_{remainder.removesuffix('_cls.npy')}"
+                tile_zip_path = tiles_dir / f"{sample_prefix}.zip"
+                if not tile_zip_path.exists():
+                    continue
 
-            with mask_zip.open(mask_member) as handle:
-                mask = np.load(handle)
-            labels = _mask_to_label_image(mask)
-            foreground_fraction = float(np.mean(labels > 0))
+                with mask_zip.open(mask_member) as handle:
+                    mask = np.load(handle)
+                labels = _mask_to_label_image(mask)
+                foreground_fraction = float(np.mean(labels > 0))
 
-            if best is None or foreground_fraction > float(best["foreground_fraction"]):
-                with zipfile.ZipFile(tile_zip_path, "r") as tile_zip:
-                    tile_member = _find_zip_member(
-                        zip_names=tile_zip.namelist(),
-                        sample_prefix=sample_prefix,
-                        tile_stem=tile_stem,
-                        suffixes=(".png", ".jpg", ".jpeg", ".tif", ".tiff"),
-                    )
-                    if tile_member is None:
-                        continue
-                    with tile_zip.open(tile_member) as tile_handle:
-                        tile_img = Image.open(tile_handle).convert("RGB")
-                        tile_img.load()
+                if best is None or foreground_fraction > float(best["foreground_fraction"]):
+                    with zipfile.ZipFile(tile_zip_path, "r") as tile_zip:
+                        tile_member = _find_zip_member(
+                            zip_names=tile_zip.namelist(),
+                            sample_prefix=sample_prefix,
+                            tile_stem=tile_stem,
+                            suffixes=(".png", ".jpg", ".jpeg", ".tif", ".tiff"),
+                        )
+                        if tile_member is None:
+                            continue
+                        with tile_zip.open(tile_member) as tile_handle:
+                            tile_img = Image.open(tile_handle).convert("RGB")
+                            tile_img.load()
 
-                best = {
-                    "sample_prefix": sample_prefix,
-                    "tile_member": tile_member,
-                    "mask_member": mask_member,
-                    "tile_zip_path": tile_zip_path,
-                    "mask_zip_path": mask_zip_path,
-                    "tile_image": tile_img,
-                    "mask_labels": labels,
-                    "foreground_fraction": foreground_fraction,
-                }
-
+                    best = {
+                        "sample_prefix": sample_prefix,
+                        "tile_member": tile_member,
+                        "mask_member": mask_member,
+                        "tile_zip_path": tile_zip_path,
+                        "mask_zip_path": mask_zip_path,
+                        "tile_image": tile_img,
+                        "mask_labels": labels,
+                        "foreground_fraction": foreground_fraction,
+                    }
+    except (zipfile.BadZipFile, OSError, Exception) as e:
+        logger.warning("Corrupted or unreadable mask zip file %s: %s. Skipping.", mask_zip_path, e)
     return best
 
 
@@ -961,7 +997,7 @@ def plot_tile_mask_examples(
     if figsize is None:
         figsize = (max(12.0, 3.8 * n_cols), 7.5)
 
-    palette = build_cell_type_palette(include_background=True, cmap_name=cmap_name)
+    palette = _build_high_contrast_mask_palette()
     cmap_values = [palette[CHANNEL_NAMES[i]] for i in range(7)]
     cmap = ListedColormap(cmap_values, name="cell_types_fixed")
 
@@ -1576,6 +1612,7 @@ def plot_nn_distance_violins(
     cell_type_cmap: str = CELL_TYPE_CMAP,
     figsize: Optional[Tuple[float, float]] = None,
     dpi: int = 200,
+    log_scale: bool = True,
     verbose: bool = True,
 ) -> None:
     """Save violin plots of intra-type nearest-neighbour distances per subtype.
@@ -1667,6 +1704,10 @@ def plot_nn_distance_violins(
         ax.set_xlabel("")
         ax.set_ylabel("Mean NN distance (px)" if col_idx == 0 else "")
         ax.tick_params(axis="x", labelrotation=40)
+        if log_scale:
+            ax.set_yscale("log")
+            if col_idx == 0:
+                ax.set_ylabel("Mean NN distance (px, log scale)")
         if col_idx > 0:
             ax.tick_params(axis="y", labelleft=False)
 
@@ -1829,7 +1870,7 @@ def plot_cross_type_proximity_heatmaps(
                         fontsize=7, color=txt_col)
 
     if im_ref is not None:
-        cbar = fig.colorbar(im_ref, ax=axes[0, -1], fraction=0.046, pad=0.10)
+        cbar = fig.colorbar(im_ref, ax=axes.ravel().tolist(), fraction=0.046, pad=0.02)
         cbar.set_label("Median NN distance (px)", fontsize=9)
 
     fig.suptitle(
@@ -1925,7 +1966,22 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
     output_dir = Path(cfg["output_dir"])
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    plots = cfg.get("plots", ["channel_contributions", "radar_contributions", "cell_type_boxplots"])
+    plots_cfg = cfg.get("plots")
+    if plots_cfg is None:
+        plots = ["channel_contributions", "radar_contributions", "cell_type_boxplots"]
+    elif isinstance(plots_cfg, str):
+        if plots_cfg.lower() in {"all", "*", "true"}:
+            plots = list(ALL_TFD_VIZ_PLOTS)
+        else:
+            plots = [plots_cfg]
+    else:
+        plots = list(plots_cfg)
+        if any(str(p).lower() in {"all", "*", "true"} for p in plots):
+            plots = list(ALL_TFD_VIZ_PLOTS)
+
+    # Keep order deterministic and drop invalid labels silently.
+    _plot_set = {str(p) for p in plots}
+    plots = [p for p in ALL_TFD_VIZ_PLOTS if p in _plot_set]
     dpi = cfg.get("dpi", 200)
 
     if "radar_contributions" in plots:
@@ -2095,6 +2151,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     cell_type_cmap=cfg.get("cmap_cell_types", CELL_TYPE_CMAP),
                     figsize=figsize,
                     dpi=dpi,
+                    log_scale=cfg.get("nn_violins_log_scale", True),
                     verbose=verbose,
                 )
 
@@ -2153,6 +2210,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 plot_voronoi_distribution(
                     results=_topology_stats,
                     output_dir=output_dir,
+                    cmap_name=cfg.get("cmap_categorical", CATEGORICAL_CMAP),
                     dpi=dpi,
                 )
 
@@ -2172,6 +2230,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 plot_knn_metrics_comparison(
                     results=_topology_stats,
                     output_dir=output_dir,
+                    cmap_name=cfg.get("cmap_categorical", CATEGORICAL_CMAP),
                     dpi=dpi,
                 )
 

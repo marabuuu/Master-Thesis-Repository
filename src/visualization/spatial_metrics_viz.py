@@ -21,6 +21,8 @@ import numpy as np
 import pandas as pd
 from scipy import stats
 
+from .core import CATEGORICAL_CMAP, build_label_palette
+
 from ..statistics.spatial_metrics import (
     compute_ripley_L_bootstrap,
     compute_voronoi_areas,
@@ -28,6 +30,15 @@ from ..statistics.spatial_metrics import (
 )
 
 logger = logging.getLogger(__name__)
+
+PAM50_ORDER = ["Basal", "Her2", "LumA", "LumB", "Normal"]
+
+
+def _ordered_subtypes(values: List[str]) -> List[str]:
+    """Return PAM50-canonical subtype order with unknown labels appended."""
+    ordered = [s for s in PAM50_ORDER if s in values]
+    ordered += [s for s in values if s not in PAM50_ORDER]
+    return ordered
 
 
 def compute_spatial_metrics_per_tile(
@@ -397,6 +408,7 @@ def plot_ripley_L_by_subtype(
 def plot_voronoi_distribution(
     results: Dict[str, Union[List[Dict], Dict]],
     output_dir: Union[str, Path],
+    cmap_name: str = CATEGORICAL_CMAP,
     dpi: int = 150,
 ) -> None:
     """Plot Voronoi cell area distributions per subtype.
@@ -431,9 +443,20 @@ def plot_voronoi_distribution(
         return
 
     df = pd.DataFrame(records)
+    subtypes = _ordered_subtypes(df["Subtype"].dropna().astype(str).unique().tolist())
+    palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
 
     fig, ax = plt.subplots(figsize=(10, 5))
-    sns.violinplot(data=df, x="Subtype", y="Voronoi Area (px²)", ax=ax, palette="Set2")
+    sns.violinplot(
+        data=df,
+        x="Subtype",
+        y="Voronoi Area (px²)",
+        hue="Subtype",
+        order=subtypes,
+        palette=palette,
+        legend=False,
+        ax=ax,
+    )
     ax.set_ylabel("Voronoi Cell Area (px²)")
     ax.set_title("Cell Dispersion: Voronoi Area Distribution per PAM50 Subtype")
     fig.tight_layout()
@@ -446,6 +469,7 @@ def plot_voronoi_distribution(
 def plot_knn_metrics_comparison(
     results: Dict[str, Union[List[Dict], Dict]],
     output_dir: Union[str, Path],
+    cmap_name: str = CATEGORICAL_CMAP,
     dpi: int = 150,
 ) -> None:
     """Plot kNN graph metrics (clustering coeff, largest component) per subtype.
@@ -483,15 +507,44 @@ def plot_knn_metrics_comparison(
         return
 
     df = pd.DataFrame(records)
+    subtypes = _ordered_subtypes(df["Subtype"].dropna().astype(str).unique().tolist())
+    palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
 
     fig, axes = plt.subplots(1, 3, figsize=(14, 4))
     for ax, col in zip(
         axes,
         ["kNN Mean Clustering Coeff", "kNN Mean Degree", "Largest Component Frac"],
     ):
-        sns.boxplot(data=df, x="Subtype", y=col, ax=ax, palette="Set2")
+        metric_df = df[np.isfinite(df[col])]
+        if metric_df.empty:
+            ax.set_title(f"{col} by Subtype")
+            ax.set_xlabel("")
+            ax.set_ylabel(col)
+            ax.text(
+                0.5,
+                0.5,
+                "no finite data",
+                transform=ax.transAxes,
+                ha="center",
+                va="center",
+                color="grey",
+            )
+            continue
+
+        sns.boxplot(
+            data=metric_df,
+            x="Subtype",
+            y=col,
+            hue="Subtype",
+            order=subtypes,
+            palette=palette,
+            legend=False,
+            ax=ax,
+        )
         ax.set_ylabel(col)
         ax.set_title(f"{col} by Subtype")
+        ax.set_xlabel("")
+        ax.tick_params(axis="x", rotation=25)
 
     fig.suptitle("kNN Graph Metrics per PAM50 Subtype", fontsize=11, y=1.02)
     fig.tight_layout()

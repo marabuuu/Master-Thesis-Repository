@@ -161,9 +161,116 @@ mopadi_genomic_crossattn:
   use_composite_metric_checkpoint: true
   composite_alpha: 1.0
 
+mopadi_genomic_ca:
+  # ── Cross-attention variant (v11) — 2026-05-12 ───────────────────────────
+  # Fix history:
+  #   v10 lambda=1  (job 41640): pred_gap peaks 2e-3 at 45k → declines to 0
+  #   v11 lambda=10 (job 41641): IDENTICAL — lambda makes no difference
+  #   v11 CA-only stop-grad (job 41642): IDENTICAL — CA stop-grad alone insufficient
+  #
+  # True root cause (identified after jobs 41642–41643):
+  #   All previous stop-grads missed the ResBlock cond_emb_layers.
+  #   Each ResBlock has a learned linear projection (cond_emb_layers) that maps
+  #   cond_emb → scale/shift (AdaGN FiLM).  Reconstruction gradient flows to
+  #   these weights even with cond_emb.detach(), training them toward zero output
+  #   (ignore conditioning) → pred_gap collapses regardless of style-MLP stop-grad.
+  #
+  #   Complete fix — stop gradient to ALL conditioning params in reconstruction pass:
+  #     blocks.py: if _stop_cond_grad: cond_out = cond_out.detach()
+  #       → ResBlock cond_emb_layers get zero reconstruction gradient
+  #     unet_autoenc.py: cond_emb = cond_emb.detach() when _ca_with_grad=False
+  #       → style MLP gets zero reconstruction gradient
+  #     unet_autoenc.py: torch.no_grad() on CA when _ca_with_grad=False
+  #       → CA params get zero reconstruction gradient
+  #     model.py: sets _stop_cond_grad=True on all ResBlocks + _ca_with_grad=False
+  #       before pass 1, resets to True/False before pass 2.
+  #   All conditioning params (ResBlock cond_emb_layers, style MLP, CA) trained
+  #   exclusively by pred_gap + CFL in pass 2.
+  #
+  # Retained from previous v11:
+  #   Full-scale Xavier out_proj (no 1% scale — bf16 precision fix).
+  #   net_beatgans_gradient_checkpoint: false (non-reentrant GC conflict fix).
+  #   pred_gap_lambda: 10.0.
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  zip_dir: ../data/BRCA-tumor-tiles-final
+  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+  img_size: 512
+  net_ch: 128
+  net_ch_mult:
+  - 1
+  - 1
+  - 2
+  - 2
+  - 4
+  - 4
+  net_attn:
+  - 16
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  lr: 0.0001
+  # Classifier-free guidance dropout (CFG)
+  # 15% of batches use feats=zeros (null conditioning).
+  # Model learns both conditional and unconditional denoising from a single
+  # reconstruction objective — no competing pred_gap/CFL gradients.
+  # At inference: eps_guided = eps_null + scale*(eps_cond - eps_null)
+  cfg_dropout: 0.15
+  # CFL / pred_gap disabled (kept for config compat, values unused)
+  cfl_lambda: 0.0
+  cfl_margin: 0.005
+  cfl_every_n_steps: 1
+  pred_gap_lambda: 0.0
+  pred_gap_margin: 0.01
+  # Cross-attention (sole conditioning path — FiLM permanently zeroed)
+  use_genomic_cross_attn: true
+  genomic_ca_heads: 8
+  genomic_ca_n_tokens: 4
+  n_tiles_per_bag: 1
+  batch_size: 16                   # 16 global / 4 GPUs = 4 per GPU
+  accumulate_grad_batches: 2       # effective global batch = 32
+  total_samples: 2500000
+  steps_per_epoch: 5000
+  save_every_samples: 80000
+  reconstruct_every_samples: 100000
+  sample_size: 8
+  net_beatgans_gradient_checkpoint: false  # disabled: non-reentrant GC (use_reentrant=False) conflicts with dual-forward pattern even across separate manual_backward calls
+  ema_decay: 0.999                 # corrected for 4-GPU batch=16 (0.9999 needs ~700k samples to warm up EMA)
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+  val_every_steps: 5000
+  limit_val_batches: 100
+  seed: 42
+  num_workers: 24
+  gpus:
+  - 0
+  - 1
+  - 2
+  - 3
+  base_dir: ./experiments/20260513_genomic_ca_v11_cfg
+  out_dir: ./experiments/20260513_genomic_ca_v11_cfg/train
+  checkpoint_dir: ./experiments/20260513_genomic_ca_v11_cfg/checkpoints
+  logdir: ./experiments/20260513_genomic_ca_v11_cfg/genomic_ca_training
+  tensorboard_dir: ./experiments/20260513_genomic_ca_v11_cfg/tensorboard
+  sample_dir: ./experiments/20260513_genomic_ca_v11_cfg/samples
+  reconstructions_dir: ./experiments/20260513_genomic_ca_v11_cfg/reconstructions
+  use_composite_metric_checkpoint: true
+  composite_alpha: 1.0
+
 training_stats:
-  logdir: ./experiments/20260511_adagn_l2norm_cfl
-  output_dir: ./experiments/20260511_adagn_l2norm_cfl/training_stats
+  logdir: ./experiments/20260513_genomic_ca_v11_cfg
+  output_dir: ./experiments/20260513_genomic_ca_v11_cfg/training_stats
   plots:
   - loss_curves
   - genomic_diagnostics
@@ -213,7 +320,7 @@ tfd_separability:
 tfd_separability_viz:
   # ── Input ─────────────────────────────────────────────────────────────────
   results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
-  tiles_dir: ../data/BRCA-tumor-tiles-corrected
+  tiles_dir: ../data/BRCA-tumor-tiles-final
   masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
   metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_col: Patient_ID
@@ -225,14 +332,14 @@ tfd_separability_viz:
   # Each plot that involves per-tile data also saves a sidecar JSON with
   # patient-level Kruskal-Wallis + pairwise Mann-Whitney U (BH FDR) results.
   plots:
-    - channel_contributions   # per-channel TFD heatmaps (absolute + relative)
+    #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
     - cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
-    - tile_mask_examples      # matched H&E tiles + classification masks
+    - tile_mask_examples     # matched H&E tiles + classification masks (requires tiles_dir)
     - ternary_composition     # epithelium-immune-connective triangle plot
-    - nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
+    #- nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
     - cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
-    - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
-    - voronoi_distribution    # cell dispersion via Voronoi areas
+    #- ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
+    #- voronoi_distribution    # cell dispersion via Voronoi areas
     - knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
     #- radar_contributions    # radar/spider chart with blended subtype colours
 

@@ -217,6 +217,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'mopadi_genomic_crossattn' section in config.yaml")
         run_genomic_training(config["mopadi_genomic_crossattn"], verbose=verbose)
 
+    elif stage == "mopadi_genomic_ca":
+        from src.cross_attention.run_training import run_training_ca
+        if "mopadi_genomic_ca" not in config:
+            raise ValueError("No 'mopadi_genomic_ca' section in config.yaml")
+        run_training_ca(config["mopadi_genomic_ca"], verbose=verbose)
+
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
         for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
@@ -232,7 +238,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, evaluation, all"
         )
 
 
@@ -264,7 +270,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
