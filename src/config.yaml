@@ -268,6 +268,86 @@ mopadi_genomic_ca:
   use_composite_metric_checkpoint: true
   composite_alpha: 1.0
 
+# ── v12: frozen backbone + fresh CA (2026-05-15) ──────────────────────────────
+# Hypothesis: backbone suppression is the root cause of guidance_delta collapse.
+# Fix: load the v11 final checkpoint, freeze ALL backbone parameters, attach a
+# fresh CA block (8 tokens, vs 4 in v11).  Only CA trains.  With backbone frozen
+# the reconstruction gradient cannot teach the backbone to suppress CA output.
+# CFG dropout raised to 30 % (vs 15 %) for a stronger conditioning incentive on
+# the 70 % real-feats batches.
+# Key diagnostic: guidance_delta should GROW (not decline as in v11).
+mopadi_genomic_ca_frozen:
+  # Shared data paths (same as v11)
+  zip_dir: ../data/BRCA-tumor-tiles-final
+  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  # Frozen backbone: load v11 final checkpoint, freeze, train only CA.
+  pretrained_backbone_ckpt: ./experiments/20260513_genomic_ca_v11_cfg/genomic_ca_training/autoenc/last.ckpt
+  frozen_backbone: true
+
+  # Architecture (same UNet as v11)
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+
+  # CFG: 30 % null batches (up from 15 % in v11)
+  cfg_dropout: 0.30
+  cfl_lambda: 0.0
+  cfl_margin: 0.005
+  cfl_every_n_steps: 1
+  pred_gap_lambda: 0.0
+  pred_gap_margin: 0.01
+
+  # CA: more gene tokens (8 vs 4) for richer subtype representations
+  use_genomic_cross_attn: true
+  genomic_ca_heads: 8
+  genomic_ca_n_tokens: 8
+
+  # Training
+  n_tiles_per_bag: 1
+  batch_size: 16
+  accumulate_grad_batches: 2
+  total_samples: 2500000
+  steps_per_epoch: 5000
+  save_every_samples: 80000
+  reconstruct_every_samples: 100000
+  sample_size: 8
+  net_beatgans_gradient_checkpoint: false
+  ema_decay: 0.999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+  lr: 0.0001
+  val_every_steps: 5000
+  limit_val_batches: 100
+  seed: 42
+  num_workers: 24
+  gpus: [0, 1, 2, 3]
+
+  # Output
+  base_dir: ./experiments/20260515_genomic_ca_v12_frozen
+  logdir: ./experiments/20260515_genomic_ca_v12_frozen/genomic_ca_training
+  out_dir: ./experiments/20260515_genomic_ca_v12_frozen/train
+  checkpoint_dir: ./experiments/20260515_genomic_ca_v12_frozen/checkpoints
+  tensorboard_dir: ./experiments/20260515_genomic_ca_v12_frozen/tensorboard
+  sample_dir: ./experiments/20260515_genomic_ca_v12_frozen/samples
+  reconstructions_dir: ./experiments/20260515_genomic_ca_v12_frozen/reconstructions
+  use_composite_metric_checkpoint: true
+  composite_alpha: 1.0
+
 training_stats:
   logdir: ./experiments/20260513_genomic_ca_v11_cfg
   output_dir: ./experiments/20260513_genomic_ca_v11_cfg/training_stats
@@ -333,14 +413,14 @@ tfd_separability_viz:
   # patient-level Kruskal-Wallis + pairwise Mann-Whitney U (BH FDR) results.
   plots:
     #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
-    - cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
-    - tile_mask_examples     # matched H&E tiles + classification masks (requires tiles_dir)
-    - ternary_composition     # epithelium-immune-connective triangle plot
+    #- cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
+    #- tile_mask_examples     # matched H&E tiles + classification masks (requires tiles_dir)
+    #- ternary_composition     # epithelium-immune-connective triangle plot
     #- nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
-    - cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
-    #- ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
+    #- cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
+    - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
     #- voronoi_distribution    # cell dispersion via Voronoi areas
-    - knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
+    #- knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
     #- radar_contributions    # radar/spider chart with blended subtype colours
 
   # ── Tile sampling ──────────────────────────────────────────────────────────

@@ -49,6 +49,16 @@ def _smooth(values, window: int):
     return smoothed, window - 1  # offset into original steps array
 
 
+def _aggregate(steps, values):
+    """Average duplicate entries logged at the same global step."""
+    from collections import defaultdict
+    agg = defaultdict(list)
+    for s, v in zip(steps, values):
+        agg[s].append(v)
+    sorted_steps = sorted(agg)
+    return sorted_steps, [float(np.mean(agg[s])) for s in sorted_steps]
+
+
 def _print_summary(data: dict[str, dict]) -> None:
     print("\n── Training Statistics ──────────────────────────────")
     for tag, series in sorted(data.items()):
@@ -68,13 +78,26 @@ def _print_summary(data: dict[str, dict]) -> None:
 def plot_training_stats(data: dict[str, dict], output_dir: Path, show: bool = False) -> None:
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    has_val      = "loss/val"         in data
-    has_shuffled = "loss/val_shuffled" in data
-    has_gap      = "cond/gap"          in data
+    has_val      = "loss/val"              in data
+    has_shuffled = "loss/val_shuffled"     in data
+    has_gap      = "cond/gap"              in data
+    has_delta    = "cond/guidance_delta"   in data
     lr_tag       = next((t for t in data if "lr" in t.lower()), None)
 
+    # Aggregate validation series: TensorBoard logs ~100 per-batch entries at
+    # the same global step during each validation run, causing vertical stacking.
+    # Reduce to one (mean) point per validation run before plotting.
+    val_s, val_v = (_aggregate(*[data["loss/val"][k] for k in ("steps", "values")])
+                    if has_val else ([], []))
+    shuf_s, shuf_v = (_aggregate(*[data["loss/val_shuffled"][k] for k in ("steps", "values")])
+                      if has_shuffled else ([], []))
+    gap_s, gap_v = (_aggregate(*[data["cond/gap"][k] for k in ("steps", "values")])
+                    if has_gap else ([], []))
+    delta_s, delta_v = (_aggregate(*[data["cond/guidance_delta"][k] for k in ("steps", "values")])
+                        if has_delta else ([], []))
+
     n_cols = 2
-    n_rows = 1 + (1 if has_val or has_shuffled else 0) + (1 if has_gap or lr_tag else 0)
+    n_rows = 1 + (1 if has_val or has_shuffled else 0) + (1 if has_gap or lr_tag or has_delta else 0)
     n_rows = max(n_rows, 2)
 
     fig, axes = plt.subplots(n_rows, n_cols, figsize=(14, 4 * n_rows),
@@ -83,69 +106,78 @@ def plot_training_stats(data: dict[str, dict], output_dir: Path, show: bool = Fa
 
     # ── row 0, col 0 : training loss (linear scale) ──────────────────────────
     ax = axes[0][0]
+    sm = off = None
+    loss_steps = loss_values = None
     if "loss" in data:
         steps  = np.array(data["loss"]["steps"])
         values = np.array(data["loss"]["values"])
+
+        # TensorBoard can emit repeated scalar writes at the same global step.
+        # Collapse duplicates before plotting so the line does not look like a
+        # stack of overlapping traces.
+        if len(steps) != len(set(steps)):
+            steps, values = map(np.asarray, _aggregate(steps.tolist(), values.tolist()))
+
+        loss_steps = steps
+        loss_values = values
+
         ax.plot(steps, values, alpha=0.25, color="steelblue", linewidth=0.6)
         window = max(10, len(values) // 50)
         sm, off = _smooth(values, window)
         if sm is not None:
             ax.plot(steps[off:], sm, color="steelblue", linewidth=1.8,
                     label=f"smooth (w={window})")
-        ax.set_xlabel("Step"); ax.set_ylabel("Loss")
-        ax.set_title("Training Loss (linear)")
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
+
+        # Keep the linear view focused on the bulk of the trajectory so the
+        # later low-loss regime remains visible when an early spike dominates.
+        positive = values[values > 0]
+        if len(positive) >= 10:
+            y_hi = float(np.quantile(positive, 0.99))
+            if np.isfinite(y_hi) and y_hi > 0:
+                ax.set_ylim(bottom=0, top=y_hi * 1.1)
+    ax.set_xlabel("Step"); ax.set_ylabel("Loss")
+    ax.set_title("Training Loss (linear)")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3)
 
     # ── row 0, col 1 : training loss (log scale) ─────────────────────────────
     ax = axes[0][1]
-    if "loss" in data:
-        steps  = np.array(data["loss"]["steps"])
-        values = np.array(data["loss"]["values"])
-        ax.plot(steps, values, alpha=0.25, color="steelblue", linewidth=0.6)
+    if loss_steps is not None and loss_values is not None:
+        ax.plot(loss_steps, loss_values, alpha=0.25, color="steelblue", linewidth=0.6)
         if sm is not None:
-            ax.plot(steps[off:], sm, color="steelblue", linewidth=1.8,
+            ax.plot(loss_steps[off:], sm, color="steelblue", linewidth=1.8,
                     label=f"smooth (w={window})")
-        ax.set_yscale("log")
-        ax.set_xlabel("Step"); ax.set_ylabel("Loss (log)")
-        ax.set_title("Training Loss (log scale)")
-        ax.legend(fontsize=8); ax.grid(True, alpha=0.3, which="both")
+    ax.set_yscale("log")
+    ax.set_xlabel("Step"); ax.set_ylabel("Loss (log)")
+    ax.set_title("Training Loss (log scale)")
+    ax.legend(fontsize=8); ax.grid(True, alpha=0.3, which="both")
 
-    # ── row 1, col 0 : val loss ───────────────────────────────────────────────
+    # ── row 1, col 0 : val loss (aggregated) ─────────────────────────────────
     if has_val or has_shuffled:
         ax = axes[1][0]
-        if has_val:
-            s, v = data["loss/val"]["steps"], data["loss/val"]["values"]
-            ax.plot(s, v, "o-", color="tomato", linewidth=2, markersize=7,
+        if val_v:
+            ax.plot(val_s, val_v, "o-", color="tomato", linewidth=2, markersize=7,
                     label="val loss")
-            for xi, yi in zip(s, v):
-                ax.annotate(f"{yi:.3f}", (xi, yi),
-                            textcoords="offset points", xytext=(4, 4), fontsize=7)
-        if has_shuffled:
-            s, v = data["loss/val_shuffled"]["steps"], data["loss/val_shuffled"]["values"]
-            ax.plot(s, v, "s--", color="orange", linewidth=1.5, markersize=5,
+        if shuf_v:
+            ax.plot(shuf_s, shuf_v, "s--", color="orange", linewidth=1.5, markersize=5,
                     label="val loss (shuffled cond.)")
         ax.set_xlabel("Step"); ax.set_ylabel("Loss")
-        ax.set_title("Validation Loss")
+        ax.set_title("Validation Loss (one point per val run)")
         ax.legend(); ax.grid(True, alpha=0.3)
 
-        # ── row 1, col 1 : val loss overlaid on train loss ───────────────────
+        # ── row 1, col 1 : val loss overlaid on train loss (log) ─────────────
         ax = axes[1][1]
-        if "loss" in data:
-            steps  = np.array(data["loss"]["steps"])
-            values = np.array(data["loss"]["values"])
-            if sm is not None:
-                ax.plot(steps[off:], sm, color="steelblue", linewidth=1.5,
-                        alpha=0.7, label="train (smoothed)")
-        if has_val:
-            s, v = data["loss/val"]["steps"], data["loss/val"]["values"]
-            ax.plot(s, v, "o-", color="tomato", linewidth=2, markersize=7,
+        if loss_steps is not None and sm is not None:
+            ax.plot(loss_steps[off:], sm, color="steelblue", linewidth=1.5,
+                    alpha=0.7, label="train (smoothed)")
+        if val_v:
+            ax.plot(val_s, val_v, "o-", color="tomato", linewidth=2, markersize=7,
                     label="val loss")
         ax.set_yscale("log")
         ax.set_xlabel("Step"); ax.set_ylabel("Loss (log)")
         ax.set_title("Train vs Val Loss (log)")
         ax.legend(); ax.grid(True, alpha=0.3, which="both")
 
-    # ── row 2, col 0 : learning rate ─────────────────────────────────────────
+    # ── row 2 : lr (col 0) + cond/gap or guidance_delta (col 1) ─────────────
     row2 = 1 + (1 if has_val or has_shuffled else 0)
     if row2 < n_rows:
         ax = axes[row2][0]
@@ -155,16 +187,35 @@ def plot_training_stats(data: dict[str, dict], output_dir: Path, show: bool = Fa
             ax.set_xlabel("Step"); ax.set_ylabel("LR")
             ax.set_title(f"Learning Rate  ({lr_tag})")
             ax.grid(True, alpha=0.3)
+        elif has_gap and gap_v:
+            ax.plot(gap_s, gap_v, "o-", color="mediumpurple", linewidth=2, markersize=7)
+            ax.axhline(0, color="gray", linestyle="--", alpha=0.6)
+            for xi, yi in zip(gap_s, gap_v):
+                ax.annotate(f"{yi:.2e}", (xi, yi),
+                            textcoords="offset points", xytext=(4, 4), fontsize=7)
+            ax.set_xlabel("Step"); ax.set_ylabel("Gap")
+            ax.set_title("Conditioning Gap  (val − val_shuffled)")
+            ax.grid(True, alpha=0.3)
         else:
             ax.set_visible(False)
 
-        # ── row 2, col 1 : cond/gap ──────────────────────────────────────────
+        # ── col 1: guidance_delta (CFG) — most important conditioning metric ──
         ax = axes[row2][1]
-        if has_gap:
-            s, v = data["cond/gap"]["steps"], data["cond/gap"]["values"]
-            ax.plot(s, v, "o-", color="mediumpurple", linewidth=2, markersize=7)
+        if has_delta and delta_v:
+            ax.plot(delta_s, delta_v, "o-", color="darkorange", linewidth=2, markersize=7,
+                    label="guidance_delta")
+            # Log scale if range spans >20×
+            pos = [v for v in delta_v if v > 0]
+            if pos and max(pos) / max(min(pos), 1e-12) > 20:
+                ax.set_yscale("log")
+            ax.set_xlabel("Step"); ax.set_ylabel("guidance_delta")
+            ax.set_title("guidance_delta = MSE(eps_cond, eps_null)")
+            ax.legend(fontsize=8); ax.grid(True, alpha=0.3, which="both")
+        elif has_gap and gap_v and lr_tag:
+            # lr was plotted in col 0 — put gap here
+            ax.plot(gap_s, gap_v, "o-", color="mediumpurple", linewidth=2, markersize=7)
             ax.axhline(0, color="gray", linestyle="--", alpha=0.6)
-            for xi, yi in zip(s, v):
+            for xi, yi in zip(gap_s, gap_v):
                 ax.annotate(f"{yi:.2e}", (xi, yi),
                             textcoords="offset points", xytext=(4, 4), fontsize=7)
             ax.set_xlabel("Step"); ax.set_ylabel("Gap")

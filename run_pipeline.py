@@ -223,6 +223,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'mopadi_genomic_ca' section in config.yaml")
         run_training_ca(config["mopadi_genomic_ca"], verbose=verbose)
 
+    elif stage == "mopadi_genomic_ca_frozen":
+        from src.cross_attention_frozen.run_training import run_training_frozen
+        if "mopadi_genomic_ca_frozen" not in config:
+            raise ValueError("No 'mopadi_genomic_ca_frozen' section in config.yaml")
+        run_training_frozen(config["mopadi_genomic_ca_frozen"], verbose=verbose)
+
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
         for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
@@ -238,7 +244,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, mopadi_genomic_ca_frozen, evaluation, all"
         )
 
 
@@ -270,7 +276,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "mopadi_genomic_ca_frozen", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
