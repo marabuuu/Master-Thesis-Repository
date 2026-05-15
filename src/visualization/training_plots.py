@@ -82,6 +82,21 @@ if TYPE_CHECKING:  # pragma: no cover
 TrainingRun = Dict[str, Any]
 
 
+def _aggregate_by_step(
+    steps: List[float],
+    values: List[float],
+) -> Tuple[List[float], List[float]]:
+    """Average duplicate entries at the same step and return sorted unique steps."""
+    if not steps:
+        return [], []
+    from collections import defaultdict
+    agg: dict = defaultdict(list)
+    for s, v in zip(steps, values):
+        agg[s].append(v)
+    sorted_steps = sorted(agg)
+    return sorted_steps, [float(np.mean(agg[s])) for s in sorted_steps]
+
+
 def _series_payload(run: TrainingRun, *candidate_names: str) -> Optional[Dict[str, Any]]:
     series = run.get("series", {})
     for name in candidate_names:
@@ -412,14 +427,16 @@ def plot_genomic_diagnostics(
     ax.legend(framealpha=0.9)
 
     # Panel 2: validation correct vs shuffled conditioning
+    # Aggregate to one point per validation run (TensorBoard logs ~100 per-batch
+    # entries at the same global step, which causes vertical stacking in plots).
     ax = axes_flat[1]
-    val_x, val_y = _series_xy(run, "loss/val", "val_loss")
-    shuffled_x, shuffled_y = _series_xy(run, "loss/val_shuffled", "val_loss_shuffled")
-    gap_x, gap_y = _series_xy(run, "cond/gap", "cond_gap")
+    val_x, val_y = _aggregate_by_step(*_series_xy(run, "loss/val", "val_loss"))
+    shuffled_x, shuffled_y = _aggregate_by_step(*_series_xy(run, "loss/val_shuffled", "val_loss_shuffled"))
+    gap_x, gap_y = _aggregate_by_step(*_series_xy(run, "cond/gap", "cond_gap"))
     if val_y and shuffled_y:
-        ax.plot(val_x[: len(val_y)], val_y, "-o", markersize=3, linewidth=1.5,
+        ax.plot(val_x, val_y, "-o", markersize=3, linewidth=1.5,
                 color=colors[2], label="Val loss (correct)", alpha=0.9)
-        ax.plot(shuffled_x[: len(shuffled_y)], shuffled_y, "-s", markersize=3, linewidth=1.5,
+        ax.plot(shuffled_x, shuffled_y, "-s", markersize=3, linewidth=1.5,
                 color=colors[3], label="Val loss (shuffled)", alpha=0.9)
         shared_n = min(len(val_x), len(shuffled_x), len(val_y), len(shuffled_y))
         if shared_n:
@@ -444,13 +461,25 @@ def plot_genomic_diagnostics(
     ax.grid(True, alpha=0.25)
     ax.legend(framealpha=0.9, loc="upper right")
 
-    # Panel 3: step-level auxiliary losses
+    # Panel 3: guidance_delta + auxiliary losses
+    # guidance_delta = MSE(eps_cond, eps_null) — the primary CFG diagnostic.
+    # Aggregated because TensorBoard logs it per-batch during validation.
     ax = axes_flat[2]
+    guidance_x, guidance_y = _aggregate_by_step(*_series_xy(run, "cond/guidance_delta"))
     genomic_train_x, genomic_train_y = _series_xy(run, "loss/genomic_train", "genomic_train_loss")
     genomic_val_x, genomic_val_y = _series_xy(run, "loss/genomic_val", "genomic_val_loss")
     genomic_x, genomic_y = _series_xy(run, "loss/genomic_guided", "genomic_guided_loss")
     cf_x, cf_y = _series_xy(run, "loss/counterfactual", "counterfactual_loss")
     gap_train_x, gap_train_y = _series_xy(run, "cond/gap_train", "cond_gap_train")
+    _has_aux = bool(genomic_train_y or genomic_val_y or genomic_y or cf_y or gap_train_y)
+    if guidance_y:
+        ax.plot(guidance_x, guidance_y, "-o", markersize=3, linewidth=1.5,
+                color=colors[0], label="guidance_delta", alpha=0.9)
+        _annotate_min(ax, guidance_x, guidance_y, color=colors[0])
+        # Log scale helps when delta spans several orders of magnitude
+        positive = [v for v in guidance_y if v > 0]
+        if positive and max(positive) / max(min(positive), 1e-12) > 20:
+            ax.set_yscale("log")
     if genomic_train_y:
         _plot_smoothed_series(ax, genomic_train_x, genomic_train_y, colors[4], "loss/genomic_train", smooth_color=seq_cmap(0.75))
     elif genomic_y:
@@ -461,16 +490,18 @@ def plot_genomic_diagnostics(
         _plot_smoothed_series(ax, cf_x, cf_y, colors[5], "loss/counterfactual", smooth_color=seq_cmap(0.55))
     if gap_train_y:
         _plot_smoothed_series(ax, gap_train_x, gap_train_y, colors[6], "cond/gap_train", smooth_color=seq_cmap(0.35))
-    if not (genomic_train_y or genomic_val_y or genomic_y or cf_y or gap_train_y):
-        ax.text(0.5, 0.5, "No auxiliary genomic losses found", ha="center", va="center", transform=ax.transAxes)
-    ax.set_title("Auxiliary / Genomic Losses")
+    if not guidance_y and not _has_aux:
+        ax.text(0.5, 0.5, "No guidance_delta or auxiliary losses found",
+                ha="center", va="center", transform=ax.transAxes)
+    ax.set_title("Guidance Delta & Auxiliary Losses")
     ax.set_xlabel("Step")
-    ax.set_ylabel("Loss")
+    ax.set_ylabel("guidance_delta / Loss")
     ax.grid(True, alpha=0.25)
-    if genomic_train_y or genomic_val_y or genomic_y or cf_y or gap_train_y:
+    if guidance_y or _has_aux:
         ax.legend(framealpha=0.9)
 
-    # Panel 4: validation cond/gap over time
+    # Panel 4: validation cond/gap over time (aggregated — same step de-duplication)
+    # gap_x / gap_y already aggregated above in Panel 2 block.
     ax = axes_flat[3]
     if gap_y:
         ax.plot(gap_x, gap_y, "-o", markersize=3, linewidth=1.5,

@@ -54,9 +54,10 @@ def compute_ripley_K(
     points: np.ndarray,
     radii: Optional[np.ndarray] = None,
     edge_correction: str = "toroidal",
+    window: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute Ripley's K-function for a 2D point pattern.
-    
+
     Parameters
     ----------
     points : (N, 2) array
@@ -65,7 +66,13 @@ def compute_ripley_K(
         Radii at which to evaluate K(r). If None, uses np.arange(5, 150, 5).
     edge_correction : str
         "toroidal" (default): wrap boundaries; "none": ignore edge effects.
-    
+    window : (width, height) or None
+        Observation window dimensions. When provided, area and toroidal wrapping
+        use these fixed tile dimensions instead of the bounding box of the
+        observed points. Always pass this when the points come from a tile of
+        known size so that K(r) is normalised correctly and the toroidal domain
+        is consistent across all tiles and CSR simulations.
+
     Returns
     -------
     radii : (M,) array
@@ -77,21 +84,23 @@ def compute_ripley_K(
         radii = np.arange(5, 150, 5).astype(float)
     else:
         radii = np.asarray(radii, dtype=float)
-    
+
     points = np.asarray(points, dtype=float)
     N = points.shape[0]
-    
+
     if N < 2:
         return radii, np.zeros_like(radii)
-    
-    # Bounding box
-    xmin, ymin = points.min(axis=0)
-    xmax, ymax = points.max(axis=0)
-    width = xmax - xmin
-    height = ymax - ymin
+
+    if window is not None:
+        xmin, ymin = 0.0, 0.0
+        width, height = float(window[0]), float(window[1])
+    else:
+        xmin, ymin = points.min(axis=0)
+        xmax, ymax = points.max(axis=0)
+        width  = xmax - xmin
+        height = ymax - ymin
     area = width * height
-    intensity = N / area
-    
+
     # Precompute all pairwise distances once (upper triangle only).
     if edge_correction == "toroidal":
         dx = np.abs(points[:, None, 0] - points[None, :, 0])
@@ -112,11 +121,12 @@ def compute_ripley_L(
     points: np.ndarray,
     radii: Optional[np.ndarray] = None,
     edge_correction: str = "toroidal",
+    window: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
     """Compute Ripley's L-function: L(r) = sqrt(K(r) / π) - r.
-    
+
     L(r) = 0 under CSR, < 0 indicates inhibition, > 0 indicates clustering.
-    
+
     Parameters
     ----------
     points : (N, 2) array
@@ -125,14 +135,16 @@ def compute_ripley_L(
         Radii to evaluate. If None, auto-computed.
     edge_correction : str
         "toroidal" or "none".
-    
+    window : (width, height) or None
+        Observation window; passed through to compute_ripley_K.
+
     Returns
     -------
     radii : (M,) array
     L_vals : (M,) array
         L(r) values (negative = inhibition, positive = clustering).
     """
-    radii, K_vals = compute_ripley_K(points, radii, edge_correction)
+    radii, K_vals = compute_ripley_K(points, radii, edge_correction, window=window)
     L_vals = np.sqrt(K_vals / np.pi) - radii
     return radii, L_vals
 
@@ -143,13 +155,14 @@ def compute_ripley_L_bootstrap(
     n_bootstrap: int = 99,
     edge_correction: str = "toroidal",
     seed: int = 42,
+    window: Optional[Tuple[float, float]] = None,
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
     """Compute Ripley's L-function with bootstrap confidence intervals under CSR.
-    
+
     Simulates n_bootstrap point patterns with the same intensity (N / area) as the
-    observed data, uniformly distributed in the bounding box, and computes L(r)
-    for each simulation. Returns percentile-based envelope.
-    
+    observed data, uniformly distributed in the observation window, and computes
+    L(r) for each simulation. Returns percentile-based envelope.
+
     Parameters
     ----------
     points : (N, 2) array
@@ -160,7 +173,14 @@ def compute_ripley_L_bootstrap(
         Number of CSR simulations (default 99 → 2.5% and 97.5% quantiles).
     edge_correction : str
     seed : int
-    
+    window : (width, height) or None
+        Observation window dimensions. When provided, both the observed L(r) and
+        all CSR simulations use this fixed domain, ensuring a consistent
+        comparison. Without it the observed pattern uses its own point bbox while
+        each CSR simulation uses a slightly smaller bbox (uniform samples never
+        exactly reach the extremes), introducing a systematic downward bias in
+        the envelope.
+
     Returns
     -------
     radii : (M,) array
@@ -172,26 +192,30 @@ def compute_ripley_L_bootstrap(
         Upper 97.5% quantile of CSR simulations.
     """
     rng = np.random.default_rng(seed)
-    radii, L_obs = compute_ripley_L(points, radii, edge_correction)
-    
+    radii, L_obs = compute_ripley_L(points, radii, edge_correction, window=window)
+
     points = np.asarray(points)
     N = points.shape[0]
-    xmin, ymin = points.min(axis=0)
-    xmax, ymax = points.max(axis=0)
-    
+
+    if window is not None:
+        sim_xmin, sim_ymin = 0.0, 0.0
+        sim_xmax, sim_ymax = float(window[0]), float(window[1])
+    else:
+        sim_xmin, sim_ymin = points.min(axis=0)
+        sim_xmax, sim_ymax = points.max(axis=0)
+
     L_boots = []
     for _ in range(n_bootstrap):
-        # Simulate uniform CSR
-        x_sim = rng.uniform(xmin, xmax, N)
-        y_sim = rng.uniform(ymin, ymax, N)
+        x_sim = rng.uniform(sim_xmin, sim_xmax, N)
+        y_sim = rng.uniform(sim_ymin, sim_ymax, N)
         points_sim = np.column_stack([x_sim, y_sim])
-        _, L_sim = compute_ripley_L(points_sim, radii, edge_correction)
+        _, L_sim = compute_ripley_L(points_sim, radii, edge_correction, window=window)
         L_boots.append(L_sim)
-    
+
     L_boots = np.array(L_boots)
     L_lower = np.percentile(L_boots, 2.5, axis=0)
     L_upper = np.percentile(L_boots, 97.5, axis=0)
-    
+
     return radii, L_obs, L_lower, L_upper
 
 

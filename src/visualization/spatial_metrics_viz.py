@@ -128,7 +128,7 @@ def compute_spatial_metrics_per_tile(
     # Compute all metrics
     radii, L_obs, L_lower, L_upper = compute_ripley_L_bootstrap(
         points, radii=np.arange(10, min(200, bounding_box[0] // 2), 10),
-        n_bootstrap=n_bootstrap, seed=42
+        n_bootstrap=n_bootstrap, seed=42, window=bounding_box,
     )
     
     voronoi_areas = compute_voronoi_areas(points, bounding_box)
