@@ -1536,16 +1536,15 @@ def _collect_spatial_topology_for_subtypes(
             class_to_patients[st].append(p)
 
     stats_by_subtype: Dict[str, Dict[str, object]] = {}
-    per_patient: Optional[int] = (
-        max(1, max_tiles // len(subtypes))
-        if max_tiles is not None and len(subtypes) > 0
-        else None
-    )
 
     for subtype in subtypes:
         pids = class_to_patients[subtype]
         if not pids:
             continue
+        # Cap per patient so each subtype gets ~max_tiles total (mirrors _collect_spatial_stats_for_subtypes)
+        per_patient: Optional[int] = (
+            max(1, max_tiles // len(pids)) if max_tiles is not None else None
+        )
         if verbose:
             print(f"  [{subtype}] Computing spatial topology stats ({len(pids)} patients)…")
 
@@ -2091,18 +2090,22 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 verbose=verbose,
             )
 
-    # --- Spatial NN plots (B + C): shared data collection ---
-    _need_spatial = (
-        "nn_distance_violins" in plots
-        or "cross_type_proximity" in plots
-        or "ripley_L_by_subtype" in plots
+    # --- Spatial plots: shared patient/subtype setup, then two separate passes ---
+    # _need_nn_stats:  NN distance + cross-type proximity  (fast per-tile summaries)
+    # _need_topology:  Ripley L(r), Voronoi, kNN           (slow connected-component pass)
+    # These are collected independently so selecting only ripley_L_by_subtype does
+    # not trigger the unnecessary NN-stats collection (which caused time-limit errors).
+    _need_nn_stats = "nn_distance_violins" in plots or "cross_type_proximity" in plots
+    _need_topology = (
+        "ripley_L_by_subtype" in plots
         or "voronoi_distribution" in plots
         or "knn_metrics" in plots
     )
-    if _need_spatial:
+
+    if _need_nn_stats or _need_topology:
         if not masks_dir or not metadata_csv:
             logger.warning(
-                "'masks_dir' or 'metadata_csv' not set — skipping spatial NN plots."
+                "'masks_dir' or 'metadata_csv' not set — skipping spatial plots."
             )
         else:
             _patient_col = cfg.get("patient_col", "Patient_ID")
@@ -2122,24 +2125,26 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
             _non_bg = list(range(1, 7))
             _max_sp = cfg.get("max_tiles_spatial", 500)
             _ripley_bootstrap = cfg.get("ripley_n_bootstrap", 99)
-            if verbose:
-                print(
-                    f"\n[TFD-Viz] Computing spatial NN statistics "
-                    f"(max {_max_sp} tiles/subtype via scipy connected components; "
-                    f"Ripley bootstrap={_ripley_bootstrap})…"
+
+            # ── NN stats (intra-type distances, cross-type proximity) ──────────
+            _stats = None
+            if _need_nn_stats:
+                if verbose:
+                    print(
+                        f"\n[TFD-Viz] Computing spatial NN statistics "
+                        f"(max {_max_sp} tiles/subtype)…"
+                    )
+                _stats = _collect_spatial_stats_for_subtypes(
+                    masks_dir=Path(masks_dir),
+                    subtypes=_subtypes,
+                    patient_to_subtype=_p2s,
+                    non_bg_channels=_non_bg,
+                    max_tiles=_max_sp,
+                    seed=cfg.get("seed", 42),
+                    verbose=verbose,
                 )
 
-            _stats = _collect_spatial_stats_for_subtypes(
-                masks_dir=Path(masks_dir),
-                subtypes=_subtypes,
-                patient_to_subtype=_p2s,
-                non_bg_channels=_non_bg,
-                max_tiles=_max_sp,
-                seed=cfg.get("seed", 42),
-                verbose=verbose,
-            )
-
-            if "nn_distance_violins" in plots:
+            if "nn_distance_violins" in plots and _stats is not None:
                 if verbose:
                     print("\n[TFD-Viz] Generating intra-type NN distance violin plots…")
                 figsize_raw = cfg.get("figsize_nn_violins")
@@ -2155,7 +2160,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     verbose=verbose,
                 )
 
-            if "cross_type_proximity" in plots:
+            if "cross_type_proximity" in plots and _stats is not None:
                 if verbose:
                     print("\n[TFD-Viz] Generating cross-type proximity heatmaps…")
                 figsize_raw = cfg.get("figsize_proximity")
@@ -2170,43 +2175,38 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     verbose=verbose,
                 )
 
-            # The newer spatial summary plots need tile-level topology metrics,
-            # so we collect them separately from the NN summary stats.
+            # ── Topology stats (Ripley, Voronoi, kNN) — slow connected-component pass ──
             _topology_stats: Optional[Dict[str, Dict[str, object]]] = None
-            if "ripley_L_by_subtype" in plots:
+            if _need_topology:
+                if verbose:
+                    print(
+                        f"\n[TFD-Viz] Computing spatial topology statistics "
+                        f"(max {_max_sp} tiles/subtype; "
+                        f"Ripley bootstrap={_ripley_bootstrap})…"
+                    )
+                _topology_stats = _collect_spatial_topology_for_subtypes(
+                    masks_dir=Path(masks_dir),
+                    subtypes=_subtypes,
+                    patient_to_subtype=_p2s,
+                    non_bg_channels=_non_bg,
+                    max_tiles=_max_sp,
+                    n_bootstrap=_ripley_bootstrap,
+                    seed=cfg.get("seed", 42),
+                    verbose=verbose,
+                )
+
+            if "ripley_L_by_subtype" in plots and _topology_stats is not None:
                 if verbose:
                     print("\n[TFD-Viz] Generating Ripley L(r) curves by subtype…")
-                if _topology_stats is None:
-                    _topology_stats = _collect_spatial_topology_for_subtypes(
-                        masks_dir=Path(masks_dir),
-                        subtypes=_subtypes,
-                        patient_to_subtype=_p2s,
-                        non_bg_channels=_non_bg,
-                        max_tiles=_max_sp,
-                        n_bootstrap=_ripley_bootstrap,
-                        seed=cfg.get("seed", 42),
-                        verbose=verbose,
-                    )
                 plot_ripley_L_by_subtype(
                     results=_topology_stats,
                     output_dir=output_dir,
                     dpi=dpi,
                 )
 
-            if "voronoi_distribution" in plots:
+            if "voronoi_distribution" in plots and _topology_stats is not None:
                 if verbose:
                     print("\n[TFD-Viz] Generating Voronoi area distributions…")
-                if _topology_stats is None:
-                    _topology_stats = _collect_spatial_topology_for_subtypes(
-                        masks_dir=Path(masks_dir),
-                        subtypes=_subtypes,
-                        patient_to_subtype=_p2s,
-                        non_bg_channels=_non_bg,
-                        max_tiles=_max_sp,
-                        n_bootstrap=_ripley_bootstrap,
-                        seed=cfg.get("seed", 42),
-                        verbose=verbose,
-                    )
                 plot_voronoi_distribution(
                     results=_topology_stats,
                     output_dir=output_dir,
@@ -2214,19 +2214,9 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                     dpi=dpi,
                 )
 
-            if "knn_metrics" in plots:
+            if "knn_metrics" in plots and _topology_stats is not None:
                 if verbose:
                     print("\n[TFD-Viz] Generating kNN connectivity metrics…")
-                if _topology_stats is None:
-                    _topology_stats = _collect_spatial_topology_for_subtypes(
-                        masks_dir=Path(masks_dir),
-                        subtypes=_subtypes,
-                        patient_to_subtype=_p2s,
-                        non_bg_channels=_non_bg,
-                        max_tiles=_max_sp,
-                        seed=cfg.get("seed", 42),
-                        verbose=verbose,
-                    )
                 plot_knn_metrics_comparison(
                     results=_topology_stats,
                     output_dir=output_dir,

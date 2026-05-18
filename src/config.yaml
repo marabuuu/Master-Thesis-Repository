@@ -419,8 +419,8 @@ tfd_separability_viz:
     #- nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
     #- cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
     - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
-    #- voronoi_distribution    # cell dispersion via Voronoi areas
-    #- knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
+    - voronoi_distribution    # cell dispersion via Voronoi areas
+    - knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
     #- radar_contributions    # radar/spider chart with blended subtype colours
 
   # ── Tile sampling ──────────────────────────────────────────────────────────
@@ -490,3 +490,87 @@ subtype_classifier:
     class_weight: balanced
   evaluate:
     model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
+
+# ── v13: Genomic Diffusion Adapter — joint from-scratch training (2026-05-17) ──────────────
+# Architecture: full MoPaDi backbone UNet + lightweight adapter UNet (~6M params).
+#   Backbone always receives cond=zeros → learns unconditional denoising.
+#   Adapter receives (x_t, t, g_tokens) → learns genomic correction Δε.
+#   ε_pred = ε_backbone + Δε_adapter.  Loss: MSE(ε_pred, noise).
+#
+# Key advantage over v11/v12:
+#   The backbone NEVER sees patient genomic features, so it cannot suppress
+#   the adapter (v11 failure) and the adapter is the sole conditioning pathway
+#   so it cannot be passively ignored (v12 failure).
+#
+# No pretrained checkpoint — both components initialise from random weights.
+# Fully reproducible.
+#
+# Health metric: cond/guidance_delta = E[‖Δε_own − Δε_null‖²]
+#   Must grow during training. If flat → adapter is not learning conditioning.
+#   Independent of backbone (backbone cannot cause this to collapse).
+#
+# Inference CFG:
+#   ε_guided = ε_backbone(x_t, t, 0) + scale * (Δε_own − Δε_null)
+genomic_adapter_training:
+  # ── Data ────────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-final
+  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  # ── Backbone UNet architecture (same as v11/v12 for comparability) ───────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  # Gradient checkpointing: safe to enable in GDA (single-forward, no dual-pass conflict)
+  net_beatgans_gradient_checkpoint: true
+
+  # ── Adapter architecture ─────────────────────────────────────────────────
+  adapter_base_ch: 64          # encoder levels: 64 → 128 → 256 channels
+  adapter_n_tokens: 8          # genomic token sequence length
+  adapter_token_dim: 256       # cross-attention token dimension
+  adapter_t_dim: 256           # sinusoidal timestep embedding dim
+  adapter_n_heads: 4           # attention heads in adapter cross-attention
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.30            # 30 % null-token dropout → adapter learns CFG delta
+
+  # ── Optimisation — two separate LRs ─────────────────────────────────────
+  backbone_lr: 1.0e-4          # AdamW LR for backbone UNet
+  adapter_lr:  3.0e-4          # AdamW LR for adapter + genomic encoder (higher: learns faster)
+  batch_size: 16               # global batch / 4 GPUs = 4 per GPU
+  accumulate_grad_batches: 2   # effective global batch = 32
+  total_samples: 20000000      # 20M → ~625k gradient steps at eff. batch 32
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Logging / checkpointing ──────────────────────────────────────────────
+  val_every_steps: 5000
+  limit_val_batches: 100
+  save_every_samples: 200000
+  save_top_k: 3
+  monitor_metric: loss/val
+  steps_per_epoch: 5000
+  reconstruct_every_samples: 200000
+  sample_size: 8
+  seed: 42
+  num_workers: 24
+  gpus: [0, 1, 2, 3]
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260517_gda_v13
+  base_dir: ./experiments/20260517_gda_v13
+  logdir: ./experiments/20260517_gda_v13/logs

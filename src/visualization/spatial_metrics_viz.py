@@ -360,37 +360,61 @@ def plot_ripley_L_by_subtype(
         axes = [axes]
 
     for ax, (subtype, subtype_data) in zip(axes, sorted(results.items())):
-        tile_list = _tile_list(subtype_data)
-        # Collect L curves from all tiles
-        radii_all = []
-        L_obs_all = []
-        L_lower_all = []
-        L_upper_all = []
-        
-        for tile_dict in tile_list:
-            if tile_dict['ripley_L'].size == 0:
-                continue
-            radii_all.append(tile_dict['ripley_radii'])
-            L_obs_all.append(tile_dict['ripley_L'])
-            L_lower_all.append(tile_dict['ripley_L_lower'])
-            L_upper_all.append(tile_dict['ripley_L_upper'])
-        
-        if not L_obs_all:
+        # Patient-level aggregation: each patient contributes one mean L(r) curve
+        # regardless of how many tiles were sampled from them.
+        per_patient_dict = (
+            subtype_data.get("per_patient", {})
+            if isinstance(subtype_data, dict)
+            else {}
+        )
+
+        def _tile_curves(tiles):
+            L_obs, L_lower, L_upper, radii = [], [], [], []
+            for td in tiles:
+                if td['ripley_L'].size == 0:
+                    continue
+                L_obs.append(td['ripley_L'])
+                L_lower.append(td['ripley_L_lower'])
+                L_upper.append(td['ripley_L_upper'])
+                radii.append(td['ripley_radii'])
+            return L_obs, L_lower, L_upper, radii
+
+        if per_patient_dict:
+            # Compute per-patient mean, then average across patients
+            pat_L_obs, pat_L_lower, pat_L_upper = [], [], []
+            radii_ref = None
+            for pid, tiles in per_patient_dict.items():
+                L_obs, L_lower, L_upper, radii_list = _tile_curves(tiles)
+                if not L_obs:
+                    continue
+                pat_L_obs.append(np.mean(L_obs, axis=0))
+                pat_L_lower.append(np.mean(L_lower, axis=0))
+                pat_L_upper.append(np.mean(L_upper, axis=0))
+                if radii_ref is None:
+                    radii_ref = radii_list[0]
+            n_label = f"n={len(pat_L_obs)} patients"
+            L_obs_all, L_lower_all, L_upper_all = pat_L_obs, pat_L_lower, pat_L_upper
+        else:
+            # Fallback: tile-level aggregation (old flat-list format)
+            tile_list = _tile_list(subtype_data)
+            L_obs_all, L_lower_all, L_upper_all, radii_list = _tile_curves(tile_list)
+            radii_ref = radii_list[0] if radii_list else None
+            n_label = f"n={len(L_obs_all)} tiles"
+
+        if not L_obs_all or radii_ref is None:
             ax.set_title(f"{subtype} (no data)")
             continue
-        
-        # Average L and envelope across tiles
-        radii = radii_all[0]  # assume same for all tiles
+
+        radii = radii_ref
         L_obs_mean = np.mean(L_obs_all, axis=0)
-        L_obs_std = np.std(L_obs_all, axis=0)
         L_lower_mean = np.mean(L_lower_all, axis=0)
         L_upper_mean = np.mean(L_upper_all, axis=0)
-        
+
         # Plot
         ax.plot(radii, L_obs_mean, 'b-', linewidth=2, label='Observed L(r)')
         ax.fill_between(radii, L_lower_mean, L_upper_mean, alpha=0.2, color='blue', label='CSR envelope (95%)')
         ax.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
-        ax.set_title(f"{subtype} (n={len(L_obs_all)} tiles)")
+        ax.set_title(f"{subtype} ({n_label})")
         ax.set_xlabel("Radius r (px)")
         if ax == axes[0]:
             ax.set_ylabel("L(r)")
