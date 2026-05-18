@@ -85,11 +85,16 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     autoenc_dir = logdir / "autoenc"
     autoenc_dir.mkdir(parents=True, exist_ok=True)
 
-    val_every_steps = cfg.get("val_every_steps", 5_000)
+    # With automatic_optimization=False, Lightning forbids accumulate_grad_batches != 1.
+    # We accumulate manually via is_last_accum(batch_idx), so global_step counts
+    # every micro-batch (not every effective optimizer step).
+    # All step-based intervals must therefore be scaled by accum_batches.
+    accum = conf.accum_batches
+    val_every_steps = cfg.get("val_every_steps", 5_000) * accum
     limit_val_batches = cfg.get("limit_val_batches", 100)
 
     ckpt_every_steps = max(
-        max(1, conf.save_every_samples // conf.batch_size_effective),
+        max(1, conf.save_every_samples // conf.batch_size),  # micro-batch units
         int(val_every_steps),
     )
     checkpoint_cb = ModelCheckpoint(
@@ -115,8 +120,10 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
             f"batch_size={conf.batch_size} must be divisible by n_devices={len(devices)}."
         )
 
-    max_steps = conf.total_samples // conf.batch_size_effective
-    log.info("Training: max_steps=%d  global_batch=%d  devices=%s", max_steps, conf.batch_size_effective, devices)
+    # micro-batch steps = total_samples / per-step global batch = total_samples / batch_size
+    max_steps = conf.total_samples // conf.batch_size
+    log.info("Training: max_steps=%d  global_batch=%d  accum=%d  devices=%s",
+             max_steps, conf.batch_size_effective, accum, devices)
 
     trainer = pl.Trainer(
         max_steps=max_steps,
@@ -130,7 +137,7 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         logger=tb_logger,
         log_every_n_steps=50,
         gradient_clip_val=None,              # GDA does manual clipping per component
-        accumulate_grad_batches=conf.accum_batches,  # tells Lightning how to count global_step
+        accumulate_grad_batches=1,           # must be 1 with automatic_optimization=False
         val_check_interval=val_every_steps,
         check_val_every_n_epoch=None,
         limit_val_batches=limit_val_batches,

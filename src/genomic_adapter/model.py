@@ -106,6 +106,18 @@ class GDALitModel(_BaseGenomicLitModel):
         )
 
     # ------------------------------------------------------------------
+    # Sample counter
+    # ------------------------------------------------------------------
+
+    @property
+    def num_samples(self) -> int:
+        # With automatic_optimization=False the Trainer uses accumulate_grad_batches=1,
+        # so global_step counts every micro-batch (not every effective optimizer step).
+        # The parent formula (global_step * batch_size_effective) would overcount by
+        # accum_batches; use batch_size (= per-micro-batch global count) instead.
+        return self.global_step * self.conf.batch_size
+
+    # ------------------------------------------------------------------
     # Batch helpers
     # ------------------------------------------------------------------
 
