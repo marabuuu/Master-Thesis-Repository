@@ -83,7 +83,13 @@ class SpatialCrossAttention(nn.Module):
     Key/Value: genomic tokens (B, n_tokens, token_dim).
     """
 
-    def __init__(self, query_dim: int, context_dim: int, n_heads: int = 4):
+    def __init__(
+        self,
+        query_dim: int,
+        context_dim: int,
+        n_heads: int = 4,
+        zero_init_output: bool = False,
+    ):
         super().__init__()
         assert query_dim % n_heads == 0, "query_dim must be divisible by n_heads"
         self.n_heads = n_heads
@@ -93,6 +99,10 @@ class SpatialCrossAttention(nn.Module):
         self.to_k = nn.Linear(context_dim, query_dim, bias=False)
         self.to_v = nn.Linear(context_dim, query_dim, bias=False)
         self.out_proj = nn.Linear(query_dim, query_dim, bias=False)
+        if zero_init_output:
+            # Zero-init lets new CA layers start as identity (no residual effect),
+            # so they can be added to a mid-run checkpoint without disruption.
+            nn.init.zeros_(self.out_proj.weight)
 
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
@@ -190,10 +200,16 @@ class GenomicResidualAdapter(nn.Module):
         # up2(hm) at H/4 → H/2, concat with h1 (H/2): (2ch + 2ch) = 4ch in
         self.up2 = nn.ConvTranspose2d(ch * 4, ch * 2, 2, stride=2)
         self.dec2 = AdapterResBlock(ch * 4, ch * 2, t_dim)
+        # Decoder CA re-attends to g_tokens after each ResBlock so that
+        # genomic information is not diluted by the spatial skip-connection path.
+        # zero_init_output=True lets these layers resume from a pre-existing
+        # checkpoint without disrupting the already-trained weights.
+        self.ca_dec2 = SpatialCrossAttention(ch * 2, token_dim, n_heads, zero_init_output=True)
 
         # up1(d2) at H/2 → H, concat with h0 (H): (ch + ch) = 2ch in
         self.up1 = nn.ConvTranspose2d(ch * 2, ch, 2, stride=2)
         self.dec1 = AdapterResBlock(ch * 2, ch, t_dim)
+        self.ca_dec1 = SpatialCrossAttention(ch, token_dim, n_heads, zero_init_output=True)
 
         # Zero-init final conv: Δε=0 at start → stable initialisation
         self.out_conv = nn.Conv2d(ch, in_ch, 1)
@@ -224,7 +240,11 @@ class GenomicResidualAdapter(nn.Module):
         hm = self.mid_ca(self.mid(h2, t_emb), g_tokens)               # (B, 4ch, H/4, W/4)
 
         # Decoder — skip from level N pairs with upsample from level N+1
-        d2 = self.dec2(torch.cat([self.up2(hm), h1], dim=1), t_emb)   # (B, 2ch, H/2, W/2)
-        d1 = self.dec1(torch.cat([self.up1(d2), h0], dim=1), t_emb)   # (B, ch, H, W)
+        d2 = self.ca_dec2(
+            self.dec2(torch.cat([self.up2(hm), h1], dim=1), t_emb), g_tokens
+        )  # (B, 2ch, H/2, W/2)
+        d1 = self.ca_dec1(
+            self.dec1(torch.cat([self.up1(d2), h0], dim=1), t_emb), g_tokens
+        )  # (B, ch, H, W)
 
         return self.out_conv(d1)  # (B, 3, H, W) = Δε

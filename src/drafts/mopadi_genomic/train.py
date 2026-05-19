@@ -154,7 +154,7 @@ class GenomicLitModel(LitModel):
                 # group by subtype
                 subtype_indices = defaultdict(list)
                 for idx, path in enumerate(tile_paths):
-                    from mopadi_genomic.dataset import patient_id_from_tile_path
+                    from src.drafts.mopadi_genomic.dataset import patient_id_from_tile_path
                     pid = patient_id_from_tile_path(path)
                     subtype = subtype_map.get(pid, "unknown")
                     subtype_indices[subtype].append(idx)

@@ -56,6 +56,7 @@ from .spatial_metrics_viz import (
     compare_metrics_across_subtypes,
     compute_spatial_metrics_per_tile,
     plot_knn_metrics_comparison,
+    plot_ripley_L_auc_comparison,
     plot_ripley_L_by_subtype,
     plot_voronoi_distribution,
     run_subtype_tests,
@@ -2098,6 +2099,7 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
     _need_nn_stats = "nn_distance_violins" in plots or "cross_type_proximity" in plots
     _need_topology = (
         "ripley_L_by_subtype" in plots
+        or "ripley_L_auc_by_subtype" in plots
         or "voronoi_distribution" in plots
         or "knn_metrics" in plots
     )
@@ -2199,6 +2201,15 @@ def run_tfd_separability_viz(cfg: dict, verbose: bool = True) -> None:
                 if verbose:
                     print("\n[TFD-Viz] Generating Ripley L(r) curves by subtype…")
                 plot_ripley_L_by_subtype(
+                    results=_topology_stats,
+                    output_dir=output_dir,
+                    dpi=dpi,
+                )
+
+            if "ripley_L_auc_by_subtype" in plots and _topology_stats is not None:
+                if verbose:
+                    print("\n[TFD-Viz] Generating Ripley L(r) AUC comparison by subtype…")
+                plot_ripley_L_auc_comparison(
                     results=_topology_stats,
                     output_dir=output_dir,
                     dpi=dpi,

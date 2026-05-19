@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import copy
 import logging
+from pathlib import Path
 
 import torch
 import torch.nn.functional as F
@@ -95,7 +96,11 @@ class GDALitModel(_BaseGenomicLitModel):
         self._ema_adapter.requires_grad_(False)
         self._ema_genomic_encoder = copy.deepcopy(self.genomic_encoder)
         self._ema_genomic_encoder.requires_grad_(False)
-        self._ema_null_token = copy.deepcopy(self.null_token.data)
+        self.register_buffer(
+            "_ema_null_token",
+            torch.zeros(conf.adapter_n_tokens, conf.adapter_token_dim),
+            persistent=False,
+        )
 
         n_adapter = sum(p.numel() for p in self.adapter.parameters())
         n_enc = sum(p.numel() for p in self.genomic_encoder.parameters())
@@ -104,6 +109,55 @@ class GDALitModel(_BaseGenomicLitModel):
             "null_token shape=%s",
             n_adapter, n_enc, list(self.null_token.shape),
         )
+
+    # ------------------------------------------------------------------
+    # Checkpoint compatibility
+    # ------------------------------------------------------------------
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        # ── Model weights: fill in any new params not present in checkpoint ──
+        # (e.g. decoder CA layers added after the first run)
+        ckpt_sd = checkpoint.get("state_dict", {})
+        model_sd = self.state_dict()
+        added = []
+        for k, v in model_sd.items():
+            if k not in ckpt_sd:
+                ckpt_sd[k] = v
+                added.append(k)
+        if added:
+            log.info("on_load_checkpoint: initialised %d new params from scratch: %s",
+                     len(added), added[:8])
+        checkpoint["state_dict"] = ckpt_sd
+
+        # ── Optimizer states: drop if param group sizes no longer match ───
+        # PyTorch raises ValueError if the saved group has a different number of
+        # params than the current optimizer group.  This happens whenever new
+        # parameters are added to an optimizer (e.g. decoder CA added to
+        # opt_adapter).  Clearing optimizer_states makes Lightning skip restoring
+        # them; model weights above are fully preserved, and only Adam momentum
+        # buffers are lost (acceptable after an architecture change).
+        opt_states = checkpoint.get("optimizer_states")
+        if opt_states:
+            # opt_backbone → self.model.parameters()  (group index 0)
+            # opt_adapter  → adapter + genomic_encoder + null_token  (group index 1)
+            current_sizes = [
+                sum(1 for _ in self.model.parameters()),
+                sum(1 for _ in self.adapter.parameters())
+                + sum(1 for _ in self.genomic_encoder.parameters())
+                + 1,  # null_token
+            ]
+            for i, (saved_opt, expected) in enumerate(zip(opt_states, current_sizes)):
+                saved_groups = saved_opt.get("param_groups", [])
+                saved_size = len(saved_groups[0]["params"]) if saved_groups else 0
+                if saved_size != expected:
+                    log.warning(
+                        "Optimizer %d param group size mismatch "
+                        "(saved=%d, current=%d) — discarding optimizer states. "
+                        "Model weights are preserved; Adam momentum resets.",
+                        i, saved_size, expected,
+                    )
+                    checkpoint["optimizer_states"] = []
+                    break
 
     # ------------------------------------------------------------------
     # Sample counter
@@ -161,6 +215,56 @@ class GDALitModel(_BaseGenomicLitModel):
             weight_decay=1e-2,
         )
         return [opt_backbone, opt_adapter], []
+
+    # ------------------------------------------------------------------
+    # Data loading — subtype-balanced sampling
+    # ------------------------------------------------------------------
+
+    def train_dataloader(self):
+        """Subtype-balanced DataLoader.
+
+        Each tile is weighted by 1 / (total tiles in its PAM50 subtype), so
+        every subtype has equal expected frequency per batch regardless of how
+        many patients/tiles it has in the training split.
+
+        Without this, LumA (≈51 % of training patients) would dominate batch
+        gradients and adapter corrections for rare subtypes (Her2, Normal)
+        would be systematically undertrained.
+        """
+        from collections import Counter
+
+        import torch.utils.data as tud
+
+        from src.drafts.mopadi_genomic.dataset import patient_id_from_tile_path
+
+        tile_paths = self.train_data.tile_paths
+        subtype_map = self.train_data._subtype_map
+
+        subtype_counts: Counter = Counter()
+        tile_subtypes: list = []
+        for path in tile_paths:
+            pid = patient_id_from_tile_path(path)
+            subtype = subtype_map.get(pid, "unknown")
+            tile_subtypes.append(subtype)
+            subtype_counts[subtype] += 1
+
+        weights = torch.tensor(
+            [1.0 / subtype_counts[s] for s in tile_subtypes],
+            dtype=torch.float32,
+        )
+        sampler = tud.WeightedRandomSampler(
+            weights, num_samples=len(tile_paths), replacement=True
+        )
+
+        if self.global_rank == 0:
+            log.info(
+                "Subtype-balanced sampler: %s",
+                {s: c for s, c in sorted(subtype_counts.items())},
+            )
+
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(self.train_data, drop_last=True, sampler=sampler)
 
     # ------------------------------------------------------------------
     # Training
@@ -226,16 +330,44 @@ class GDALitModel(_BaseGenomicLitModel):
             self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
 
         # guidance_delta: E[‖Δε_own − Δε_null‖²]
-        # Primary health indicator — must grow as adapter learns conditioning.
-        if self.global_rank == 0 and (self.num_samples % (500 * self.conf.batch_size_effective) < self.conf.batch_size_effective):
+        # Fires exactly once per interval (< batch_size, not < batch_size_effective).
+        # Uses fresh x_t with randomly drawn timesteps so consecutive measurements
+        # are independent of the training batch's t distribution.
+        _gd_interval = 500 * self.conf.batch_size_effective
+        if self.global_rank == 0 and (self.num_samples % _gd_interval < self.conf.batch_size):
             with torch.no_grad():
-                b = min(4, B)
-                d_own = self.adapter(x_t[:b].detach(), t[:b], g_tokens[:b].detach())
-                d_null = self.adapter(x_t[:b].detach(), t[:b], null_expanded[:b].detach())
-                guidance_delta = (d_own - d_null).pow(2).mean().item()
+                bm = min(16, B)
+                t_m = torch.randint(0, self.conf.T, (bm,), device=self.device)
+                x_t_m = self.sampler.q_sample(
+                    imgs[:bm].detach(), t_m,
+                    noise=torch.randn_like(imgs[:bm]),
+                )
+                g_tok_m = self.genomic_encoder(feats[:bm].detach())
+                null_m = self.null_token.unsqueeze(0).expand(bm, -1, -1).detach()
+                d_own_m = self.adapter(x_t_m, t_m, g_tok_m)
+                d_null_m = self.adapter(x_t_m, t_m, null_m)
+                guidance_delta = (d_own_m - d_null_m).pow(2).mean().item()
                 self.logger.experiment.add_scalar(
                     "cond/guidance_delta", guidance_delta, self.num_samples
                 )
+
+                # Encoder health: are g_tokens diverse across patients?
+                # If g_token_diversity ≈ 0, the genomic encoder has collapsed.
+                # If g_vs_null_dist ≈ 0, real tokens ≈ null token → adapter can't distinguish.
+                g_tok_mean = g_tok_m.mean(dim=0, keepdim=True)
+                g_token_diversity = (g_tok_m - g_tok_mean).pow(2).mean().item()
+                g_vs_null = (g_tok_m - null_m).pow(2).mean().item()
+                self.logger.experiment.add_scalar(
+                    "cond/g_token_diversity", g_token_diversity, self.num_samples
+                )
+                self.logger.experiment.add_scalar(
+                    "cond/g_vs_null_dist", g_vs_null, self.num_samples
+                )
+
+        # Sample image grid: clean | noisy | backbone_recon | cond_recon | guidance_delta_vis
+        _si_interval = self.conf.reconstruct_every_samples
+        if self.global_rank == 0 and (self.num_samples % _si_interval < self.conf.batch_size):
+            self._log_sample_images(imgs.detach(), feats.detach())
 
         return loss
 
@@ -248,7 +380,7 @@ class GDALitModel(_BaseGenomicLitModel):
             return
 
         # Backbone EMA (from parent)
-        from mopadi.utils.ema import ema as _ema
+        from mopadi.train_diff_autoenc import ema as _ema
         _ema(self.model, self.ema_model, self.conf.ema_decay)
 
         # Adapter EMA (manual)
@@ -283,11 +415,129 @@ class GDALitModel(_BaseGenomicLitModel):
             delta_eps = self._ema_adapter(x_t, t, g_tokens)
             loss_val = F.mse_loss(eps_backbone + delta_eps, noise)
 
-        self.log("loss/val", loss_val, on_step=False, on_epoch=True,
-                 sync_dist=True, prog_bar=True)
-        if self.global_rank == 0:
-            self.logger.experiment.add_scalar("loss/val", loss_val.item(), self.num_samples)
+        # logger=False: accumulate in callback_metrics without writing to TFBoard
+        # per batch (which would create 100 entries per val run at the same step).
+        # on_validation_epoch_end writes a single add_scalar at num_samples.
+        self.log("_val_loss", loss_val, on_step=False, on_epoch=True,
+                 sync_dist=True, prog_bar=True, logger=False)
         return loss_val
+
+    def on_validation_epoch_end(self) -> None:
+        if self.trainer.state.stage == "sanity_check":
+            return
+        val_loss = self.trainer.callback_metrics.get("_val_loss")
+        if val_loss is not None:
+            if self.global_rank == 0:
+                self.logger.experiment.add_scalar(
+                    "loss/val", val_loss.item(), self.num_samples
+                )
+            # sync_dist=False: already aggregated by validation_step's sync_dist=True
+            self.log("loss/val_ckpt", val_loss, prog_bar=False, sync_dist=False)
+
+    # ------------------------------------------------------------------
+    # Training-time sample visualisation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _log_sample_images(self, imgs: torch.Tensor, feats: torch.Tensor) -> None:
+        """
+        Save a reconstruction grid to TensorBoard + disk.
+
+        Rows (each column = one patient tile):
+          1. clean original
+          2. noisy at t=250 (~25 % of T)
+          3. backbone-only reconstruction of x_0
+          4. backbone + adapter (conditioned) reconstruction of x_0
+          5. guidance delta Δε_own − Δε_null (scaled for visibility)
+
+        If the sampler does not expose sqrt_alphas_cumprod the reconstruction
+        rows are omitted and only clean / noisy / guidance are shown.
+
+        A fixed sample batch is captured on the first call so the same patients
+        appear at every logging interval, making cross-step comparison meaningful.
+        """
+        from torchvision.utils import make_grid, save_image
+
+        # Capture and pin a fixed sample batch on the first call
+        if not hasattr(self, "_sample_imgs"):
+            b = min(8, imgs.shape[0])
+            self._sample_imgs = imgs[:b].clone().cpu()
+            self._sample_feats = feats[:b].clone().cpu()
+
+        imgs_s = self._sample_imgs.to(self.device)
+        feats_s = self._sample_feats.to(self.device, dtype=torch.float32)
+        b = imgs_s.shape[0]
+
+        t_vis = torch.full((b,), 250, device=self.device, dtype=torch.long)
+        x_t_vis = self.sampler.q_sample(
+            imgs_s, t_vis, noise=torch.randn_like(imgs_s)
+        )
+        t_scaled = self.sampler._scale_timesteps(t_vis)
+        zeros_cond = torch.zeros(b, self.conf.feat_dim, device=self.device, dtype=torch.float32)
+
+        g_tokens_vis = self.genomic_encoder(feats_s)
+        null_vis = self.null_token.unsqueeze(0).expand(b, -1, -1).detach()
+
+        eps_back = self.model.forward(
+            x=x_t_vis, t=t_scaled, x_start=imgs_s, cond=zeros_cond
+        ).pred
+        d_own = self.adapter(x_t_vis, t_vis, g_tokens_vis)
+        d_null = self.adapter(x_t_vis, t_vis, null_vis)
+
+        def _guidance_vis(delta):
+            g_min = delta.flatten(1).min(1).values.view(-1, 1, 1, 1)
+            g_max = delta.flatten(1).max(1).values.view(-1, 1, 1, 1)
+            return (2 * (delta - g_min) / (g_max - g_min + 1e-8) - 1).clamp(-1, 1)
+
+        rows = [imgs_s.clamp(-1, 1), x_t_vis.clamp(-1, 1)]
+
+        # Reconstruct x_0 from eps if the sampler exposes the alphas
+        try:
+            sac  = torch.as_tensor(
+                self.sampler.sqrt_alphas_cumprod, device=self.device, dtype=torch.float32
+            )
+            somc = torch.as_tensor(
+                self.sampler.sqrt_one_minus_alphas_cumprod, device=self.device, dtype=torch.float32
+            )
+            def _x0(x_t_, eps_, t_):
+                a = sac[t_].view(-1, 1, 1, 1)
+                b_ = somc[t_].view(-1, 1, 1, 1)
+                return ((x_t_ - b_ * eps_) / a).clamp(-1, 1)
+
+            rows += [_x0(x_t_vis, eps_back, t_vis), _x0(x_t_vis, eps_back + d_own, t_vis)]
+        except AttributeError:
+            pass
+
+        rows.append(_guidance_vis(d_own - d_null))
+        grid = make_grid(torch.cat(rows, dim=0), nrow=b, normalize=True,
+                         value_range=(-1, 1), padding=2)
+
+        self.logger.experiment.add_image("samples/train", grid, self.num_samples)
+        samples_dir = Path(self.conf.logdir) / "samples"
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        save_image(grid, samples_dir / f"samples_{self.num_samples:010d}.png")
+
+        # ── EMA version ───────────────────────────────────────────────────
+        eps_back_ema = self.ema_model.forward(
+            x=x_t_vis, t=t_scaled, x_start=imgs_s, cond=zeros_cond
+        ).pred
+        g_tok_ema = self._ema_genomic_encoder(feats_s)
+        null_ema = self._ema_null_token.unsqueeze(0).expand(b, -1, -1)
+        d_own_ema  = self._ema_adapter(x_t_vis, t_vis, g_tok_ema)
+        d_null_ema = self._ema_adapter(x_t_vis, t_vis, null_ema)
+
+        rows_ema = [imgs_s.clamp(-1, 1), x_t_vis.clamp(-1, 1)]
+        try:
+            rows_ema += [_x0(x_t_vis, eps_back_ema, t_vis),
+                         _x0(x_t_vis, eps_back_ema + d_own_ema, t_vis)]
+        except NameError:
+            pass
+        rows_ema.append(_guidance_vis(d_own_ema - d_null_ema))
+
+        grid_ema = make_grid(torch.cat(rows_ema, dim=0), nrow=b, normalize=True,
+                             value_range=(-1, 1), padding=2)
+        self.logger.experiment.add_image("samples/train_ema", grid_ema, self.num_samples)
+        save_image(grid_ema, samples_dir / f"samples_ema_{self.num_samples:010d}.png")
 
     # ------------------------------------------------------------------
     # Inference helper (used by sampling scripts)

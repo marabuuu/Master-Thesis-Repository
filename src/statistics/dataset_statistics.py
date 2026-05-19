@@ -950,6 +950,21 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
     # ── Load data ─────────────────────────────────────────────────────────────
     df = load_clinical_data(str(clinical_csv), patient_col)
 
+    # ── Optional: restrict to patients with computed segmentation masks ────────
+    masks_dir_cfg = cfg.get("masks_dir")
+    if masks_dir_cfg:
+        masks_dir_path = Path(masks_dir_cfg)
+        if masks_dir_path.exists():
+            available_ids = {p.stem for p in masks_dir_path.glob("*.zip")}
+            before = len(df)
+            df = df[df[patient_col].isin(available_ids)].copy()
+            if verbose:
+                print(f"[DatasetStats] Filtered to patients with segmentation masks: "
+                      f"{before:,} → {len(df):,}")
+        else:
+            if verbose:
+                print(f"[DatasetStats][WARN] masks_dir not found: {masks_dir_path} — skipping filter")
+
     shared_palette: Dict[str, str] = {}
     if subtype_col in df.columns:
         subtype_values = df[subtype_col].dropna().astype(str).str.strip()

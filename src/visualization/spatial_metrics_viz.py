@@ -380,24 +380,22 @@ def plot_ripley_L_by_subtype(
             return L_obs, L_lower, L_upper, radii
 
         if per_patient_dict:
-            # Compute per-patient mean, then average across patients
-            pat_L_obs, pat_L_lower, pat_L_upper = [], [], []
+            # One mean L(r) curve per patient, then summarise across patients
+            pat_L_obs = []
             radii_ref = None
             for pid, tiles in per_patient_dict.items():
-                L_obs, L_lower, L_upper, radii_list = _tile_curves(tiles)
+                L_obs, _, _, radii_list = _tile_curves(tiles)
                 if not L_obs:
                     continue
                 pat_L_obs.append(np.mean(L_obs, axis=0))
-                pat_L_lower.append(np.mean(L_lower, axis=0))
-                pat_L_upper.append(np.mean(L_upper, axis=0))
                 if radii_ref is None:
                     radii_ref = radii_list[0]
             n_label = f"n={len(pat_L_obs)} patients"
-            L_obs_all, L_lower_all, L_upper_all = pat_L_obs, pat_L_lower, pat_L_upper
+            L_obs_all = pat_L_obs
         else:
             # Fallback: tile-level aggregation (old flat-list format)
             tile_list = _tile_list(subtype_data)
-            L_obs_all, L_lower_all, L_upper_all, radii_list = _tile_curves(tile_list)
+            L_obs_all, _, _, radii_list = _tile_curves(tile_list)
             radii_ref = radii_list[0] if radii_list else None
             n_label = f"n={len(L_obs_all)} tiles"
 
@@ -406,14 +404,23 @@ def plot_ripley_L_by_subtype(
             continue
 
         radii = radii_ref
-        L_obs_mean = np.mean(L_obs_all, axis=0)
-        L_lower_mean = np.mean(L_lower_all, axis=0)
-        L_upper_mean = np.mean(L_upper_all, axis=0)
+        L_obs_arr = np.array(L_obs_all)          # (n_patients, n_radii)
+        L_obs_mean = L_obs_arr.mean(axis=0)
+        n_obs = len(L_obs_arr)
+        L_obs_sem = (
+            L_obs_arr.std(axis=0, ddof=1) / np.sqrt(n_obs)
+            if n_obs > 1 else np.zeros_like(L_obs_mean)
+        )
 
-        # Plot
-        ax.plot(radii, L_obs_mean, 'b-', linewidth=2, label='Observed L(r)')
-        ax.fill_between(radii, L_lower_mean, L_upper_mean, alpha=0.2, color='blue', label='CSR envelope (95%)')
-        ax.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.5)
+        # Plot mean curve + ±1 SEM band across patients
+        ax.plot(radii, L_obs_mean, 'b-', linewidth=2, label='Mean L(r)')
+        ax.fill_between(
+            radii,
+            L_obs_mean - L_obs_sem,
+            L_obs_mean + L_obs_sem,
+            alpha=0.25, color='blue', label='±1 SEM across patients',
+        )
+        ax.axhline(0, color='black', linestyle='--', linewidth=0.8, alpha=0.5, label='CSR (L = 0)')
         ax.set_title(f"{subtype} ({n_label})")
         ax.set_xlabel("Radius r (px)")
         if ax == axes[0]:
@@ -427,6 +434,188 @@ def plot_ripley_L_by_subtype(
     fig.savefig(out, dpi=dpi, bbox_inches='tight')
     plt.close()
     logger.info(f"Saved Ripley plot → {out}")
+
+
+def _auc_ripley_L(L: np.ndarray, radii: np.ndarray, r_min: float, r_max: float) -> float:
+    """Trapezoidal AUC of L(r) over [r_min, r_max]."""
+    mask = (radii >= r_min) & (radii <= r_max)
+    if mask.sum() < 2:
+        return np.nan
+    return float(np.trapz(L[mask], radii[mask]))
+
+
+def _draw_significance_bars(
+    ax: plt.Axes,
+    subtypes: List[str],
+    pairwise_q: Dict[str, float],
+    y_top: float,
+    y_range: float,
+) -> None:
+    """Annotate significant pairs with bracketed asterisks above the boxplot."""
+    sig: List[tuple] = []
+    for key, q in pairwise_q.items():
+        if q >= 0.05:
+            continue
+        idx = key.find("_vs_")
+        if idx < 0:
+            continue
+        s1, s2 = key[:idx], key[idx + 4:]
+        if s1 not in subtypes or s2 not in subtypes:
+            continue
+        stars = "***" if q < 0.001 else "**" if q < 0.01 else "*"
+        sig.append((subtypes.index(s1), subtypes.index(s2), stars))
+
+    # Stack bars narrowest-span first to minimise overlap
+    sig.sort(key=lambda t: abs(t[1] - t[0]))
+    step = 0.08 * y_range
+    for level, (i1, i2, stars) in enumerate(sig):
+        y = y_top + step * level
+        x1, x2 = min(i1, i2), max(i1, i2)
+        bar_h = step * 0.35
+        ax.plot([x1, x1, x2, x2], [y, y + bar_h, y + bar_h, y], "k-", lw=1.0)
+        ax.text((x1 + x2) / 2, y + bar_h, stars, ha="center", va="bottom", fontsize=9)
+
+    if sig:
+        ax.set_ylim(top=y_top + step * (len(sig) + 1.5))
+
+
+def plot_ripley_L_auc_comparison(
+    results: Dict[str, Union[List[Dict], Dict]],
+    output_dir: Union[str, Path],
+    r_min: float = 20.0,
+    r_max: float = 100.0,
+    cmap_name: str = CATEGORICAL_CMAP,
+    dpi: int = 150,
+) -> Dict:
+    """Reduce per-patient Ripley L(r) to a scalar AUC and compare across subtypes.
+
+    For each patient the mean tile-level L(r) curve is reduced to its area
+    under the curve (AUC) over ``[r_min, r_max]`` px.  A Kruskal-Wallis test
+    followed by pairwise Mann-Whitney U tests (Benjamini-Hochberg FDR) is then
+    run across subtypes.  The figure shows a boxplot with individual patient
+    dots and significance brackets for all q < 0.05 pairs.
+
+    Parameters
+    ----------
+    results : dict[str, list[dict] | dict]
+        Same format as :func:`plot_ripley_L_by_subtype`.
+    output_dir : path
+    r_min, r_max : float
+        Radius range (px) for the AUC integration.
+    cmap_name, dpi : see other plot functions.
+
+    Returns
+    -------
+    dict
+        Output of :func:`run_subtype_tests` — Kruskal-Wallis H/p, pairwise q.
+    """
+    try:
+        import matplotlib.pyplot as plt
+        import seaborn as sns
+    except ImportError:
+        logger.warning("matplotlib/seaborn not available; skipping AUC plot.")
+        return {}
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    # ------------------------------------------------------------------
+    # Collect one AUC scalar per patient per subtype
+    # ------------------------------------------------------------------
+    patient_auc: Dict[str, np.ndarray] = {}
+    for subtype, subtype_data in sorted(results.items()):
+        per_patient_dict = (
+            subtype_data.get("per_patient", {})
+            if isinstance(subtype_data, dict) else {}
+        )
+        aucs: List[float] = []
+        if per_patient_dict:
+            for pid, tiles in per_patient_dict.items():
+                L_curves = [td["ripley_L"] for td in tiles if td["ripley_L"].size > 0]
+                radii_list = [td["ripley_radii"] for td in tiles if td["ripley_radii"].size > 0]
+                if not L_curves:
+                    continue
+                mean_L = np.mean(L_curves, axis=0)
+                auc = _auc_ripley_L(mean_L, radii_list[0], r_min, r_max)
+                if np.isfinite(auc):
+                    aucs.append(auc)
+        else:
+            # Fallback: treat all tiles as one virtual patient
+            tile_list = _tile_list(subtype_data)
+            L_curves = [td["ripley_L"] for td in tile_list if td["ripley_L"].size > 0]
+            radii_all = [td["ripley_radii"] for td in tile_list if td["ripley_radii"].size > 0]
+            if L_curves:
+                mean_L = np.mean(L_curves, axis=0)
+                auc = _auc_ripley_L(mean_L, radii_all[0], r_min, r_max)
+                if np.isfinite(auc):
+                    aucs.append(auc)
+        patient_auc[subtype] = np.array(aucs)
+
+    # ------------------------------------------------------------------
+    # Statistical test
+    # ------------------------------------------------------------------
+    metric_name = f"ripley_L_auc_{int(r_min)}-{int(r_max)}px"
+    test_results = run_subtype_tests(patient_auc, metric_name=metric_name)
+    logger.info("Ripley L AUC test: %s", test_results)
+
+    # ------------------------------------------------------------------
+    # Plot
+    # ------------------------------------------------------------------
+    records = [
+        {"Subtype": subtype, "AUC L(r)": auc}
+        for subtype, aucs in patient_auc.items()
+        for auc in aucs
+    ]
+    if not records:
+        logger.warning("No AUC data to plot.")
+        return test_results
+
+    df = pd.DataFrame(records)
+    subtypes = _ordered_subtypes(df["Subtype"].unique().tolist())
+    palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
+
+    fig, ax = plt.subplots(figsize=(8, 5))
+    sns.boxplot(
+        data=df, x="Subtype", y="AUC L(r)", hue="Subtype",
+        order=subtypes, palette=palette, legend=False,
+        width=0.55, fliersize=0, ax=ax,
+    )
+    sns.stripplot(
+        data=df, x="Subtype", y="AUC L(r)",
+        order=subtypes, color="black", alpha=0.35, size=3, jitter=True, ax=ax,
+    )
+
+    # n-labels below the x-axis ticks
+    y_lo, y_hi = ax.get_ylim()
+    for i, s in enumerate(subtypes):
+        n = len(patient_auc.get(s, []))
+        ax.text(i, y_lo - 0.03 * (y_hi - y_lo), f"n={n}",
+                ha="center", va="top", fontsize=8, color="dimgray")
+
+    # Significance bars
+    pairwise_q = test_results.get("pairwise_q", {})
+    _draw_significance_bars(ax, subtypes, pairwise_q, y_top=y_hi, y_range=(y_hi - y_lo))
+
+    # Title with Kruskal-Wallis result
+    kw_p = test_results.get("kruskal_p", float("nan"))
+    kw_h = test_results.get("kruskal_H", float("nan"))
+    ax.set_title(
+        f"Ripley L(r) AUC [{r_min:.0f}–{r_max:.0f} px] per Patient by PAM50 Subtype\n"
+        f"Kruskal-Wallis H={kw_h:.2f}, p={kw_p:.3g}",
+        fontsize=10,
+    )
+    ax.set_xlabel("PAM50 Subtype")
+    ax.set_ylabel(f"AUC of L(r)  [{r_min:.0f}–{r_max:.0f} px]")
+    ax.axhline(0, color="black", linestyle="--", linewidth=0.8, alpha=0.4)
+    ax.grid(axis="y", alpha=0.3)
+    fig.tight_layout()
+
+    out = output_dir / "spatial_ripley_L_auc_by_subtype.png"
+    fig.savefig(out, dpi=dpi, bbox_inches="tight")
+    plt.close()
+    logger.info("Saved Ripley L AUC plot → %s", out)
+
+    return test_results
 
 
 def plot_voronoi_distribution(

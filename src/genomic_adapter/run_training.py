@@ -102,7 +102,7 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         filename="{epoch}-{step}",
         save_last=True,
         save_top_k=cfg.get("save_top_k", 3),
-        monitor=cfg.get("monitor_metric", "loss/val"),
+        monitor=cfg.get("monitor_metric", "loss/val_ckpt"),
         mode="min",
         every_n_train_steps=ckpt_every_steps,
     )

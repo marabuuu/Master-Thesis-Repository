@@ -32,8 +32,9 @@ class GDAConfig(GenomicTrainConfig):
 
     # ── CFG ──────────────────────────────────────────────────────────
     # Override parent's cond_dropout_prob with a clearer name.
-    # 30 % null dropout forces adapter to encode a meaningful CFG delta.
-    cfg_dropout: float = 0.30
+    # 15 % null dropout: enough for CFG at inference while giving the adapter
+    # more gradient signal on real tokens during early training.
+    cfg_dropout: float = 0.15
 
     # ── Per-component learning rates ─────────────────────────────────
     # Parent's conf.lr is used for the backbone; adapter gets its own LR.

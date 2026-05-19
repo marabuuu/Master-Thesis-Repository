@@ -8,6 +8,7 @@ dataset_statistics:
   menopause_col: menopause_status
   os_time_col: OS.time
   os_event_col: OS
+  masks_dir: ./experiments/20260509_tfd_separability/masks
   output_dir: ./experiments/20260504_dataset_statistics
   plots:
   - tumor_stage_distribution
@@ -516,12 +517,7 @@ genomic_adapter_training:
   zip_dir: ../data/BRCA-tumor-tiles-final
   genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
   patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
-  max_tiles_by_subtype:
-    LumA: 45
-    LumB: 120
-    Basal: 135
-    Her2: 300
-    Normal: null
+  max_tiles_by_subtype:  # null = no cap; subtype balance handled by WeightedRandomSampler
 
   # ── Backbone UNet architecture (same as v11/v12 for comparability) ───────
   img_size: 512
@@ -544,7 +540,9 @@ genomic_adapter_training:
   adapter_n_heads: 4           # attention heads in adapter cross-attention
 
   # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.30            # 30 % null-token dropout → adapter learns CFG delta
+  # 15 % null dropout: enough for CFG at inference while giving the adapter
+  # ~85 % of batches with real genomic tokens during early training.
+  cfg_dropout: 0.15
 
   # ── Optimisation — two separate LRs ─────────────────────────────────────
   backbone_lr: 1.0e-4          # AdamW LR for backbone UNet
@@ -562,7 +560,7 @@ genomic_adapter_training:
   limit_val_batches: 100
   save_every_samples: 200000
   save_top_k: 3
-  monitor_metric: loss/val
+  monitor_metric: loss/val_ckpt
   steps_per_epoch: 5000
   reconstruct_every_samples: 200000
   sample_size: 8
