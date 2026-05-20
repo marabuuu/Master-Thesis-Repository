@@ -236,6 +236,8 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         cfg_dropout=float(_get("cfg_dropout", 0.30)),
         backbone_lr=float(_get("backbone_lr", 1e-4)),
         adapter_lr=float(_get("adapter_lr", 3e-4)),
+        contrastive_weight=float(_get("contrastive_weight", 0.01)),
+        contrastive_temp=float(_get("contrastive_temp", 0.1)),
         # Unused parent fields set to neutral values
         counterfactual_loss_weight=0.0,
         cond_dropout_prob=0.0,

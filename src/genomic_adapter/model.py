@@ -189,8 +189,49 @@ class GDALitModel(_BaseGenomicLitModel):
             flat["img"] = img.reshape(B * N, C, H, W)
             feat = batch["feat"]
             flat["feat"] = feat.unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
+            if "subtype" in flat:
+                flat["subtype"] = [s for s in flat["subtype"] for _ in range(N)]
             return flat, N
         return batch, 1
+
+    @staticmethod
+    def _subtype_contrastive_loss(
+        g_tokens: torch.Tensor,
+        subtypes: list,
+        temperature: float = 0.1,
+    ) -> torch.Tensor:
+        """Supervised contrastive loss (SupCon) on mean-pooled g_tokens.
+
+        Pulls same-subtype token vectors together and pushes different-subtype
+        vectors apart.  Returns zero if the batch has fewer than 2 distinct
+        subtypes or no anchor has a same-subtype neighbour.
+        """
+        # Mean-pool tokens per sample and L2-normalise → (B, D)
+        z = F.normalize(g_tokens.float().mean(dim=1), dim=-1)
+        B = z.shape[0]
+
+        unique_subtypes = list(dict.fromkeys(subtypes))
+        if len(unique_subtypes) < 2:
+            return z.new_zeros(())
+
+        label_map = {s: i for i, s in enumerate(unique_subtypes)}
+        labels = torch.tensor([label_map[s] for s in subtypes], device=z.device)
+
+        mask_self = torch.eye(B, dtype=torch.bool, device=z.device)
+        mask_pos = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~mask_self  # (B, B)
+
+        if not mask_pos.any():
+            return z.new_zeros(())
+
+        sim = torch.matmul(z, z.T) / temperature                                 # (B, B)
+        log_denom = torch.logsumexp(
+            sim.masked_fill(mask_self, -1e9), dim=1, keepdim=True
+        )                                                                         # (B, 1)
+        log_prob = sim - log_denom                                               # (B, B)
+
+        n_pos = mask_pos.float().sum(dim=1)                                      # (B,)
+        loss_per_anchor = -(log_prob * mask_pos.float()).sum(dim=1) / n_pos.clamp(min=1)
+        return loss_per_anchor[n_pos > 0].mean()
 
     # ------------------------------------------------------------------
     # Optimizers
@@ -294,6 +335,17 @@ class GDALitModel(_BaseGenomicLitModel):
         # Differentiable conditional replace (avoids in-place on leaf tensor)
         g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
 
+        # ── Subtype contrastive loss on real g_tokens (float32, before autocast) ──
+        # Computed here so gradients reach genomic_encoder in full precision.
+        # Uses real tokens only (not null-replaced) so the loss reflects the
+        # encoder's actual subtype separation, not the CFG-dropout mixture.
+        if self.conf.contrastive_weight > 0 and "subtype" in batch:
+            c_loss = self._subtype_contrastive_loss(
+                g_tokens, batch["subtype"], self.conf.contrastive_temp
+            )
+        else:
+            c_loss = feats.new_zeros(())
+
         # ── Forward pass ─────────────────────────────────────────────────
         with torch.autocast(device_type="cuda", enabled=self.conf.fp16):
             # Backbone: unconditional ε prediction
@@ -309,7 +361,9 @@ class GDALitModel(_BaseGenomicLitModel):
             # Adapter: genomic correction Δε
             delta_eps = self.adapter(x_t, t, g_tokens_train)           # (B, 3, H, W)
 
-            loss = F.mse_loss(eps_backbone + delta_eps, noise)
+            mse_loss = F.mse_loss(eps_backbone + delta_eps, noise)
+
+        loss = mse_loss + self.conf.contrastive_weight * c_loss
 
         self.manual_backward(loss / accum)
 
@@ -328,6 +382,10 @@ class GDALitModel(_BaseGenomicLitModel):
         # ── Logging ───────────────────────────────────────────────────────
         if self.global_rank == 0:
             self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
+            if self.conf.contrastive_weight > 0:
+                self.logger.experiment.add_scalar(
+                    "cond/contrastive_loss", c_loss.item(), self.num_samples
+                )
 
         # guidance_delta: E[‖Δε_own − Δε_null‖²]
         # Fires exactly once per interval (< batch_size, not < batch_size_effective).

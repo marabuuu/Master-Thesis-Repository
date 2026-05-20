@@ -36,6 +36,14 @@ class GDAConfig(GenomicTrainConfig):
     # more gradient signal on real tokens during early training.
     cfg_dropout: float = 0.15
 
+    # ── Subtype contrastive loss ──────────────────────────────────────
+    # Supervised contrastive loss (SupCon) on mean-pooled g_tokens grouped
+    # by PAM50 subtype.  Pulls same-subtype token vectors together and pushes
+    # different-subtype vectors apart, directly regularising the bottleneck.
+    # Set to 0.0 to disable.
+    contrastive_weight: float = 0.01
+    contrastive_temp: float = 0.1
+
     # ── Per-component learning rates ─────────────────────────────────
     # Parent's conf.lr is used for the backbone; adapter gets its own LR.
     backbone_lr: float = 1e-4
