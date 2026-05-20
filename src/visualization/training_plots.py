@@ -34,16 +34,30 @@ from typing import Any, Dict, List, Optional, Sequence, Tuple, Union, TYPE_CHECK
 
 import numpy as np
 
-from .core import (
-    CATEGORICAL_CMAP,
-    SEQUENTIAL_CMAP,
-    _check_matplotlib,
-    get_categorical_colors,
-    get_crameri_cmap,
-    save_figure,
-    setup_style,
-    show_or_save,
-)
+try:
+    from .core import (
+        CATEGORICAL_CMAP,
+        SEQUENTIAL_CMAP,
+        _check_matplotlib,
+        get_categorical_colors,
+        get_crameri_cmap,
+        save_figure,
+        setup_style,
+        show_or_save,
+    )
+except ImportError:
+    import sys as _sys
+    _sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
+    from src.visualization.core import (  # type: ignore[no-redef]
+        CATEGORICAL_CMAP,
+        SEQUENTIAL_CMAP,
+        _check_matplotlib,
+        get_categorical_colors,
+        get_crameri_cmap,
+        save_figure,
+        setup_style,
+        show_or_save,
+    )
 
 try:
     import matplotlib.pyplot as plt
@@ -95,6 +109,60 @@ def _aggregate_by_step(
         agg[s].append(v)
     sorted_steps = sorted(agg)
     return sorted_steps, [float(np.mean(agg[s])) for s in sorted_steps]
+
+
+def _bin_series(
+    steps: List[float],
+    values: List[float],
+    n_bins: int = 50,
+) -> Tuple[List[float], List[float]]:
+    """Bin a dense (steps, values) series into n_bins equal-width step windows.
+
+    Returns the bin-centre x and the mean y per bin.  Useful for turning a
+    noisy step-level loss curve into a smooth epoch-level trend line without
+    throwing away data in the faded raw plot.
+    """
+    if not steps:
+        return [], []
+    arr_s = np.asarray(steps, dtype=float)
+    arr_v = np.asarray(values, dtype=float)
+    edges = np.linspace(arr_s.min(), arr_s.max(), n_bins + 1)
+    centers, means = [], []
+    for i in range(n_bins):
+        mask = (arr_s >= edges[i]) & (arr_s < edges[i + 1])
+        if mask.any():
+            centers.append(float(0.5 * (edges[i] + edges[i + 1])))
+            means.append(float(arr_v[mask].mean()))
+    return centers, means
+
+
+def _ema_series(
+    steps: List[float],
+    values: List[float],
+    alpha: float = 0.005,
+    max_points: int = 2000,
+) -> Tuple[List[float], List[float]]:
+    """Exponential moving average smoothing of a noisy step-level series.
+
+    Unlike bin-averaging, EMA inherits the very first value and then
+    exponentially tracks the true mean — so a training-loss curve that starts
+    at 1.0 and drops quickly will actually *show* 1.0 at the left edge, which
+    bin-averaging over wide windows cannot do.
+
+    Steps are sorted before smoothing so multi-file data merges correctly.
+    The result is thinned to at most *max_points* for fast rendering.
+    """
+    if not steps:
+        return [], []
+    pairs = sorted(zip(steps, values))
+    s = [p[0] for p in pairs]
+    v = [p[1] for p in pairs]
+    ema = [v[0]]
+    for i in range(1, len(v)):
+        ema.append(alpha * v[i] + (1.0 - alpha) * ema[-1])
+    # Thin evenly so we don't plot 40 000 points
+    stride = max(1, len(s) // max_points)
+    return s[::stride], ema[::stride]
 
 
 def _series_payload(run: TrainingRun, *candidate_names: str) -> Optional[Dict[str, Any]]:
@@ -873,3 +941,325 @@ def _annotate_min(
         fontsize=7,
         color=color,
     )
+
+
+# ===================================================================
+#  GDA v13 — direct TFEvents loader + diagnostic plotter
+# ===================================================================
+
+
+def load_gda_tfevents(
+    logdir: Union[str, Path],
+    large_file_budget: int = 4000,
+    small_file_threshold_mb: float = 10.0,
+) -> Dict[str, Tuple[List[float], List[float]]]:
+    """Load scalar metrics from a TFEvents logdir into (steps, values) pairs.
+
+    Each event file is loaded **separately** so that small early files (which
+    contain the initial high-loss phase) get proportionally more representation
+    than the large later files.  Without this, global reservoir sampling across
+    all files starves the early file of its ~8 slots out of 8 000, causing the
+    plot to miss the loss=1.0 starting point entirely.
+
+    Strategy
+    --------
+    - Files  < *small_file_threshold_mb* : read **all** events (no cap).
+    - Files >= *small_file_threshold_mb* : cap at *large_file_budget* per tag.
+
+    Parameters
+    ----------
+    large_file_budget : int
+        Max scalar events per tag for large files (reservoir-sampled).
+    small_file_threshold_mb : float
+        Files below this size (MB) are read in full.
+    """
+    import glob
+    import os as _os
+
+    try:
+        from tensorboard.backend.event_processing.event_accumulator import EventAccumulator
+    except ImportError as exc:
+        raise ImportError(
+            "tensorboard is required: pip install tensorboard"
+        ) from exc
+
+    files = sorted(glob.glob(_os.path.join(str(logdir), "events.out.tfevents.*")))
+    result: Dict[str, Tuple[List[float], List[float]]] = {}
+
+    for fpath in files:
+        size_mb = _os.path.getsize(fpath) / (1024 ** 2)
+        budget = 0 if size_mb < small_file_threshold_mb else large_file_budget
+        ea = EventAccumulator(fpath, size_guidance={"scalars": budget})
+        ea.Reload()
+        for tag in ea.Tags().get("scalars", []):
+            events = ea.Scalars(tag)
+            if tag not in result:
+                result[tag] = ([], [])
+            result[tag][0].extend(float(e.step) for e in events)
+            result[tag][1].extend(float(e.value) for e in events)
+
+    return result
+
+
+def plot_gda_v13_diagnostics(
+    logdir: Union[str, Path],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (16, 14),
+    cmap_name: str = CATEGORICAL_CMAP,
+    title: str = "GDA v13 — Training Diagnostics",
+) -> "Figure":
+    """Six-panel diagnostic figure for GDA v13 from TFEvents.
+
+    Panels
+    ------
+    1. Training loss  (step-level, smoothed)
+    2. Validation loss  (aggregated — one point per val run)
+    3. guidance_delta  = E[‖Δε_own − Δε_null‖²]  (primary CFG signal)
+    4. g_token_diversity  (variance of genomic token embeddings)
+    5. g_vs_null_dist  (L2 distance between cond and null tokens)
+    6. Learning-rate schedule  (backbone AdamW + adapter AdamW-1)
+
+    Parameters
+    ----------
+    logdir : str | Path
+        Directory containing the TFEvents files, e.g.
+        ``experiments/20260517_gda_v13/gda/``.
+    save_path : str | Path | None
+        If given, the figure is written to this path (PNG/PDF/SVG).
+    show : bool
+        Call ``plt.show()`` after rendering.
+    """
+    _check_matplotlib()
+    setup_style()
+
+    data = load_gda_tfevents(logdir)
+
+    def _get(tag: str) -> Tuple[List[float], List[float]]:
+        return data.get(tag, ([], []))
+
+    train_steps, train_vals = _get("loss/train")
+    # Prefer loss/val (sample-step scale, more points) over loss/val_ckpt
+    # (optimizer-step scale, only 4 clean points from latest job).
+    # _aggregate_by_step collapses duplicates from the old per-batch logging bug.
+    val_steps_raw, val_vals_raw = _get("loss/val")
+    if not val_vals_raw:
+        val_steps_raw, val_vals_raw = _get("loss/val_ckpt")
+    val_steps, val_vals = _aggregate_by_step(val_steps_raw, val_vals_raw)
+
+    delta_steps_raw, delta_vals_raw = _get("cond/guidance_delta")
+    delta_steps, delta_vals = _aggregate_by_step(delta_steps_raw, delta_vals_raw)
+
+    div_steps_raw, div_vals_raw = _get("cond/g_token_diversity")
+    div_steps, div_vals = _aggregate_by_step(div_steps_raw, div_vals_raw)
+
+    dist_steps_raw, dist_vals_raw = _get("cond/g_vs_null_dist")
+    dist_steps, dist_vals = _aggregate_by_step(dist_steps_raw, dist_vals_raw)
+
+    lr0_steps, lr0_vals = _get("lr-AdamW")
+    lr1_steps, lr1_vals = _get("lr-AdamW-1")
+
+    colors = get_categorical_colors(8, cmap_name=cmap_name)
+    seq_cmap = get_crameri_cmap(SEQUENTIAL_CMAP)
+
+    fig, axes = plt.subplots(3, 2, figsize=figsize)
+    axs = axes.flatten()
+
+    # ------------------------------------------------------------------
+    # Panel 1 — Combined train + val loss (epoch-binned, no scatter)
+    # x-axis in millions of samples so it reads like a normal loss curve.
+    # ------------------------------------------------------------------
+    ax = axs[0]
+    has_loss = False
+    # Pre-compute EMA-smoothed train loss (sorts multi-file data by step)
+    ex_M, ey = [], []
+    if train_vals:
+        raw_x_M = [s / 1e6 for s in train_steps]
+        ex_M, ey = _ema_series(raw_x_M, list(train_vals), alpha=0.005)
+        ax.plot(ex_M, ey, linewidth=2.2, color=colors[0], label="train loss (EMA)")
+        has_loss = True
+    # Pre-compute binned val loss
+    exv_M, eyv = [], []
+    best_idx = 0
+    n_vbins = 50
+    if val_vals:
+        raw_xv_M = [s / 1e6 for s in val_steps]
+        yv_arr = np.asarray(val_vals, dtype=float)
+        n_vbins = min(50, max(6, len(yv_arr) // 3))
+        exv_M, eyv = _bin_series(raw_xv_M, list(yv_arr), n_bins=n_vbins)
+        if exv_M:
+            ax.plot(exv_M, eyv, linewidth=2.2, color=colors[1], label="val loss")
+            has_loss = True
+        best_idx = int(np.argmin(yv_arr))
+        ax.scatter([raw_xv_M[best_idx]], [yv_arr[best_idx]], s=130, marker="*",
+                   color=colors[2], edgecolors="black", linewidth=0.6, zorder=5,
+                   label=f"best val  {yv_arr[best_idx]:.4f}")
+    if not has_loss:
+        ax.text(0.5, 0.5, "No loss data", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Training and Validation Loss", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("MSE Loss")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 2 — Same EMA/binned curves on log scale (fine convergence)
+    # ------------------------------------------------------------------
+    ax = axs[1]
+    has_loss2 = False
+    if ex_M:
+        ax.plot(ex_M, ey, linewidth=2.2, color=colors[0], label="train loss (EMA)")
+        has_loss2 = True
+    if exv_M:
+        ax.plot(exv_M, eyv, linewidth=2.2, color=colors[1], label="val loss")
+        has_loss2 = True
+    if val_vals:
+        ax.scatter([raw_xv_M[best_idx]], [yv_arr[best_idx]], s=130, marker="*",
+                   color=colors[2], edgecolors="black", linewidth=0.6, zorder=5,
+                   label=f"best val  {yv_arr[best_idx]:.4f}")
+    if has_loss2:
+        ax.set_yscale("log")
+    else:
+        ax.text(0.5, 0.5, "No loss data", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Training and Validation Loss (log scale)", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("MSE Loss (log)")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22, which="both")
+
+    # ------------------------------------------------------------------
+    # Panel 3 — guidance_delta (primary CFG health metric)
+    # ------------------------------------------------------------------
+    ax = axs[2]
+    if delta_vals:
+        ax.plot(delta_steps, delta_vals, "-o", markersize=4, linewidth=1.4,
+                color=seq_cmap(0.75), label="guidance_delta")
+        ax.axhline(0.0, color="grey", linewidth=0.8, alpha=0.4, linestyle="--")
+        positive = [v for v in delta_vals if v > 0]
+        if positive and max(positive) / max(min(positive), 1e-12) > 20:
+            ax.set_yscale("log")
+        ax.legend(framealpha=0.9, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No cond/guidance_delta data yet", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Guidance Delta  E[‖Δε_own − Δε_null‖²]", fontweight="bold")
+    ax.set_xlabel("Global Step (≈ samples seen)")
+    ax.set_ylabel("guidance_delta")
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 4 — g_token_diversity
+    # ------------------------------------------------------------------
+    ax = axs[3]
+    if div_vals:
+        ax.plot(div_steps, div_vals, "-o", markersize=4, linewidth=1.4,
+                color=colors[3], label="g_token_diversity")
+        ax.legend(framealpha=0.9, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No cond/g_token_diversity data yet", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Genomic Token Diversity", fontweight="bold")
+    ax.set_xlabel("Global Step (≈ samples seen)")
+    ax.set_ylabel("g_token_diversity")
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 5 — g_vs_null_dist
+    # ------------------------------------------------------------------
+    ax = axs[4]
+    if dist_vals:
+        ax.plot(dist_steps, dist_vals, "-o", markersize=4, linewidth=1.4,
+                color=colors[4], label="g_vs_null_dist")
+        ax.axhline(0.0, color="grey", linewidth=0.8, alpha=0.4, linestyle="--")
+        ax.legend(framealpha=0.9, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No cond/g_vs_null_dist data yet", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Genomic vs Null Token Distance", fontweight="bold")
+    ax.set_xlabel("Global Step (≈ samples seen)")
+    ax.set_ylabel("g_vs_null_dist (L2)")
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 6 — Learning rate (both optimisers)
+    # ------------------------------------------------------------------
+    ax = axs[5]
+    has_lr = False
+    if lr0_vals:
+        ax.plot(lr0_steps, lr0_vals, linewidth=1.4, color=colors[0],
+                label="backbone (AdamW, 1e-4)")
+        has_lr = True
+    if lr1_vals:
+        ax.plot(lr1_steps, lr1_vals, linewidth=1.4, color=colors[1],
+                label="adapter+enc (AdamW-1, 3e-4)")
+        has_lr = True
+    if has_lr:
+        ax.ticklabel_format(axis="y", style="sci", scilimits=(-4, -4))
+        ax.legend(framealpha=0.9, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No LR data", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+    ax.set_title("Learning Rate Schedule", fontweight="bold")
+    ax.set_xlabel("Optimizer Step (current job)")
+    ax.set_ylabel("Learning Rate")
+    ax.grid(True, alpha=0.22)
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig
+
+
+# ===================================================================
+#  CLI entry-point
+# ===================================================================
+
+if __name__ == "__main__":
+    import argparse
+    import sys as _sys
+    # Allow `python src/visualization/training_plots.py` from any cwd
+    _repo_root = str(Path(__file__).resolve().parents[2])
+    if _repo_root not in _sys.path:
+        _sys.path.insert(0, _repo_root)
+    # Re-import with absolute paths so the relative imports above resolve
+    from src.visualization.training_plots import (  # noqa: E402
+        plot_gda_v13_diagnostics,
+    )
+
+    _DEFAULT_LOGDIR = (
+        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260517_gda_v13/gda"
+    )
+    _DEFAULT_OUT = (
+        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260517_gda_v13"
+        "/gda_v13_diagnostics.png"
+    )
+
+    parser = argparse.ArgumentParser(
+        description="Plot GDA v13 training diagnostics from TFEvents."
+    )
+    parser.add_argument(
+        "--logdir", default=_DEFAULT_LOGDIR,
+        help="Directory containing TFEvents files (default: GDA v13 experiment dir)",
+    )
+    parser.add_argument(
+        "--out", default=_DEFAULT_OUT,
+        help="Output figure path (PNG/PDF/SVG). Default: next to logdir.",
+    )
+    parser.add_argument(
+        "--no-show", action="store_true",
+        help="Do not call plt.show() — just save to --out.",
+    )
+    args = parser.parse_args()
+
+    out_path = Path(args.out)
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+
+    print(f"Loading TFEvents from: {args.logdir}")
+    fig = plot_gda_v13_diagnostics(
+        logdir=args.logdir,
+        save_path=out_path,
+        show=not args.no_show,
+    )
+    print(f"Saved: {out_path}")
