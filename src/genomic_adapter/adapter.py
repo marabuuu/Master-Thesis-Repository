@@ -29,6 +29,7 @@ Genomic conditioning: cross-attention on token sequence from GenomicTokenEncoder
 from __future__ import annotations
 
 import math
+from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
@@ -104,6 +105,10 @@ class SpatialCrossAttention(nn.Module):
             # so they can be added to a mid-run checkpoint without disruption.
             nn.init.zeros_(self.out_proj.weight)
 
+        # Attention capture (disabled by default; enabled via adapter.capture_attention())
+        self._capture_attn: bool = False
+        self._last_attn_weights: torch.Tensor | None = None
+
     def forward(self, x: torch.Tensor, context: torch.Tensor) -> torch.Tensor:
         B, C, H, W = x.shape
         h = self.norm(x)
@@ -113,7 +118,17 @@ class SpatialCrossAttention(nn.Module):
         K = self.to_k(context).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
         V = self.to_v(context).view(B, -1, self.n_heads, self.head_dim).transpose(1, 2)
 
-        attn = F.scaled_dot_product_attention(Q, K, V)
+        if self._capture_attn:
+            # Manual implementation so we can store the weight matrix.
+            # Numerically equivalent to the fused kernel (no dropout, no mask).
+            weights = F.softmax(
+                torch.matmul(Q, K.transpose(-2, -1)) * (self.head_dim ** -0.5), dim=-1
+            )                                                        # (B, heads, HW, n_tokens)
+            self._last_attn_weights = weights.detach()
+            attn = torch.matmul(weights, V)
+        else:
+            attn = F.scaled_dot_product_attention(Q, K, V)
+
         attn = attn.transpose(1, 2).reshape(B, H * W, C)
         out = self.out_proj(attn).permute(0, 2, 1).view(B, C, H, W)
         return x + out  # residual
@@ -215,6 +230,45 @@ class GenomicResidualAdapter(nn.Module):
         self.out_conv = nn.Conv2d(ch, in_ch, 1)
         nn.init.zeros_(self.out_conv.weight)
         nn.init.zeros_(self.out_conv.bias)
+
+    # ------------------------------------------------------------------
+    # Attention capture utilities (for visualization — zero training cost)
+    # ------------------------------------------------------------------
+
+    @contextmanager
+    def capture_attention(self):
+        """Context manager that enables attention weight capture for all CA layers.
+
+        Usage::
+
+            with adapter.capture_attention():
+                delta_eps = adapter(x_t, t, g_tokens)
+            weights = adapter.get_attn_weights()
+            # weights['mid_ca']: (B, n_heads, H*W, n_tokens)
+        """
+        layers = (self.ca0, self.ca1, self.ca2, self.mid_ca, self.ca_dec2, self.ca_dec1)
+        for ca in layers:
+            ca._capture_attn = True
+        try:
+            yield
+        finally:
+            for ca in layers:
+                ca._capture_attn = False
+
+    def get_attn_weights(self) -> dict[str, torch.Tensor]:
+        """Return the last captured attention weights keyed by layer name.
+
+        Only valid after a forward pass inside ``capture_attention()``.
+        Spatial sizes per layer (img_size=512):
+          ca0, ca_dec1 : H*W = 512×512 = 262 144
+          ca1, ca_dec2 : H*W = 256×256 = 65 536
+          ca2, mid_ca  : H*W = 128×128 = 16 384
+        """
+        return {
+            name: getattr(self, name)._last_attn_weights
+            for name in ("ca0", "ca1", "ca2", "mid_ca", "ca_dec2", "ca_dec1")
+            if getattr(self, name)._last_attn_weights is not None
+        }
 
     def forward(
         self,
