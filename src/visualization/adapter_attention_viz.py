@@ -85,6 +85,10 @@ def _load_model(ckpt_path: str, hparams_path: str, device: str):
         hp = yaml.load(f, Loader=yaml.FullLoader)
 
     conf = GDAConfig.from_dict(hp)
+    # model_name is an enum not serialised by Lightning's hparams.yaml — set it explicitly.
+    if conf.model_name is None:
+        from mopadi.configs.choices import ModelName
+        conf.model_name = ModelName.beatgans_autoenc
     conf.make_model_conf()
 
     model = GDALitModel(conf)
@@ -439,9 +443,13 @@ def plot_subtype_attention_profiles(
 # CLI
 # ---------------------------------------------------------------------------
 
-_DEFAULT_CKPT    = "experiments/20260517_gda_v13/logs/autoenc/last.ckpt"
-_DEFAULT_HPARAMS = "experiments/20260517_gda_v13/gda/hparams.yaml"
-_DEFAULT_OUT     = "experiments/20260517_gda_v13/attention_viz"
+_REPO_ROOT       = Path(__file__).resolve().parents[2]   # .../Master-Thesis-Repository
+_EXP_BASE        = _REPO_ROOT.parent / "experiments"     # .../genhist/experiments
+_RUN             = "20260517_gda_v13"
+
+_DEFAULT_CKPT    = str(_EXP_BASE / _RUN / "gda/autoenc/last.ckpt")
+_DEFAULT_HPARAMS = str(_EXP_BASE / _RUN / "gda/hparams.yaml")
+_DEFAULT_OUT     = str(_EXP_BASE / _RUN / "attention_viz")
 
 
 def main() -> None:
