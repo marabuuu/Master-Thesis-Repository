@@ -1005,11 +1005,11 @@ def plot_gda_v13_diagnostics(
     logdir: Union[str, Path],
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
-    figsize: Tuple[float, float] = (16, 14),
+    figsize: Tuple[float, float] = (16, 18),
     cmap_name: str = CATEGORICAL_CMAP,
     title: str = "GDA v13 — Training Diagnostics",
 ) -> "Figure":
-    """Six-panel diagnostic figure for GDA v13 from TFEvents.
+    """Seven-panel diagnostic figure for GDA v13 from TFEvents.
 
     Panels
     ------
@@ -1019,6 +1019,7 @@ def plot_gda_v13_diagnostics(
     4. g_token_diversity  (variance of genomic token embeddings)
     5. g_vs_null_dist  (L2 distance between cond and null tokens)
     6. Learning-rate schedule  (backbone AdamW + adapter AdamW-1)
+    7. contrastive_loss  (auxiliary genomic conditioning loss, EMA-smoothed)
 
     Parameters
     ----------
@@ -1059,10 +1060,12 @@ def plot_gda_v13_diagnostics(
     lr0_steps, lr0_vals = _get("lr-AdamW")
     lr1_steps, lr1_vals = _get("lr-AdamW-1")
 
+    contrastive_steps_raw, contrastive_vals_raw = _get("cond/contrastive_loss")
+
     colors = get_categorical_colors(8, cmap_name=cmap_name)
     seq_cmap = get_crameri_cmap(SEQUENTIAL_CMAP)
 
-    fig, axes = plt.subplots(3, 2, figsize=figsize)
+    fig, axes = plt.subplots(4, 2, figsize=figsize)
     axs = axes.flatten()
 
     # ------------------------------------------------------------------
@@ -1205,6 +1208,36 @@ def plot_gda_v13_diagnostics(
     ax.set_xlabel("Optimizer Step (current job)")
     ax.set_ylabel("Learning Rate")
     ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 7 — Contrastive loss  (dense per-step → EMA smoothed)
+    # Only available from the job that introduced the auxiliary loss.
+    # x-axis matches panels 1-2 (millions of samples / steps).
+    # ------------------------------------------------------------------
+    ax = axs[6]
+    if contrastive_vals_raw:
+        ct_x_M = [s / 1e6 for s in contrastive_steps_raw]
+        ect_M, ect_y = _ema_series(ct_x_M, list(contrastive_vals_raw), alpha=0.005)
+        ax.plot(ect_M, ect_y, linewidth=2.2, color=colors[5],
+                label="contrastive loss (EMA)")
+        # Mark start/end values for quick trend reading
+        if ect_y:
+            ax.axhline(ect_y[0], color=colors[5], linewidth=0.7, alpha=0.35, linestyle="--")
+            ax.annotate(f"start {ect_y[0]:.4f}", xy=(ect_M[0], ect_y[0]),
+                        xytext=(6, 4), textcoords="offset points", fontsize=7, color=colors[5])
+            ax.annotate(f"now {ect_y[-1]:.4f}", xy=(ect_M[-1], ect_y[-1]),
+                        xytext=(-60, -12), textcoords="offset points", fontsize=7, color=colors[5])
+        ax.legend(framealpha=0.9, fontsize=8)
+    else:
+        ax.text(0.5, 0.5, "No cond/contrastive_loss data yet\n(added in later job restarts)",
+                ha="center", va="center", transform=ax.transAxes, color="grey")
+    ax.set_title("Contrastive Loss — Genomic Conditioning", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("Contrastive Loss")
+    ax.grid(True, alpha=0.22)
+
+    # Hide unused 8th panel
+    axs[7].set_visible(False)
 
     fig.suptitle(title, fontsize=14, fontweight="bold")
     fig.tight_layout(rect=(0, 0, 1, 0.97))
