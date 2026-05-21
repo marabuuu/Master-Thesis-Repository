@@ -473,22 +473,40 @@ class GDALitModel(_BaseGenomicLitModel):
             delta_eps = self._ema_adapter(x_t, t, g_tokens)
             loss_val = F.mse_loss(eps_backbone + delta_eps, noise)
 
+            # Shuffled-conditioning loss: same forward pass but with mismatched genomic
+            # features. If loss_val_shuffled > loss_val the conditioning is carrying
+            # subtype-specific information (cond/gap > 0 is the key signal to watch).
+            perm = torch.randperm(B, device=self.device)
+            g_tokens_shuffled = self._ema_genomic_encoder(feats[perm])
+            delta_eps_shuffled = self._ema_adapter(x_t, t, g_tokens_shuffled)
+            loss_val_shuffled = F.mse_loss(eps_backbone + delta_eps_shuffled, noise)
+
         # logger=False: accumulate in callback_metrics without writing to TFBoard
         # per batch (which would create 100 entries per val run at the same step).
         # on_validation_epoch_end writes a single add_scalar at num_samples.
         self.log("_val_loss", loss_val, on_step=False, on_epoch=True,
                  sync_dist=True, prog_bar=True, logger=False)
+        self.log("_val_loss_shuffled", loss_val_shuffled, on_step=False, on_epoch=True,
+                 sync_dist=True, prog_bar=False, logger=False)
         return loss_val
 
     def on_validation_epoch_end(self) -> None:
         if self.trainer.state.stage == "sanity_check":
             return
         val_loss = self.trainer.callback_metrics.get("_val_loss")
+        val_loss_shuffled = self.trainer.callback_metrics.get("_val_loss_shuffled")
         if val_loss is not None:
             if self.global_rank == 0:
                 self.logger.experiment.add_scalar(
                     "loss/val", val_loss.item(), self.num_samples
                 )
+                if val_loss_shuffled is not None:
+                    self.logger.experiment.add_scalar(
+                        "loss/val_shuffled", val_loss_shuffled.item(), self.num_samples
+                    )
+                    self.logger.experiment.add_scalar(
+                        "cond/gap", val_loss_shuffled.item() - val_loss.item(), self.num_samples
+                    )
             # sync_dist=False: already aggregated by validation_step's sync_dist=True
             self.log("loss/val_ckpt", val_loss, prog_bar=False, sync_dist=False)
 
