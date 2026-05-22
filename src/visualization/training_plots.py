@@ -1217,15 +1217,16 @@ def plot_gda_v13_diagnostics(
     ax = axs[6]
     if contrastive_vals_raw:
         ct_x_M = [s / 1e6 for s in contrastive_steps_raw]
-        ect_M, ect_y = _ema_series(ct_x_M, list(contrastive_vals_raw), alpha=0.005)
-        ax.plot(ect_M, ect_y, linewidth=2.2, color=colors[5],
-                label="contrastive loss (EMA)")
-        # Mark start/end values for quick trend reading
-        if ect_y:
-            ax.axhline(ect_y[0], color=colors[5], linewidth=0.7, alpha=0.35, linestyle="--")
-            ax.annotate(f"start {ect_y[0]:.4f}", xy=(ect_M[0], ect_y[0]),
+        # Bin-average avoids EMA initialization artifacts (first sampled value may be a
+        # near-zero outlier that makes EMA appear to rise even when the true mean falls).
+        bct_M, bct_y = _bin_series(ct_x_M, list(contrastive_vals_raw), n_bins=80)
+        ax.plot(bct_M, bct_y, linewidth=2.2, color=colors[5],
+                label="contrastive loss (bin avg)")
+        if bct_y:
+            ax.axhline(bct_y[0], color=colors[5], linewidth=0.7, alpha=0.35, linestyle="--")
+            ax.annotate(f"start {bct_y[0]:.4f}", xy=(bct_M[0], bct_y[0]),
                         xytext=(6, 4), textcoords="offset points", fontsize=7, color=colors[5])
-            ax.annotate(f"now {ect_y[-1]:.4f}", xy=(ect_M[-1], ect_y[-1]),
+            ax.annotate(f"now {bct_y[-1]:.4f}", xy=(bct_M[-1], bct_y[-1]),
                         xytext=(-60, -12), textcoords="offset points", fontsize=7, color=colors[5])
         ax.legend(framealpha=0.9, fontsize=8)
     else:

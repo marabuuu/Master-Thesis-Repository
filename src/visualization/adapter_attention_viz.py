@@ -192,7 +192,7 @@ def plot_token_gradient_importance(
             g_tokens = model.genomic_encoder(feats)   # (B, n_tokens, token_dim)
             g_tokens.retain_grad()
             delta_eps = model.adapter(x_t, t, g_tokens)
-            delta_eps.norm(dim=(1, 2, 3)).sum().backward()
+            delta_eps.flatten(1).norm(dim=1).sum().backward()
 
         # (B, n_tokens, token_dim) → (B, n_tokens)
         imp = g_tokens.grad.detach().norm(dim=-1).cpu().numpy()
