@@ -60,6 +60,7 @@ from .spatial_metrics_viz import (
     plot_ripley_L_by_subtype,
     plot_voronoi_distribution,
     run_subtype_tests,
+    _globally_correct_stats,
 )
 
 try:
@@ -124,6 +125,30 @@ ALL_TFD_VIZ_PLOTS = [
     "voronoi_distribution",
     "knn_metrics",
 ]
+
+
+def _stat_star(q: float, eta_sq: float = 0.0, eta_sq_threshold: float = 0.01) -> str:
+    """Significance stars requiring both a BH q-value gate and an effect-size gate.
+
+    Parameters
+    ----------
+    q : float
+        Globally BH-corrected Kruskal-Wallis q-value (``kruskal_q`` from
+        :func:`_globally_correct_stats`).
+    eta_sq : float
+        η² = H / (n − 1) from :func:`run_subtype_tests`.
+    eta_sq_threshold : float
+        Minimum η² to annotate.  Default 0.01 ("small" by Cohen's convention).
+        This prevents trivially small but statistically detectable differences
+        (inflated by large n) from generating misleading stars.
+    """
+    if q >= 0.05 or eta_sq < eta_sq_threshold:
+        return ""
+    if q < 0.001:
+        return "***"
+    if q < 0.01:
+        return "**"
+    return "*"
 
 
 # ===================================================================
@@ -733,6 +758,22 @@ def plot_cell_type_boxplots(
 
     df_long = pd.DataFrame(records)
 
+    # --- Patient-level statistical tests (must run before plotting for annotations) ---
+    # One value per patient = median of that patient's tile fractions.
+    stats_results: Dict[str, Dict] = {}
+    for ch, ch_name in channels_to_plot:
+        patient_vals: Dict[str, np.ndarray] = {
+            subtype: np.array([
+                float(np.nanmedian(tiles[:, ch]))
+                for tiles in pid_to_tiles.values()
+                if ch < tiles.shape[1]
+            ])
+            for subtype, pid_to_tiles in pid_fracs_by_subtype.items()
+        }
+        stats_results[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
+    # Apply one global BH pass across all cell-type KW tests and all pairwise tests.
+    _globally_correct_stats(stats_results)
+
     # --- Figure: 1 row × n_subtypes cols, shared y-axis ---
     n_subtypes = len(subtypes)
     if figsize is None:
@@ -765,37 +806,52 @@ def plot_cell_type_boxplots(
         )
         ax.set_title(subtype, fontsize=12, fontweight="bold", pad=6)
         ax.set_xlabel("")
-        ax.set_ylabel("Fraction of tissue area" if col_idx == 0 else "")
+        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "")
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
         ax.tick_params(axis="x", labelrotation=40)
 
         if col_idx > 0:
             ax.tick_params(axis="y", labelleft=False)
 
+    # --- Significance annotations (globally corrected KW + effect-size gate) ---
+    y_max = axes[0][0].get_ylim()[1]
+    y_min = axes[0][0].get_ylim()[0]
+    y_span = y_max - y_min
+    star_y = y_max + 0.02 * y_span
+
+    for col_idx, subtype in enumerate(subtypes):
+        ax = axes[0][col_idx]
+        subset = df_long[df_long["Subtype"] == subtype]
+        present = [name for name in ch_labels if name in subset["Cell Type"].values]
+        for x_idx, name in enumerate(present):
+            res = stats_results.get(name, {})
+            star = _stat_star(
+                q=res.get("kruskal_q", res.get("kruskal_p", 1.0)),
+                eta_sq=res.get("eta_sq", 0.0),
+            )
+            if star:
+                ax.text(
+                    x_idx, star_y, star,
+                    ha="center", va="bottom", fontsize=7, color="#333333",
+                )
+        ax.set_ylim(top=y_max + 0.14 * y_span)
+
     fig.suptitle(
-        "Cell-Type Tissue Composition per PAM50 Subtype",
+        "Cell-Type Nuclei Composition per PAM50 Subtype",
         fontsize=12, y=1.02,
     )
     fig.tight_layout()
+    fig.text(
+        0.5, -0.01,
+        "Stars: global BH q<0.05 and η²≥0.01 (KW across PAM50 subtypes, "
+        "patient-level medians).  * q<0.05  ** q<0.01  *** q<0.001",
+        ha="center", va="top", fontsize=7, color="#555555", style="italic",
+    )
 
     out = output_dir / "tfd_cell_type_boxplots.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
         print(f"[OK] Saved cell-type boxplots → {out}")
-
-    # --- Patient-level statistical tests (Kruskal-Wallis + pairwise MWU + BH FDR) ---
-    # One value per patient = median of that patient's tile fractions.
-    stats_results: Dict[str, Dict] = {}
-    for ch, ch_name in channels_to_plot:
-        patient_vals: Dict[str, np.ndarray] = {
-            subtype: np.array([
-                float(np.nanmedian(tiles[:, ch]))
-                for tiles in pid_to_tiles.values()
-                if ch < tiles.shape[1]
-            ])
-            for subtype, pid_to_tiles in pid_fracs_by_subtype.items()
-        }
-        stats_results[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
 
     stats_path = output_dir / "tfd_cell_type_composition_stats.json"
     with open(stats_path, "w") as _f:
@@ -1670,6 +1726,24 @@ def plot_nn_distance_violins(
         return
 
     df_long = pd.DataFrame(records)
+
+    # --- Patient-level statistical tests (run before plotting for annotations) ---
+    nn_stats: Dict[str, Dict] = {}
+    for i, ch in enumerate(non_bg_channels):
+        ch_name = CHANNEL_NAMES[ch]
+        patient_vals: Dict[str, np.ndarray] = {
+            subtype: np.array([
+                float(v[i])
+                for v in stats_by_subtype[subtype].get("patient_nn_intra", {}).values()
+                if np.isfinite(v[i])
+            ])
+            for subtype in subtypes
+            if subtype in stats_by_subtype
+        }
+        nn_stats[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
+    # Apply one global BH pass across all cell-type KW tests and all pairwise tests.
+    _globally_correct_stats(nn_stats)
+
     n_subtypes = len(subtypes)
     if figsize is None:
         figsize = (n_subtypes * 4.2, 5.2)
@@ -1711,32 +1785,51 @@ def plot_nn_distance_violins(
         if col_idx > 0:
             ax.tick_params(axis="y", labelleft=False)
 
+    # --- Significance annotations (globally corrected KW + effect-size gate) ---
+    y_max = axes[0][0].get_ylim()[1]
+    y_min = axes[0][0].get_ylim()[0]
+    if log_scale:
+        star_y = y_max * 1.05
+        new_y_top = y_max * 1.20
+    else:
+        y_span = y_max - y_min
+        star_y = y_max + 0.02 * y_span
+        new_y_top = y_max + 0.14 * y_span
+
+    for col_idx, subtype in enumerate(subtypes):
+        ax = axes[0][col_idx]
+        subset = df_long[df_long["Subtype"] == subtype]
+        present = [name for name in ch_labels if name in subset["Cell Type"].values]
+        for x_idx, name in enumerate(present):
+            res = nn_stats.get(name, {})
+            star = _stat_star(
+                q=res.get("kruskal_q", res.get("kruskal_p", 1.0)),
+                eta_sq=res.get("eta_sq", 0.0),
+            )
+            if star:
+                ax.text(
+                    x_idx, star_y, star,
+                    ha="center", va="bottom", fontsize=7, color="#333333",
+                )
+        ax.set_ylim(top=new_y_top)
+
     fig.suptitle(
         "Intra-Type Nearest-Neighbour Distance per PAM50 Subtype\n"
         "(mean distance from each cell to its nearest same-type neighbour)",
         fontsize=12, y=1.02,
     )
     fig.tight_layout()
+    fig.text(
+        0.5, -0.01,
+        "Stars: global BH q<0.05 and η²≥0.01 (KW across PAM50 subtypes, "
+        "patient-level medians).  * q<0.05  ** q<0.01  *** q<0.001",
+        ha="center", va="top", fontsize=7, color="#555555", style="italic",
+    )
 
     out = output_dir / "tfd_nn_distance_violins.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
         print(f"[OK] Saved NN distance violin plots → {out}")
-
-    # --- Patient-level statistical tests ---
-    nn_stats: Dict[str, Dict] = {}
-    for i, ch in enumerate(non_bg_channels):
-        ch_name = CHANNEL_NAMES[ch]
-        patient_vals: Dict[str, np.ndarray] = {
-            subtype: np.array([
-                float(v[i])
-                for v in stats_by_subtype[subtype].get("patient_nn_intra", {}).values()
-                if np.isfinite(v[i])
-            ])
-            for subtype in subtypes
-            if subtype in stats_by_subtype
-        }
-        nn_stats[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
 
     stats_path = output_dir / "tfd_nn_distance_stats.json"
     with open(stats_path, "w") as _f:
@@ -1902,6 +1995,8 @@ def plot_cross_type_proximity_heatmaps(
                 if subtype in stats_by_subtype
             }
             cross_stats[key] = run_subtype_tests(patient_vals, metric_name=key)
+    # Global BH across all 30 source→target pair families.
+    _globally_correct_stats(cross_stats)
 
     stats_path = output_dir / "tfd_cross_type_proximity_stats.json"
     with open(stats_path, "w") as _f:
