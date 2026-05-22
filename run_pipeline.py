@@ -130,6 +130,14 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         import sys as _sys
         _sys.argv = ["get_tiles_within_rois", "--config", config_path]
         run_roi_filter()
+
+    elif stage == "tar_to_tumor_zip":
+        from src.preprocessing.tar_to_tumor_zip import main as run_tar_to_tumor_zip
+        if "tar_to_tumor_zip" not in config:
+            raise ValueError("No 'tar_to_tumor_zip' section in config.yaml")
+        import sys as _sys
+        _sys.argv = ["tar_to_tumor_zip", "--config", config_path]
+        run_tar_to_tumor_zip()
     
     elif stage == "encoding":
         print(f"[INFO] Encoding stage not yet configured in this CLI")
@@ -235,6 +243,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'genomic_adapter_training' section in config.yaml")
         run_gda_training(config["genomic_adapter_training"], verbose=verbose)
 
+    elif stage == "virchow2_umap":
+        from src.visualization.virchow2_umap import run_virchow2_umap
+        if "virchow2_umap" not in config:
+            raise ValueError("No 'virchow2_umap' section in config.yaml")
+        run_virchow2_umap(config["virchow2_umap"], verbose=verbose)
+
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
         for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
@@ -250,7 +264,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, mopadi_genomic_ca_frozen, genomic_adapter_training, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, mopadi_genomic_ca_frozen, genomic_adapter_training, virchow2_umap, evaluation, all"
         )
 
 
@@ -282,7 +296,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "mopadi_genomic_ca_frozen", "genomic_adapter_training", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "mopadi_genomic_ca_frozen", "genomic_adapter_training", "virchow2_umap", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
