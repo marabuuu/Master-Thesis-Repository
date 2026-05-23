@@ -140,7 +140,13 @@ def load_patient_splits(splits_path: str | Path) -> Dict[str, str]:
         if split_name not in raw:
             continue
         entry = raw[split_name]
-        patients = entry.get("patients", []) if isinstance(entry, dict) else entry
+        if isinstance(entry, dict):
+            # Two formats: {"patients": [...]} or {pid: ..., pid: ...}
+            patients = entry.get("patients", None)
+            if patients is None:
+                patients = list(entry.keys())
+        else:
+            patients = entry  # plain list
         for pid in patients:
             pid_to_split[canonical_patient_id(pid)] = split_name
     return pid_to_split
