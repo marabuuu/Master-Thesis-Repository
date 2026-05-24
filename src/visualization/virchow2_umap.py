@@ -156,11 +156,12 @@ def load_patient_splits(splits_path: str | Path) -> Dict[str, str]:
 # H5 feature loading
 # ---------------------------------------------------------------------------
 
-def _load_patient_mean_feature(
+def _load_patient_feats(
     h5_path: Path,
     max_tiles: Optional[int],
     rng: np.random.RandomState,
 ) -> Tuple[str, np.ndarray]:
+    """Return (patient_id, feats) where feats is shape (n_sampled, feat_dim)."""
     pid = canonical_patient_id(h5_path.stem)
     with h5py.File(h5_path, "r") as h5f:
         feats = _pick_feature_array(h5f)  # (n_tiles, feat_dim)
@@ -169,36 +170,23 @@ def _load_patient_mean_feature(
         idx = rng.choice(feats.shape[0], max_tiles, replace=False)
         feats = feats[idx]
 
-    return pid, feats.mean(axis=0).astype(np.float32)
+    return pid, feats.astype(np.float32)
 
 
-def load_all_features(
+def _iter_h5_files(
     features_dir: Path,
     subtype_map: Dict[str, str],
     pid_to_split: Optional[Dict[str, str]],
     max_tiles_per_patient: Optional[int],
-    seed: int,
+    rng: np.random.RandomState,
     verbose: bool,
-) -> Tuple[np.ndarray, List[str], List[str], List[str]]:
-    """
-    Load h5 files, mean-pool tiles, join with subtype + split info.
-
-    When ``pid_to_split`` is provided only patients present in that mapping
-    are included (i.e. the same patient selection as the genomic UMAP).
-
-    Returns
-    -------
-    embeddings  : ndarray (N, feat_dim)
-    patient_ids : list[str]
-    subtypes    : list[str]
-    splits      : list[str]  — "train" / "val" / "test" / "unknown"
-    """
+) -> Tuple[List[np.ndarray], List[str], List[str], List[str]]:
+    """Shared h5 iteration used by both patient-level and tile-level loaders."""
     h5_files = sorted(features_dir.glob("*.h5")) + sorted(features_dir.glob("*.hdf5"))
     if not h5_files:
         raise FileNotFoundError(f"No .h5/.hdf5 files found in: {features_dir}")
 
-    rng = np.random.RandomState(seed)
-    vecs: List[np.ndarray] = []
+    feat_blocks: List[np.ndarray] = []
     patient_ids: List[str] = []
     subtypes: List[str] = []
     splits: List[str] = []
@@ -206,9 +194,8 @@ def load_all_features(
     skipped_split = 0
 
     for h5_path in h5_files:
-        pid, mean_vec = _load_patient_mean_feature(h5_path, max_tiles_per_patient, rng)
+        pid, feats = _load_patient_feats(h5_path, max_tiles_per_patient, rng)
 
-        # Split filter: when a splits map is given, skip patients not in it
         if pid_to_split is not None:
             if pid not in pid_to_split:
                 skipped_split += 1
@@ -222,12 +209,12 @@ def load_all_features(
             skipped_subtype += 1
             continue
 
-        vecs.append(mean_vec)
+        feat_blocks.append(feats)
         patient_ids.append(pid)
         subtypes.append(subtype)
         splits.append(split)
 
-    if not vecs:
+    if not feat_blocks:
         raise RuntimeError(
             f"No patients matched.  "
             f"Checked {len(h5_files)} h5 files; "
@@ -236,11 +223,57 @@ def load_all_features(
 
     if verbose:
         print(
-            f"[Virchow2UMAP] Loaded {len(vecs):,} patients  "
+            f"[Virchow2UMAP] Loaded {len(feat_blocks):,} patients  "
             f"(skipped: {skipped_split} no-split, {skipped_subtype} no-subtype)"
         )
 
-    return np.stack(vecs, axis=0), patient_ids, subtypes, splits
+    return feat_blocks, patient_ids, subtypes, splits
+
+
+def load_patient_level_features(
+    features_dir: Path,
+    subtype_map: Dict[str, str],
+    pid_to_split: Optional[Dict[str, str]],
+    max_tiles_per_patient: Optional[int],
+    seed: int,
+    verbose: bool,
+) -> Tuple[np.ndarray, List[str], List[str], List[str]]:
+    """One mean-pooled vector per patient.  Returns (embeddings, pids, subtypes, splits)."""
+    rng = np.random.RandomState(seed)
+    feat_blocks, patient_ids, subtypes, splits = _iter_h5_files(
+        features_dir, subtype_map, pid_to_split, max_tiles_per_patient, rng, verbose
+    )
+    embeddings = np.stack([b.mean(axis=0) for b in feat_blocks], axis=0)
+    return embeddings, patient_ids, subtypes, splits
+
+
+def load_tile_level_features(
+    features_dir: Path,
+    subtype_map: Dict[str, str],
+    pid_to_split: Optional[Dict[str, str]],
+    max_tiles_per_patient: Optional[int],
+    seed: int,
+    verbose: bool,
+) -> Tuple[np.ndarray, List[str], List[str], List[str]]:
+    """One row per tile.  Returns (embeddings, pids, subtypes, splits) — all tile-length."""
+    rng = np.random.RandomState(seed)
+    feat_blocks, patient_ids, subtypes, splits = _iter_h5_files(
+        features_dir, subtype_map, pid_to_split, max_tiles_per_patient, rng, verbose
+    )
+    # Expand metadata to one entry per tile
+    tile_pids: List[str] = []
+    tile_subtypes: List[str] = []
+    tile_splits: List[str] = []
+    for feats, pid, sub, spl in zip(feat_blocks, patient_ids, subtypes, splits):
+        n = feats.shape[0]
+        tile_pids.extend([pid] * n)
+        tile_subtypes.extend([sub] * n)
+        tile_splits.extend([spl] * n)
+
+    embeddings = np.concatenate(feat_blocks, axis=0)
+    if verbose:
+        print(f"[Virchow2UMAP] Total tiles for UMAP: {embeddings.shape[0]:,}")
+    return embeddings, tile_pids, tile_subtypes, tile_splits
 
 
 # ---------------------------------------------------------------------------
@@ -253,6 +286,7 @@ def plot_umap_scatter(
     splits: List[str],
     palette: Dict[str, str],
     output_dir: Path,
+    mode: str = "patient",
     figsize: Tuple[int, int] = (10, 8),
     point_size: float = 80,
     alpha: float = 0.8,
@@ -269,6 +303,9 @@ def plot_umap_scatter(
 
     has_multiple_splits = tmp["Split"].nunique() > 1
 
+    unit = "tiles" if mode == "tile" else "patients"
+    title = f"Virchow2 Feature UMAP — PAM50 Subtypes ({len(tmp):,} {unit})"
+
     fig, ax = plt.subplots(figsize=figsize)
     sns.scatterplot(
         data=tmp,
@@ -282,10 +319,11 @@ def plot_umap_scatter(
         alpha=alpha,
         edgecolor="k",
         linewidth=0.3,
+        rasterized=mode == "tile",
         ax=ax,
     )
 
-    ax.set_title("Virchow2 Feature UMAP — PAM50 Subtypes", fontsize=13, fontweight="bold")
+    ax.set_title(title, fontsize=13, fontweight="bold")
     ax.set_xticks([])
     ax.set_yticks([])
     ax.spines["top"].set_visible(False)
@@ -294,7 +332,8 @@ def plot_umap_scatter(
               fontsize=9, title_fontsize=10)
 
     fig.tight_layout()
-    save_figure(fig, output_dir / "virchow2_umap.png", dpi=dpi)
+    fname = f"virchow2_umap_{mode}.png"
+    save_figure(fig, output_dir / fname, dpi=dpi)
 
 
 # ---------------------------------------------------------------------------
@@ -323,6 +362,8 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     subtype_col        = cfg.get("subtype_col", "Majority_Subtype_mRNA")
     splits_path        = cfg.get("patient_splits_path")
     output_dir         = Path(cfg.get("output_dir", "./experiments/virchow2_umap"))
+    mode               = cfg.get("mode", "patient")  # "patient" or "tile"
+    wanted_subtypes    = cfg.get("subtypes", None)   # None = all subtypes
     max_tiles          = cfg.get("max_tiles_per_patient", 100)
     n_neighbors        = int(cfg.get("n_neighbors", 15))
     min_dist           = float(cfg.get("min_dist", 0.1))
@@ -366,9 +407,14 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
         print(f"[Virchow2UMAP] Subtype map: {len(subtype_map):,} patients from {Path(csv_path).name}")
 
     # ── Load features ─────────────────────────────────────────────────────────
-    embeddings, patient_ids, subtypes, splits = load_all_features(
-        features_dir, subtype_map, pid_to_split, max_tiles, seed, verbose
-    )
+    if mode == "tile":
+        embeddings, patient_ids, subtypes, splits = load_tile_level_features(
+            features_dir, subtype_map, pid_to_split, max_tiles, seed, verbose
+        )
+    else:
+        embeddings, patient_ids, subtypes, splits = load_patient_level_features(
+            features_dir, subtype_map, pid_to_split, max_tiles, seed, verbose
+        )
 
     if verbose:
         from collections import Counter
@@ -379,6 +425,25 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
             print("[Virchow2UMAP] Split counts:")
             for spl, cnt in sorted(Counter(splits).items()):
                 print(f"  {spl}: {cnt}")
+
+    # ── Subtype filter ────────────────────────────────────────────────────────
+    if wanted_subtypes:
+        wanted_set = set(wanted_subtypes)
+        mask = [s in wanted_set for s in subtypes]
+        if not any(mask):
+            raise RuntimeError(
+                f"No patients found for subtypes {wanted_subtypes}. "
+                f"Available: {sorted(set(subtypes))}"
+            )
+        embeddings  = embeddings[np.array(mask)]
+        patient_ids = [p for p, m in zip(patient_ids, mask) if m]
+        subtypes    = [s for s, m in zip(subtypes,    mask) if m]
+        splits      = [sp for sp, m in zip(splits,    mask) if m]
+        if verbose:
+            from collections import Counter
+            print(f"[Virchow2UMAP] Filtered to {wanted_subtypes}:")
+            for sub, cnt in sorted(Counter(subtypes).items()):
+                print(f"  {sub}: {cnt}")
 
     # ── UMAP ──────────────────────────────────────────────────────────────────
     if verbose:
@@ -396,7 +461,7 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
         random_state=seed,
         verbose=verbose,
     )
-    umap_embedding = reducer.fit_transform(embeddings)
+    umap_embedding: np.ndarray = np.asarray(reducer.fit_transform(embeddings))
 
     # Save coordinates for downstream use
     coords_df = pd.DataFrame({
@@ -406,7 +471,7 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
         "umap_1":     umap_embedding[:, 0],
         "umap_2":     umap_embedding[:, 1],
     })
-    coords_path = output_dir / "virchow2_umap_coords.csv"
+    coords_path = output_dir / f"virchow2_umap_{mode}_coords.csv"
     coords_df.to_csv(coords_path, index=False)
     if verbose:
         print(f"[Virchow2UMAP] Saved coordinates → {coords_path.name}")
@@ -417,7 +482,7 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_umap_scatter(
         umap_embedding, subtypes, splits, palette, output_dir,
-        figsize=figsize, point_size=point_size, alpha=alpha, dpi=dpi,
+        mode=mode, figsize=figsize, point_size=point_size, alpha=alpha, dpi=dpi,
     )
 
     if verbose:
