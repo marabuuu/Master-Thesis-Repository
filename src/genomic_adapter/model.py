@@ -297,7 +297,7 @@ class GDALitModel(_BaseGenomicLitModel):
             weights, num_samples=len(tile_paths), replacement=True
         )
 
-        if self.global_rank == 0:
+        if self.trainer.is_global_zero:
             log.info(
                 "Subtype-balanced sampler: %s",
                 {s: c for s, c in sorted(subtype_counts.items())},
@@ -380,7 +380,7 @@ class GDALitModel(_BaseGenomicLitModel):
             opt_adapter.zero_grad()
 
         # ── Logging ───────────────────────────────────────────────────────
-        if self.global_rank == 0:
+        if self.trainer.is_global_zero:
             self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
             if self.conf.contrastive_weight > 0:
                 self.logger.experiment.add_scalar(
@@ -392,7 +392,7 @@ class GDALitModel(_BaseGenomicLitModel):
         # Uses fresh x_t with randomly drawn timesteps so consecutive measurements
         # are independent of the training batch's t distribution.
         _gd_interval = 500 * self.conf.batch_size_effective
-        if self.global_rank == 0 and (self.num_samples % _gd_interval < self.conf.batch_size):
+        if self.trainer.is_global_zero and (self.num_samples % _gd_interval < self.conf.batch_size):
             with torch.no_grad():
                 bm = min(16, B)
                 t_m = torch.randint(0, self.conf.T, (bm,), device=self.device)
@@ -424,7 +424,7 @@ class GDALitModel(_BaseGenomicLitModel):
 
         # Sample image grid: clean | noisy | backbone_recon | cond_recon | guidance_delta_vis
         _si_interval = self.conf.reconstruct_every_samples
-        if self.global_rank == 0 and (self.num_samples % _si_interval < self.conf.batch_size):
+        if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
             self._log_sample_images(imgs.detach(), feats.detach())
 
         return loss
@@ -496,7 +496,7 @@ class GDALitModel(_BaseGenomicLitModel):
         val_loss = self.trainer.callback_metrics.get("_val_loss")
         val_loss_shuffled = self.trainer.callback_metrics.get("_val_loss_shuffled")
         if val_loss is not None:
-            if self.global_rank == 0:
+            if self.trainer.is_global_zero:
                 self.logger.experiment.add_scalar(
                     "loss/val", val_loss.item(), self.num_samples
                 )

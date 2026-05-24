@@ -364,15 +364,15 @@ mopadi_genomic_ca_frozen:
   composite_alpha: 1.0
 
 training_stats:
-  logdir: ./experiments/20260513_genomic_ca_v11_cfg
-  output_dir: ./experiments/20260513_genomic_ca_v11_cfg/training_stats
+  logdir: ./experiments/20260517_gda_v13
+  output_dir: ./experiments/20260517_gda_v13/training_stats
   plots:
   - loss_curves
   - genomic_diagnostics
   #- batch_trajectory
-  #- train_val_comparison
+  - train_val_comparison
   #- early_stopping
-  #- summary
+  - summary
   figsize:
   - 16
   - 12
@@ -593,8 +593,12 @@ virchow2_umap:
   patient_col: bcr_patient_barcode
   subtype_col: Majority_Subtype_mRNA
   patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+  subtypes:                         # null = all subtypes; list to restrict
+  - Basal
+  - LumA
+  mode: tile                        # "patient" (mean-pooled, 1 pt/patient) or "tile" (1 pt/tile)
   output_dir: ./experiments/20260522_virchow2_umap
-  max_tiles_per_patient: 100        # tiles per patient to mean-pool; null = all
+  max_tiles_per_patient: 50         # tiles per patient; keep low in tile mode for speed
   n_neighbors: 15
   min_dist: 0.1
   metric: cosine
