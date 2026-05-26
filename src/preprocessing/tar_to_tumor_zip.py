@@ -285,9 +285,19 @@ def process_tar(tar_fname, tar_dir, save_dir, roi_dir, target_mpp, area_threshol
         # use slide_dir (not tar_fname) for annotation matching and output naming
         out_zip = os.path.join(save_dir, f'{slide_dir}.zip')
         if os.path.exists(out_zip):
-            logging.info('Skipping %s: output already exists', slide_dir)
-            written += 1
-            continue
+            # Verify the existing zip is not a corrupt partial from a prior crash.
+            try:
+                with zipfile.ZipFile(out_zip, 'r') as _zf:
+                    names = _zf.namelist()
+                    if names:
+                        with _zf.open(names[0]) as _f:
+                            _f.read(256)  # probe compressed data of first tile
+                logging.info('Skipping %s: valid zip already exists (%d tiles)', slide_dir, len(names))
+                written += 1
+                continue
+            except Exception as _e:
+                logging.warning('Corrupt zip for %s (%s) — re-creating', slide_dir, _e)
+                os.remove(out_zip)
 
         # match annotation CSV by slide directory name
         try:
@@ -315,14 +325,17 @@ def process_tar(tar_fname, tar_dir, save_dir, roi_dir, target_mpp, area_threshol
             print(f'  {slide_dir[:40]}: no tumor tiles selected')
             continue
 
-        # stream selected PNGs from tar → zip, no staging to disk
+        # stream selected PNGs from tar → zip, no staging to disk.
+        # Write to a .tmp file first; rename to final path only on clean
+        # completion — so a crash/OOM never leaves a corrupt partial zip.
         selected_set = set(selected)
         member_map = {base: full for full, base, _, _ in tile_data}
+        out_zip_tmp = f'{out_zip}.{os.getpid()}.tmp'
 
         try:
             with (
                 tarfile.open(tar_path, 'r:*') as tf,
-                zipfile.ZipFile(out_zip, 'w', zipfile.ZIP_DEFLATED) as zf,
+                zipfile.ZipFile(out_zip_tmp, 'w', zipfile.ZIP_DEFLATED) as zf,
             ):
                 for base, full_name in member_map.items():
                     if base not in selected_set:
@@ -333,12 +346,14 @@ def process_tar(tar_fname, tar_dir, save_dir, roi_dir, target_mpp, area_threshol
                             zf.writestr(os.path.join(slide_dir, base), f.read())
                     except Exception as e:
                         logging.warning('Failed to copy %s: %s', base, e)
+            os.replace(out_zip_tmp, out_zip)  # atomic on POSIX
             written += 1
             print(f'  {slide_dir[:50]}: wrote {len(selected)} tiles → {os.path.basename(out_zip)}')
         except Exception as e:
             print(f'  {slide_dir[:40]}: error writing zip: {e}')
-            if os.path.exists(out_zip):
-                os.remove(out_zip)
+            for path in (out_zip_tmp, out_zip):
+                if os.path.exists(path):
+                    os.remove(path)
 
     return written
 

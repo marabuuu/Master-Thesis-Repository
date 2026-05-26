@@ -758,13 +758,18 @@ if __name__ == "__main__":
         description="Build per-patient genomic H5 files for MoPaDi training."
     )
     parser.add_argument("--config", required=True, help="Path to config.yaml")
+    parser.add_argument(
+        "--section",
+        default="build_genomic_features",
+        help="Top-level config section to use (default: build_genomic_features)",
+    )
     args = parser.parse_args()
 
     with open(args.config) as fh:
         full_cfg = yaml.safe_load(fh)
 
-    section = full_cfg.get("mopadi_genomic_training", {})
+    section = full_cfg.get(args.section, {})
     if not section:
-        raise SystemExit("No 'mopadi_genomic_training' section found in config.")
+        raise SystemExit(f"No '{args.section}' section found in config.")
 
     run_build_genomic_features(section, verbose=True)
