@@ -102,6 +102,14 @@ class GDALitModel(_BaseGenomicLitModel):
             persistent=False,
         )
 
+        # Freeze backbone when requested — must happen after super().__init__
+        # which creates self.model and self.ema_model.
+        if conf.freeze_backbone:
+            self.model.requires_grad_(False)
+            # ema_model is already requires_grad=False; mark explicitly for clarity
+            self.ema_model.requires_grad_(False)
+            log.info("GDALitModel: backbone FROZEN — only adapter/encoder receive gradients")
+
         n_adapter = sum(p.numel() for p in self.adapter.parameters())
         n_enc = sum(p.numel() for p in self.genomic_encoder.parameters())
         log.info(
@@ -129,7 +137,16 @@ class GDALitModel(_BaseGenomicLitModel):
                      len(added), added[:8])
         checkpoint["state_dict"] = ckpt_sd
 
-        # ── Optimizer states: drop if param group sizes no longer match ───
+        # ── Optimizer states ──────────────────────────────────────────────
+        # When the backbone is frozen (v15+) there is only one optimizer
+        # (opt_adapter).  Old checkpoints (v13/v14) had two; restoring them
+        # would cause a group-size mismatch.  Drop all optimizer states so
+        # Adam momentum resets cleanly for the new training phase.
+        if self.conf.freeze_backbone:
+            checkpoint["optimizer_states"] = []
+            return
+
+        # Drop if param group sizes no longer match ──────────────────────
         # PyTorch raises ValueError if the saved group has a different number of
         # params than the current optimizer group.  This happens whenever new
         # parameters are added to an optimizer (e.g. decoder CA added to
@@ -238,12 +255,6 @@ class GDALitModel(_BaseGenomicLitModel):
     # ------------------------------------------------------------------
 
     def configure_optimizers(self):
-        opt_backbone = torch.optim.AdamW(
-            self.model.parameters(),
-            lr=self.conf.backbone_lr,
-            betas=(0.9, 0.999),
-            weight_decay=1e-2,
-        )
         adapter_params = (
             list(self.adapter.parameters())
             + list(self.genomic_encoder.parameters())
@@ -252,6 +263,15 @@ class GDALitModel(_BaseGenomicLitModel):
         opt_adapter = torch.optim.AdamW(
             adapter_params,
             lr=self.conf.adapter_lr,
+            betas=(0.9, 0.999),
+            weight_decay=1e-2,
+        )
+        if self.conf.freeze_backbone:
+            # Single optimizer — backbone has no trainable parameters.
+            return [opt_adapter], []
+        opt_backbone = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.conf.backbone_lr,
             betas=(0.9, 0.999),
             weight_decay=1e-2,
         )
@@ -312,7 +332,10 @@ class GDALitModel(_BaseGenomicLitModel):
     # ------------------------------------------------------------------
 
     def training_step(self, batch, batch_idx):
-        opt_backbone, opt_adapter = self.optimizers()
+        if self.conf.freeze_backbone:
+            opt_adapter = self.optimizers()
+        else:
+            opt_backbone, opt_adapter = self.optimizers()
         accum = self.conf.accum_batches
 
         batch, _ = self._flatten_bag_batch(batch)
@@ -332,8 +355,6 @@ class GDALitModel(_BaseGenomicLitModel):
         null_mask = torch.rand(B, device=self.device) < self.conf.cfg_dropout
         g_tokens = self.genomic_encoder(feats)                          # (B, n, d)
         null_expanded = self.null_token.unsqueeze(0).expand(B, -1, -1) # (B, n, d)
-        # Differentiable conditional replace (avoids in-place on leaf tensor)
-        g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
 
         # ── Subtype contrastive loss on real g_tokens (float32, before autocast) ──
         # Computed here so gradients reach genomic_encoder in full precision.
@@ -347,41 +368,86 @@ class GDALitModel(_BaseGenomicLitModel):
             c_loss = feats.new_zeros(())
 
         # ── Forward pass ─────────────────────────────────────────────────
-        with torch.autocast(device_type="cuda", enabled=self.conf.fp16):
-            # Backbone: unconditional ε prediction
-            t_scaled = self.sampler._scale_timesteps(t)
-            backbone_out = self.model.forward(
-                x=x_t,
-                t=t_scaled,
-                x_start=imgs,
-                cond=zeros_cond,
-            )
-            eps_backbone = backbone_out.pred                             # (B, 3, H, W)
+        # NOTE: no inner torch.autocast block here — Lightning's precision plugin
+        # (bf16-mixed or fp16-mixed) wraps training_step at the trainer level.
+        # An inner autocast(enabled=False) would disable the outer bf16 context,
+        # causing dtype mismatches when tensors produced outside (under bf16) are
+        # passed into model layers with the outer context unexpectedly disabled.
+        t_scaled = self.sampler._scale_timesteps(t)
+        backbone_out = self.model.forward(
+            x=x_t,
+            t=t_scaled,
+            x_start=imgs,
+            cond=zeros_cond,
+        )
+        eps_backbone = backbone_out.pred                             # (B, 3, H, W)
 
-            # Adapter: genomic correction Δε
-            delta_eps = self.adapter(x_t, t, g_tokens_train)           # (B, 3, H, W)
+        use_delta = self.conf.delta_encouragement_weight > 0
+        use_split = self.conf.split_backbone_adapter_loss
 
-            mse_loss = F.mse_loss(eps_backbone + delta_eps, noise)
+        if use_delta or use_split:
+            # Need d_own and d_null separately for delta loss or stop-grad.
+            d_own  = self.adapter(x_t, t, g_tokens)       # (B, 3, H, W) real tokens
+            d_null = self.adapter(x_t, t, null_expanded)  # (B, 3, H, W) null token
+            # Reconstruct CFG-dropout mix from the two precomputed outputs
+            d_train = torch.where(null_mask[:, None, None, None], d_null, d_own)
+        else:
+            # Original single-pass path (backward-compatible)
+            g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
+            d_train = self.adapter(x_t, t, g_tokens_train)
 
-        loss = mse_loss + self.conf.contrastive_weight * c_loss
+        # Cast to float32 for loss: F.mse_loss is not autocast-eligible and
+        # will fail with mixed bf16/float32 inputs under bf16-mixed precision.
+        noise_f = noise.float()
+        if use_split:
+            mse_backbone = F.mse_loss(eps_backbone.float(), noise_f)
+            mse_adapter  = F.mse_loss(eps_backbone.detach().float() + d_train.float(), noise_f)
+            mse_loss = mse_backbone + mse_adapter
+        else:
+            mse_loss = F.mse_loss((eps_backbone + d_train).float(), noise_f)
+
+        # Delta encouragement loss (fp32 for numerical stability with small values)
+        if use_delta:
+            gd = (d_own.float() - d_null.float()).pow(2).mean()
+            delta_loss = -self.conf.delta_encouragement_weight * torch.log(gd + 1e-8)
+        else:
+            delta_loss = feats.new_zeros(())
+
+        loss = mse_loss + delta_loss + self.conf.contrastive_weight * c_loss
 
         self.manual_backward(loss / accum)
 
         if self.is_last_accum(batch_idx):
             if self.conf.grad_clip > 0:
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.grad_clip)
+                if not self.conf.freeze_backbone:
+                    torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.grad_clip)
                 torch.nn.utils.clip_grad_norm_(
                     list(self.adapter.parameters()) + list(self.genomic_encoder.parameters()),
                     self.conf.grad_clip,
                 )
-            opt_backbone.step()
+            if not self.conf.freeze_backbone:
+                opt_backbone.step()
+                opt_backbone.zero_grad()
             opt_adapter.step()
-            opt_backbone.zero_grad()
             opt_adapter.zero_grad()
 
         # ── Logging ───────────────────────────────────────────────────────
         if self.trainer.is_global_zero:
             self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
+            if self.conf.split_backbone_adapter_loss:
+                self.logger.experiment.add_scalar(
+                    "loss/backbone", mse_backbone.item(), self.num_samples
+                )
+                self.logger.experiment.add_scalar(
+                    "loss/adapter", mse_adapter.item(), self.num_samples
+                )
+            if self.conf.delta_encouragement_weight > 0:
+                self.logger.experiment.add_scalar(
+                    "cond/delta_loss", delta_loss.item(), self.num_samples
+                )
+                self.logger.experiment.add_scalar(
+                    "cond/guidance_delta_train", gd.item(), self.num_samples
+                )
             if self.conf.contrastive_weight > 0:
                 self.logger.experiment.add_scalar(
                     "cond/contrastive_loss", c_loss.item(), self.num_samples
@@ -437,9 +503,10 @@ class GDALitModel(_BaseGenomicLitModel):
         if not self.is_last_accum(batch_idx):
             return
 
-        # Backbone EMA (from parent)
-        from mopadi.train_diff_autoenc import ema as _ema
-        _ema(self.model, self.ema_model, self.conf.ema_decay)
+        # Backbone EMA — skip when frozen; weights never change so EMA = backbone always
+        if not self.conf.freeze_backbone:
+            from mopadi.train_diff_autoenc import ema as _ema
+            _ema(self.model, self.ema_model, self.conf.ema_decay)
 
         # Adapter EMA (manual)
         decay = self.conf.ema_decay
@@ -471,7 +538,8 @@ class GDALitModel(_BaseGenomicLitModel):
             ).pred
             g_tokens = self._ema_genomic_encoder(feats)
             delta_eps = self._ema_adapter(x_t, t, g_tokens)
-            loss_val = F.mse_loss(eps_backbone + delta_eps, noise)
+            noise_f = noise.float()
+            loss_val = F.mse_loss((eps_backbone + delta_eps).float(), noise_f)
 
             # Shuffled-conditioning loss: same forward pass but with mismatched genomic
             # features. If loss_val_shuffled > loss_val the conditioning is carrying
@@ -479,7 +547,7 @@ class GDALitModel(_BaseGenomicLitModel):
             perm = torch.randperm(B, device=self.device)
             g_tokens_shuffled = self._ema_genomic_encoder(feats[perm])
             delta_eps_shuffled = self._ema_adapter(x_t, t, g_tokens_shuffled)
-            loss_val_shuffled = F.mse_loss(eps_backbone + delta_eps_shuffled, noise)
+            loss_val_shuffled = F.mse_loss((eps_backbone + delta_eps_shuffled).float(), noise_f)
 
         # logger=False: accumulate in callback_metrics without writing to TFBoard
         # per batch (which would create 100 entries per val run at the same step).
@@ -554,11 +622,13 @@ class GDALitModel(_BaseGenomicLitModel):
         g_tokens_vis = self.genomic_encoder(feats_s)
         null_vis = self.null_token.unsqueeze(0).expand(b, -1, -1).detach()
 
+        # Cast to float32: arithmetic below (sac/somc arrays, make_grid) expects
+        # consistent float32; model outputs may be bf16 under bf16-mixed precision.
         eps_back = self.model.forward(
             x=x_t_vis, t=t_scaled, x_start=imgs_s, cond=zeros_cond
-        ).pred
-        d_own = self.adapter(x_t_vis, t_vis, g_tokens_vis)
-        d_null = self.adapter(x_t_vis, t_vis, null_vis)
+        ).pred.float()
+        d_own = self.adapter(x_t_vis, t_vis, g_tokens_vis).float()
+        d_null = self.adapter(x_t_vis, t_vis, null_vis).float()
 
         def _guidance_vis(delta):
             g_min = delta.flatten(1).min(1).values.view(-1, 1, 1, 1)
@@ -596,11 +666,11 @@ class GDALitModel(_BaseGenomicLitModel):
         # ── EMA version ───────────────────────────────────────────────────
         eps_back_ema = self.ema_model.forward(
             x=x_t_vis, t=t_scaled, x_start=imgs_s, cond=zeros_cond
-        ).pred
+        ).pred.float()
         g_tok_ema = self._ema_genomic_encoder(feats_s)
         null_ema = self._ema_null_token.unsqueeze(0).expand(b, -1, -1)
-        d_own_ema  = self._ema_adapter(x_t_vis, t_vis, g_tok_ema)
-        d_null_ema = self._ema_adapter(x_t_vis, t_vis, null_ema)
+        d_own_ema  = self._ema_adapter(x_t_vis, t_vis, g_tok_ema).float()
+        d_null_ema = self._ema_adapter(x_t_vis, t_vis, null_ema).float()
 
         rows_ema = [imgs_s.clamp(-1, 1), x_t_vis.clamp(-1, 1)]
         try:

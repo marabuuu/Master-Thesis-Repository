@@ -49,6 +49,34 @@ class GDAConfig(GenomicTrainConfig):
     backbone_lr: float = 1e-4
     adapter_lr: float = 3e-4
 
+    # ── Delta encouragement loss ──────────────────────────────────────
+    # Adds −delta_encouragement_weight × log(guidance_delta + ε) to the
+    # training loss, directly penalising near-zero adapter divergence.
+    # guidance_delta = E[‖Δε_own − Δε_null‖²].
+    # Set to 0.0 to disable (default, backward-compatible).
+    # Recommended starting value: 1e-3.
+    delta_encouragement_weight: float = 0.0
+
+    # ── Split backbone/adapter loss (stop-gradient) ───────────────────
+    # When True, the loss is split into two separate terms:
+    #   L_backbone = MSE(eps_backbone, noise)
+    #   L_adapter  = MSE(eps_backbone.detach() + d_train, noise)
+    # This forces the backbone to learn denoising independently (cannot
+    # free-ride on the adapter), while the adapter trains on the residual
+    # from a stopped backbone — no competing gradients, since backbone and
+    # adapter are separate networks.
+    # When False (default), uses the original joint loss:
+    #   MSE(eps_backbone + d_train, noise)
+    split_backbone_adapter_loss: bool = False
+
+    # ── Frozen backbone (v15+) ────────────────────────────────────────
+    # When True, backbone weights are frozen at training start.  Only the
+    # adapter, genomic encoder, and null_token receive gradients.
+    # Eliminates backbone–adapter competition entirely: use when resuming
+    # from a well-trained backbone checkpoint (e.g. v13 epoch-13).
+    # backbone_lr is ignored when freeze_backbone=True.
+    freeze_backbone: bool = False
+
     def __post_init__(self):
         # Skip GenomicTrainConfig.__post_init__ feat_dim == style_ch check —
         # in GDA the backbone still uses style_ch-sized cond vectors (zeros),

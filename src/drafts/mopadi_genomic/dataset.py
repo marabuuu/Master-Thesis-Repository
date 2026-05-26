@@ -241,10 +241,21 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     # ------------------------------------------------------------------
 
     def __getitem__(self, index: int) -> Dict:
-        # Some edge tiles in ZIPs are non-square (e.g. 480×640). Skip them by
-        # walking forward until we find a tile with the expected square size.
+        # Walk forward until we find a readable, square tile.
+        # Catches BadZipFile (bad central directory), OSError (I/O), and
+        # zlib.error (corrupt compressed stream inside a tile) so a single bad
+        # tile never kills a DataLoader worker.
+        import zipfile as _zipfile
+        import zlib as _zlib
         for offset in range(len(self.tile_paths)):
-            item = super().__getitem__((index + offset) % len(self.tile_paths))
+            try:
+                item = super().__getitem__((index + offset) % len(self.tile_paths))
+            except (_zipfile.BadZipFile, OSError, _zlib.error) as exc:
+                log.warning(
+                    "Skipping corrupt tile at index %d (offset %d): %s",
+                    index, offset, exc,
+                )
+                continue
             img = item["img"]
             if img.shape[-2] == self._img_size and img.shape[-1] == self._img_size:
                 break

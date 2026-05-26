@@ -45,8 +45,11 @@ The config.yaml section should look like:
 
 from __future__ import annotations
 
+import json
 import logging
 import traceback
+import zipfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -62,6 +65,96 @@ from .model import GDALitModel
 log = logging.getLogger(__name__)
 
 
+def _validate_cohort_coverage(
+    patient_splits_path: str,
+    zip_dir: str,
+    drop_threshold: float = 0.30,
+    check_cohort: str = "TCGA-LIHC",
+) -> None:
+    """Raise RuntimeError if too many patients from *check_cohort* lack valid zips.
+
+    Reads the central directory of each zip (fast — no decompression) to detect
+    both missing and corrupt archives before any GPU memory is allocated.
+
+    Parameters
+    ----------
+    patient_splits_path:
+        Path to ``patient_splits.json`` produced by ``build_genomic_features``.
+    zip_dir:
+        Directory containing per-patient ``*.zip`` tile archives.
+    drop_threshold:
+        Maximum acceptable fraction of dropped patients (0–1). Default 0.30.
+    check_cohort:
+        Subtype label to check. No-op if this label is absent from splits.
+    """
+    with open(patient_splits_path) as f:
+        splits_data = json.load(f)
+
+    expected_pids: set = set()
+    for fold, entries in splits_data.items():
+        if fold.startswith("_") or not isinstance(entries, dict):
+            continue
+        for pid, meta in entries.items():
+            if pid.startswith("_") or not isinstance(meta, dict):
+                continue
+            if meta.get("subtype") == check_cohort:
+                expected_pids.add(pid)
+
+    if not expected_pids:
+        log.debug("_validate_cohort_coverage: no '%s' patients found — skipping.", check_cohort)
+        return
+
+    zip_dir_path = Path(zip_dir)
+    valid_pids: set = set()
+    invalid: list = []
+
+    for pid in expected_pids:
+        matches = list(zip_dir_path.glob(f"{pid}*.zip"))
+        if not matches:
+            invalid.append((pid, "no zip file found"))
+            continue
+        zip_path = matches[0]
+        try:
+            with zipfile.ZipFile(zip_path, "r") as zf:
+                names = zf.namelist()
+                if names:
+                    with zf.open(names[0]) as _f:
+                        _f.read()   # full decompress — catches zlib.error too
+            valid_pids.add(pid)
+        except Exception as exc:
+            invalid.append((pid, str(exc)))
+
+    n_expected = len(expected_pids)
+    n_valid = len(valid_pids)
+    n_dropped = n_expected - n_valid
+    drop_frac = n_dropped / n_expected if n_expected > 0 else 0.0
+
+    if invalid:
+        sample = invalid[:10]
+        log.warning(
+            "%d %s patients lack valid zips (showing first 10): %s",
+            len(invalid), check_cohort,
+            [(pid, err) for pid, err in sample],
+        )
+
+    log.info(
+        "Cohort coverage check [%s]: %d/%d patients have valid zips (%.1f%% dropped)",
+        check_cohort, n_valid, n_expected, drop_frac * 100,
+    )
+
+    if drop_frac > drop_threshold:
+        raise RuntimeError(
+            f"\n[GDA Startup] Too many {check_cohort} patients are missing or have corrupt zip archives!\n"
+            f"  Expected : {n_expected} patients (from patient_splits.json)\n"
+            f"  Valid    : {n_valid}\n"
+            f"  Dropped  : {n_dropped} ({drop_frac:.1%})\n"
+            f"  Threshold: {drop_threshold:.0%}\n"
+            f"  First bad entries: {invalid[:5]}\n"
+            f"  → Check {zip_dir} for missing or corrupt zip archives.\n"
+            f"  → Re-run the PoC symlink setup and verify LIHC zip integrity."
+        )
+
+
 def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     if verbose:
         logging.basicConfig(
@@ -73,9 +166,20 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     conf = _build_config(cfg)
     log.info(
         "GDAConfig: img_size=%d  feat_dim=%d  adapter_base_ch=%d  "
-        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f",
+        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f  "
+        "split_loss=%s  delta_w=%.1e",
         conf.img_size, conf.feat_dim, conf.adapter_base_ch,
         conf.backbone_lr, conf.adapter_lr, conf.cfg_dropout,
+        conf.split_backbone_adapter_loss, conf.delta_encouragement_weight,
+    )
+
+    # Validate that we haven't lost >30% of any minority cohort due to missing/
+    # corrupt zip archives.  Runs before GPU memory is allocated.
+    drop_threshold = float(cfg.get("lihc_drop_threshold", 0.30))
+    _validate_cohort_coverage(
+        patient_splits_path=conf.patient_splits_path,
+        zip_dir=conf.zip_dir,
+        drop_threshold=drop_threshold,
     )
 
     conf.make_model_conf()
@@ -238,6 +342,9 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         adapter_lr=float(_get("adapter_lr", 3e-4)),
         contrastive_weight=float(_get("contrastive_weight", 0.01)),
         contrastive_temp=float(_get("contrastive_temp", 0.1)),
+        delta_encouragement_weight=float(_get("delta_encouragement_weight", 0.0)),
+        split_backbone_adapter_loss=bool(_get("split_backbone_adapter_loss", False)),
+        freeze_backbone=bool(_get("freeze_backbone", False)),
         # Unused parent fields set to neutral values
         counterfactual_loss_weight=0.0,
         cond_dropout_prob=0.0,
