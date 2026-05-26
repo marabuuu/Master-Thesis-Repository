@@ -529,9 +529,10 @@ def plot_ripley_L_by_subtype(
     # Pairwise significance of L(r) AUC across subtypes
     # ------------------------------------------------------------------
     auc_stats = run_subtype_tests(patient_aucs, metric_name="Ripley_L_AUC")
+    _globally_correct_stats({"Ripley_L_AUC": auc_stats})
     pairwise_q: Dict[str, float] = auc_stats.get("pairwise_q", {})
     pairwise_r: Dict[str, float] = auc_stats.get("pairwise_r", {})
-    kruskal_p: float = auc_stats.get("kruskal_p", float("nan"))
+    kruskal_q: float = auc_stats.get("kruskal_q", float("nan"))
     _R_THRESHOLD = 0.1  # |rank-biserial r| minimum for annotation
 
     def _sig_diffs(subtype: str) -> str:
@@ -606,8 +607,8 @@ def plot_ripley_L_by_subtype(
 
     kw_str = (
         f"Kruskal-Wallis on L(r) AUC [{auc_r_min:.0f}–{auc_r_max:.0f} px]: "
-        f"p = {kruskal_p:.3g}"
-        if np.isfinite(kruskal_p) else ""
+        f"q = {kruskal_q:.3g}"
+        if np.isfinite(kruskal_q) else ""
     )
     fig.suptitle(
         "Ripley's L(r) by Subtype: Clustering vs. Inhibition at Multiple Scales\n"

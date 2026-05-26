@@ -26,7 +26,7 @@ from tqdm import tqdm
 # Add the project root to the python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from visualization import (
+from src.visualization import (
     build_embedding_matrix,
     prepare_labels,
     plot_umap,
@@ -240,9 +240,15 @@ def run_visualizations(config: dict, verbose: bool = True):
 
     # 8.c UMAP coloured by split (second view)
     if verbose: print("[Latents] UMAP coloured by split...")
-    plot_umap(X, y_split, title="UMAP — coloured by data split", style_labels=y_subtype,
-              markers={"LumA": "o", "LumB": "s", "Basal": "^", "Her2": "D", "Normal": "P"},
-              save_path=out_dir / "UMAP_split.png", show=False)
+    _marker_shapes = ["o", "s", "^", "D", "P", "v", "<", ">"]
+    _unique_subtypes = sorted(set(y_subtype))
+    _subtype_markers = {s: _marker_shapes[i % len(_marker_shapes)] for i, s in enumerate(_unique_subtypes)}
+    try:
+        plot_umap(X, y_split, title="UMAP — coloured by data split", style_labels=y_subtype,
+                  markers=_subtype_markers,
+                  save_path=out_dir / "UMAP_split.png", show=False)
+    except Exception as e:
+        print(f"  ⚠️ UMAP split plot failed: {e}")
 
     # 9. Cosine Distance Clustermap
     if verbose: print("[Latents] Plotting Cosine Clustermap...")
@@ -302,15 +308,20 @@ def run_visualizations(config: dict, verbose: bool = True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
+    parser.add_argument(
+        "--section",
+        default="visualize_latents",
+        help="Top-level config section to use (default: visualize_latents)",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         full_cfg = yaml.safe_load(f)
 
-    if "visualize_latents" not in full_cfg:
-        raise ValueError("Missing 'visualize_latents' key in config file.")
+    if args.section not in full_cfg:
+        raise ValueError(f"Missing '{args.section}' key in config file.")
 
-    run_visualizations(full_cfg["visualize_latents"])
+    run_visualizations(full_cfg[args.section])
 
 
 if __name__ == "__main__":
