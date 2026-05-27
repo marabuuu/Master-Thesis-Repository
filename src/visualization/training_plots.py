@@ -1001,15 +1001,15 @@ def load_gda_tfevents(
     return result
 
 
-def plot_gda_v13_diagnostics(
+def plot_gda_diagnostics(
     logdir: Union[str, Path],
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
     figsize: Tuple[float, float] = (16, 18),
     cmap_name: str = CATEGORICAL_CMAP,
-    title: str = "GDA v13 — Training Diagnostics",
+    title: str = "GDA — Training Diagnostics",
 ) -> "Figure":
-    """Seven-panel diagnostic figure for GDA v13 from TFEvents.
+    """Seven-panel diagnostic figure for any GDA run from TFEvents.
 
     Panels
     ------
@@ -1025,7 +1025,7 @@ def plot_gda_v13_diagnostics(
     ----------
     logdir : str | Path
         Directory containing the TFEvents files, e.g.
-        ``experiments/20260517_gda_v13/gda/``.
+        ``experiments/20260526_poc_brca_lihc_gda_v2/gda/``.
     save_path : str | Path | None
         If given, the figure is written to this path (PNG/PDF/SVG).
     show : bool
@@ -1246,6 +1246,10 @@ def plot_gda_v13_diagnostics(
     return fig
 
 
+# Backward-compat alias
+plot_gda_v13_diagnostics = plot_gda_diagnostics
+
+
 # ===================================================================
 #  CLI entry-point
 # ===================================================================
@@ -1259,27 +1263,31 @@ if __name__ == "__main__":
         _sys.path.insert(0, _repo_root)
     # Re-import with absolute paths so the relative imports above resolve
     from src.visualization.training_plots import (  # noqa: E402
-        plot_gda_v13_diagnostics,
+        plot_gda_diagnostics,
     )
 
     _DEFAULT_LOGDIR = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260517_gda_v13/gda"
+        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2/gda"
     )
     _DEFAULT_OUT = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260517_gda_v13"
-        "/gda_v13_diagnostics.png"
+        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2"
+        "/gda_diagnostics.png"
     )
 
     parser = argparse.ArgumentParser(
-        description="Plot GDA v13 training diagnostics from TFEvents."
+        description="Plot GDA training diagnostics from TFEvents."
     )
     parser.add_argument(
         "--logdir", default=_DEFAULT_LOGDIR,
-        help="Directory containing TFEvents files (default: GDA v13 experiment dir)",
+        help="Directory containing TFEvents files",
     )
     parser.add_argument(
         "--out", default=_DEFAULT_OUT,
-        help="Output figure path (PNG/PDF/SVG). Default: next to logdir.",
+        help="Output figure path (PNG/PDF/SVG).",
+    )
+    parser.add_argument(
+        "--title", default=None,
+        help="Figure title. Defaults to 'GDA — Training Diagnostics'.",
     )
     parser.add_argument(
         "--no-show", action="store_true",
@@ -1290,10 +1298,15 @@ if __name__ == "__main__":
     out_path = Path(args.out)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
+    kwargs = {}
+    if args.title:
+        kwargs["title"] = args.title
+
     print(f"Loading TFEvents from: {args.logdir}")
-    fig = plot_gda_v13_diagnostics(
+    fig = plot_gda_diagnostics(
         logdir=args.logdir,
         save_path=out_path,
         show=not args.no_show,
+        **kwargs,
     )
     print(f"Saved: {out_path}")

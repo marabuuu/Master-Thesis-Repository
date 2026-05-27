@@ -4,7 +4,7 @@ Cross-attention visualizations for GDA v13.
 Three views, in increasing scientific importance:
 
   Idea 2 — Token gradient importance  (works on current checkpoint, no code change needed)
-      ∂‖Δε‖/∂g_tokens  gradient norm per token, grouped by PAM50 subtype.
+      ∂‖Δε‖/∂g_tokens  gradient norm per token, grouped by subtype.
       If all 8 tokens have similar importance → encoder collapse or adapter not using tokens.
       If some tokens dominate → adapter has learned to route subtype signal through specific tokens.
 
@@ -13,7 +13,7 @@ Three views, in increasing scientific importance:
       Shows which spatial regions of the histology attend most to each genomic token.
 
   Idea 3 — Per-subtype attention profiles  (requires adapter.capture_attention())
-      Mean attention weight per token per PAM50 subtype, across multiple CA layers.
+      Mean attention weight per token per subtype, across multiple CA layers.
       The most thesis-relevant plot: if profiles differ across subtypes the adapter
       has learned subtype-specific routing through the cross-attention.
 
@@ -21,16 +21,16 @@ Usage
 -----
     # Idea 2 only (works on any checkpoint right now):
     python -m src.visualization.adapter_attention_viz \\
-        --checkpoint experiments/20260517_gda_v13/logs/autoenc/last.ckpt \\
-        --hparams   experiments/20260517_gda_v13/gda/hparams.yaml \\
-        --out       experiments/20260517_gda_v13/attention_viz/ \\
+        --checkpoint experiments/20260526_poc_brca_lihc_gda_v2/gda/autoenc/last.ckpt \\
+        --hparams   experiments/20260526_poc_brca_lihc_gda_v2/gda/hparams.yaml \\
+        --out       experiments/20260526_poc_brca_lihc_gda_v2/attention_viz/ \\
         --idea 2
 
     # All three ideas:
     python -m src.visualization.adapter_attention_viz \\
-        --checkpoint experiments/20260517_gda_v13/logs/autoenc/last.ckpt \\
-        --hparams   experiments/20260517_gda_v13/gda/hparams.yaml \\
-        --out       experiments/20260517_gda_v13/attention_viz/ \\
+        --checkpoint experiments/20260526_poc_brca_lihc_gda_v2/gda/autoenc/last.ckpt \\
+        --hparams   experiments/20260526_poc_brca_lihc_gda_v2/gda/hparams.yaml \\
+        --out       experiments/20260526_poc_brca_lihc_gda_v2/attention_viz/ \\
         --idea all
 
     # Spatial heatmaps at full resolution (ca0) instead of bottleneck (mid_ca):
@@ -52,17 +52,42 @@ import torch
 import torch.nn.functional as F
 
 # ---------------------------------------------------------------------------
-# PAM50 colours
+# Subtype colours
+# Known entries cover PAM50 (for BRCA subtype runs) and common tissue labels.
+# Any other subtype gets an automatically assigned colour from the fallback
+# palette so the plots remain readable regardless of the label vocabulary.
 # ---------------------------------------------------------------------------
 
 SUBTYPE_COLORS: dict[str, str] = {
+    # PAM50 subtypes
     "Basal":   "#E74C3C",
     "Her2":    "#9B59B6",
     "LumA":    "#3498DB",
     "LumB":    "#1ABC9C",
     "Normal":  "#2ECC71",
+    # Tissue-type labels — bare and TCGA-prefixed forms (e.g. BRCA vs LIHC PoC runs)
+    "BRCA":      "#E74C3C",
+    "LIHC":      "#3498DB",
+    "TCGA-BRCA": "#E74C3C",
+    "TCGA-LIHC": "#3498DB",
     "unknown": "#95A5A6",
 }
+
+_FALLBACK_PALETTE: list[str] = [
+    "#E67E22", "#8E44AD", "#16A085", "#C0392B", "#2980B9",
+    "#27AE60", "#D35400", "#7F8C8D", "#F39C12", "#1A5276",
+]
+
+_fallback_cache: dict[str, str] = {}
+
+
+def _subtype_color(name: str) -> str:
+    """Return the colour for *name*, falling back to a stable auto-assigned colour."""
+    if name in SUBTYPE_COLORS:
+        return SUBTYPE_COLORS[name]
+    if name not in _fallback_cache:
+        _fallback_cache[name] = _FALLBACK_PALETTE[len(_fallback_cache) % len(_FALLBACK_PALETTE)]
+    return _fallback_cache[name]
 
 # ---------------------------------------------------------------------------
 # Model + data loading
@@ -109,7 +134,7 @@ def _load_tiles_per_subtype(
     n_per_subtype: int,
     split: str,
 ) -> Dict[str, List[dict]]:
-    """Return up to n_per_subtype items per PAM50 subtype from the dataset."""
+    """Return up to n_per_subtype items per subtype from the dataset."""
     try:
         from src.drafts.mopadi_genomic.dataset import ZipTilesWithGenomicFeatures
     except ImportError:
@@ -127,6 +152,14 @@ def _load_tiles_per_subtype(
         img_size=conf.img_size,
     )
 
+    # Determine every subtype that actually has tiles in this split so the
+    # early-exit below doesn't fire after the first subtype fills up.
+    # _genomic_cache keys = patients with both tiles and H5 files in this split.
+    expected_subtypes = {
+        dataset._subtype_map.get(pid, "unknown")
+        for pid in dataset._genomic_cache
+    }
+
     rng = np.random.default_rng(seed=0)
     indices = rng.permutation(len(dataset)).tolist()
 
@@ -136,7 +169,10 @@ def _load_tiles_per_subtype(
         sub = item.get("subtype", "unknown")
         if len(by_subtype[sub]) < n_per_subtype:
             by_subtype[sub].append(item)
-        if all(len(v) >= n_per_subtype for v in by_subtype.values()):
+        if (
+            expected_subtypes <= by_subtype.keys()
+            and all(len(v) >= n_per_subtype for v in by_subtype.values())
+        ):
             break
 
     return dict(by_subtype)
@@ -213,7 +249,7 @@ def plot_token_gradient_importance(
     for ax, sub in zip(axes, subtypes_sorted):
         mask  = np.array([s == sub for s in subtype_labels])
         vals  = importance[mask].mean(axis=0)
-        ax.bar(tok_labels, vals, color=SUBTYPE_COLORS.get(sub, "#aaa"), width=0.7)
+        ax.bar(tok_labels, vals, color=_subtype_color(sub), width=0.7)
         ax.set_title(sub, fontsize=10)
         ax.set_ylim(0, ymax)
         ax.tick_params(axis="x", labelsize=8)
@@ -248,10 +284,10 @@ def plot_spatial_attention_heatmaps(
     out_path: Optional[Path] = None,
 ) -> plt.Figure:
     """
-    For one representative tile per PAM50 subtype, overlay the per-token
+    For one representative tile per subtype, overlay the per-token
     attention weight map from a chosen CA layer on the original tile.
 
-    Rows = PAM50 subtypes.  Columns = original tile + one column per token.
+    Rows = subtypes.  Columns = original tile + one column per token.
 
     Recommended layers (img_size=512):
       mid_ca : 128×128 spatial — good balance of resolution and memory (~2 MB)
@@ -351,13 +387,13 @@ def plot_subtype_attention_profiles(
 ) -> plt.Figure:
     """
     For each CA layer, plot the mean attention weight per genomic token broken
-    down by PAM50 subtype.
+    down by subtype.
 
     This is the most thesis-relevant plot:
       • Identical profiles across subtypes → adapter is NOT learning subtype-specific
         routing (genomic tokens are treated the same regardless of subtype).
       • Different profiles → the adapter is routing different information through
-        different tokens depending on the patient's subtype.
+        different tokens depending on the sample's subtype.
 
     Layers default to the two encoder levels + bottleneck + first decoder level,
     which give a coarse-to-fine view of where subtype information enters.
@@ -410,7 +446,7 @@ def plot_subtype_attention_profiles(
                 tok_x + offset,
                 profiles[sub][lyr],
                 width=width,
-                color=SUBTYPE_COLORS.get(sub, "#aaa"),
+                color=_subtype_color(sub),
                 label=sub,
             )
         ax.set_xticks(tok_x)
@@ -427,7 +463,7 @@ def plot_subtype_attention_profiles(
         loc="lower center", ncol=len(subtypes_sorted),
         bbox_to_anchor=(0.5, -0.08), fontsize=9,
     )
-    fig.suptitle(f"Per-Subtype Attention Profiles  (t = {t_val})", fontsize=12)
+    fig.suptitle(f"Per-Subtype Attention Profiles  (t={t_val})", fontsize=12)
     fig.tight_layout()
 
     if out_path:
@@ -445,7 +481,7 @@ def plot_subtype_attention_profiles(
 
 _REPO_ROOT       = Path(__file__).resolve().parents[2]   # .../Master-Thesis-Repository
 _EXP_BASE        = _REPO_ROOT.parent / "experiments"     # .../genhist/experiments
-_RUN             = "20260517_gda_v13"
+_RUN             = "20260526_poc_brca_lihc_gda_v2"
 
 _DEFAULT_CKPT    = str(_EXP_BASE / _RUN / "gda/autoenc/last.ckpt")
 _DEFAULT_HPARAMS = str(_EXP_BASE / _RUN / "gda/hparams.yaml")
@@ -454,7 +490,7 @@ _DEFAULT_OUT     = str(_EXP_BASE / _RUN / "attention_viz")
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="GDA v13 cross-attention visualizations",
+        description="GDA cross-attention visualizations",
         formatter_class=argparse.ArgumentDefaultsHelpFormatter,
     )
     parser.add_argument("--checkpoint",  default=_DEFAULT_CKPT)
@@ -468,7 +504,7 @@ def main() -> None:
              "'1' and '3' require the attention-capture code in adapter.py.",
     )
     parser.add_argument("--n_tiles",    type=int,   default=4,
-                        help="Tiles per PAM50 subtype")
+                        help="Tiles per subtype")
     parser.add_argument("--t",          type=int,   default=500,
                         help="Diffusion timestep for forward pass (0–999)")
     parser.add_argument("--attn_layer", default="mid_ca",
