@@ -166,11 +166,9 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     conf = _build_config(cfg)
     log.info(
         "GDAConfig: img_size=%d  feat_dim=%d  adapter_base_ch=%d  "
-        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f  "
-        "split_loss=%s  delta_w=%.1e",
+        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f",
         conf.img_size, conf.feat_dim, conf.adapter_base_ch,
         conf.backbone_lr, conf.adapter_lr, conf.cfg_dropout,
-        conf.split_backbone_adapter_loss, conf.delta_encouragement_weight,
     )
 
     # Validate that we haven't lost >30% of any minority cohort due to missing/
@@ -340,13 +338,6 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         cfg_dropout=float(_get("cfg_dropout", 0.30)),
         backbone_lr=float(_get("backbone_lr", 1e-4)),
         adapter_lr=float(_get("adapter_lr", 3e-4)),
-        contrastive_weight=float(_get("contrastive_weight", 0.01)),
-        contrastive_temp=float(_get("contrastive_temp", 0.1)),
-        cohort_weight=float(_get("cohort_weight", 0.0)),
-        n_cohorts=int(_get("n_cohorts", 2)),
-        delta_encouragement_weight=float(_get("delta_encouragement_weight", 0.0)),
-        pairwise_delta_weight=float(_get("pairwise_delta_weight", 0.0)),
-        split_backbone_adapter_loss=bool(_get("split_backbone_adapter_loss", False)),
         freeze_backbone=bool(_get("freeze_backbone", False)),
         # Unused parent fields set to neutral values
         counterfactual_loss_weight=0.0,

@@ -102,17 +102,6 @@ class GDALitModel(_BaseGenomicLitModel):
             persistent=False,
         )
 
-        # ── Cohort classification head ─────────────────────────────────────
-        # Linear probe on mean-pooled g_tokens.  Forces the genomic encoder to
-        # produce cohort-discriminative embeddings; gradient flows only through
-        # genomic_encoder, never through the backbone.
-        if conf.cohort_weight > 0:
-            self.cohort_head: torch.nn.Linear | None = torch.nn.Linear(
-                conf.adapter_token_dim, conf.n_cohorts
-            )
-        else:
-            self.cohort_head = None
-
         # Freeze backbone when requested — must happen after super().__init__
         # which creates self.model and self.ema_model.
         if conf.freeze_backbone:
@@ -172,8 +161,7 @@ class GDALitModel(_BaseGenomicLitModel):
                 sum(1 for _ in self.model.parameters()),
                 sum(1 for _ in self.adapter.parameters())
                 + sum(1 for _ in self.genomic_encoder.parameters())
-                + 1  # null_token
-                + (sum(1 for _ in self.cohort_head.parameters()) if self.cohort_head is not None else 0),
+                + 1,  # null_token
             ]
             for i, (saved_opt, expected) in enumerate(zip(opt_states, current_sizes)):
                 saved_groups = saved_opt.get("param_groups", [])
@@ -223,45 +211,6 @@ class GDALitModel(_BaseGenomicLitModel):
             return flat, N
         return batch, 1
 
-    @staticmethod
-    def _subtype_contrastive_loss(
-        g_tokens: torch.Tensor,
-        subtypes: list,
-        temperature: float = 0.1,
-    ) -> torch.Tensor:
-        """Supervised contrastive loss (SupCon) on mean-pooled g_tokens.
-
-        Pulls same-subtype token vectors together and pushes different-subtype
-        vectors apart.  Returns zero if the batch has fewer than 2 distinct
-        subtypes or no anchor has a same-subtype neighbour.
-        """
-        # Mean-pool tokens per sample and L2-normalise → (B, D)
-        z = F.normalize(g_tokens.float().mean(dim=1), dim=-1)
-        B = z.shape[0]
-
-        unique_subtypes = list(dict.fromkeys(subtypes))
-        if len(unique_subtypes) < 2:
-            return z.new_zeros(())
-
-        label_map = {s: i for i, s in enumerate(unique_subtypes)}
-        labels = torch.tensor([label_map[s] for s in subtypes], device=z.device)
-
-        mask_self = torch.eye(B, dtype=torch.bool, device=z.device)
-        mask_pos = (labels.unsqueeze(0) == labels.unsqueeze(1)) & ~mask_self  # (B, B)
-
-        if not mask_pos.any():
-            return z.new_zeros(())
-
-        sim = torch.matmul(z, z.T) / temperature                                 # (B, B)
-        log_denom = torch.logsumexp(
-            sim.masked_fill(mask_self, -1e9), dim=1, keepdim=True
-        )                                                                         # (B, 1)
-        log_prob = sim - log_denom                                               # (B, B)
-
-        n_pos = mask_pos.float().sum(dim=1)                                      # (B,)
-        loss_per_anchor = -(log_prob * mask_pos.float()).sum(dim=1) / n_pos.clamp(min=1)
-        return loss_per_anchor[n_pos > 0].mean()
-
     # ------------------------------------------------------------------
     # Optimizers
     # ------------------------------------------------------------------
@@ -271,7 +220,6 @@ class GDALitModel(_BaseGenomicLitModel):
             list(self.adapter.parameters())
             + list(self.genomic_encoder.parameters())
             + [self.null_token]
-            + (list(self.cohort_head.parameters()) if self.cohort_head is not None else [])
         )
         opt_adapter = torch.optim.AdamW(
             adapter_params,
@@ -368,109 +316,19 @@ class GDALitModel(_BaseGenomicLitModel):
         null_mask = torch.rand(B, device=self.device) < self.conf.cfg_dropout
         g_tokens = self.genomic_encoder(feats)                          # (B, n, d)
         null_expanded = self.null_token.unsqueeze(0).expand(B, -1, -1) # (B, n, d)
-
-        # ── Subtype contrastive loss on real g_tokens (float32, before autocast) ──
-        # Computed here so gradients reach genomic_encoder in full precision.
-        # Uses real tokens only (not null-replaced) so the loss reflects the
-        # encoder's actual subtype separation, not the CFG-dropout mixture.
-        if self.conf.contrastive_weight > 0 and "subtype" in batch:
-            c_loss = self._subtype_contrastive_loss(
-                g_tokens, batch["subtype"], self.conf.contrastive_temp
-            )
-        else:
-            c_loss = feats.new_zeros(())
-
-        # ── Cohort classification head ──────────────────────────────────────
-        # Cross-entropy on mean-pooled g_tokens → cohort integer label.
-        # Weight ~1.0 makes this signal competitive with the MSE loss (~0.07)
-        # and overcomes the mean-encoding collapse seen at contrastive_weight=0.01.
-        # Gradient path: cohort_head → g_tokens → genomic_encoder only;
-        # backbone receives zero gradient from this term.
-        if self.conf.cohort_weight > 0 and self.cohort_head is not None and "subtype" in batch:
-            subtypes = batch["subtype"]
-            # Sort alphabetically for consistent label assignment across batches.
-            # TCGA-BRCA → 0, TCGA-LIHC → 1 (and any future cohort keeps order).
-            unique_sorted = sorted(set(subtypes))
-            label_map = {s: i for i, s in enumerate(unique_sorted)}
-            cohort_labels = torch.tensor(
-                [label_map[s] for s in subtypes], device=self.device, dtype=torch.long
-            )
-            g_pooled = g_tokens.float().mean(dim=1)          # (B, token_dim)
-            cohort_logits = self.cohort_head(g_pooled)       # (B, n_cohorts)
-            cohort_loss = F.cross_entropy(cohort_logits, cohort_labels)
-            with torch.no_grad():
-                cohort_acc = (cohort_logits.argmax(dim=-1) == cohort_labels).float().mean()
-        else:
-            cohort_loss = feats.new_zeros(())
-            cohort_acc = feats.new_zeros(())
+        g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
 
         # ── Forward pass ─────────────────────────────────────────────────
         # NOTE: no inner torch.autocast block here — Lightning's precision plugin
         # (bf16-mixed or fp16-mixed) wraps training_step at the trainer level.
-        # An inner autocast(enabled=False) would disable the outer bf16 context,
-        # causing dtype mismatches when tensors produced outside (under bf16) are
-        # passed into model layers with the outer context unexpectedly disabled.
         t_scaled = self.sampler._scale_timesteps(t)
-        backbone_out = self.model.forward(
-            x=x_t,
-            t=t_scaled,
-            x_start=imgs,
-            cond=zeros_cond,
-        )
+        backbone_out = self.model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=zeros_cond)
         eps_backbone = backbone_out.pred                             # (B, 3, H, W)
 
-        use_delta    = self.conf.delta_encouragement_weight > 0
-        use_pairwise = self.conf.pairwise_delta_weight > 0
-        use_split    = self.conf.split_backbone_adapter_loss
+        d_train = self.adapter(x_t, t, g_tokens_train)
 
-        if use_delta or use_pairwise or use_split:
-            # Need d_own and d_null separately for delta loss, pairwise loss, or stop-grad.
-            d_own  = self.adapter(x_t, t, g_tokens)       # (B, 3, H, W) real tokens
-            d_null = self.adapter(x_t, t, null_expanded)  # (B, 3, H, W) null token
-            # Reconstruct CFG-dropout mix from the two precomputed outputs
-            d_train = torch.where(null_mask[:, None, None, None], d_null, d_own)
-        else:
-            # Original single-pass path (backward-compatible)
-            g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
-            d_train = self.adapter(x_t, t, g_tokens_train)
-
-        # Cast to float32 for loss: F.mse_loss is not autocast-eligible and
-        # will fail with mixed bf16/float32 inputs under bf16-mixed precision.
-        noise_f = noise.float()
-        if use_split:
-            mse_backbone = F.mse_loss(eps_backbone.float(), noise_f)
-            mse_adapter  = F.mse_loss(eps_backbone.detach().float() + d_train.float(), noise_f)
-            mse_loss = mse_backbone + mse_adapter
-        else:
-            mse_loss = F.mse_loss((eps_backbone + d_train).float(), noise_f)
-
-        # Delta encouragement loss (fp32 for numerical stability with small values)
-        if use_delta:
-            gd = (d_own.float() - d_null.float()).pow(2).mean()
-            delta_loss = -self.conf.delta_encouragement_weight * torch.log(gd + 1e-8)
-        else:
-            delta_loss = feats.new_zeros(())
-
-        # ── Pairwise Δε loss (unsupervised) ──────────────────────────────────
-        # Compare adapter output for the same noisy images but cyclically shifted
-        # patient tokens: forces the adapter to produce different corrections for
-        # different patients' RNA-seq without requiring any cohort labels.
-        # Cyclic shift guarantees perm[i] ≠ i for all i (no trivial self-pairs).
-        if use_pairwise:
-            perm = (torch.arange(B, device=self.device) + 1) % B
-            d_perm = self.adapter(x_t, t, g_tokens[perm])
-            pd = (d_own.float() - d_perm.float()).pow(2).mean()
-            pairwise_delta_loss = -self.conf.pairwise_delta_weight * torch.log(pd + 1e-8)
-        else:
-            pairwise_delta_loss = feats.new_zeros(())
-
-        loss = (
-            mse_loss
-            + delta_loss
-            + pairwise_delta_loss
-            + self.conf.contrastive_weight * c_loss
-            + self.conf.cohort_weight * cohort_loss
-        )
+        # Cast to float32: F.mse_loss is not autocast-eligible under bf16-mixed.
+        loss = F.mse_loss((eps_backbone + d_train).float(), noise.float())
 
         self.manual_backward(loss / accum)
 
@@ -488,78 +346,32 @@ class GDALitModel(_BaseGenomicLitModel):
             opt_adapter.step()
             opt_adapter.zero_grad()
 
-        # ── Logging ───────────────────────────────────────────────────────
         if self.trainer.is_global_zero:
             self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
-            if self.conf.split_backbone_adapter_loss:
-                self.logger.experiment.add_scalar(
-                    "loss/backbone", mse_backbone.item(), self.num_samples
-                )
-                self.logger.experiment.add_scalar(
-                    "loss/adapter", mse_adapter.item(), self.num_samples
-                )
-            if self.conf.delta_encouragement_weight > 0:
-                self.logger.experiment.add_scalar(
-                    "cond/delta_loss", delta_loss.item(), self.num_samples
-                )
-                self.logger.experiment.add_scalar(
-                    "cond/guidance_delta_train", gd.item(), self.num_samples
-                )
-            if self.conf.pairwise_delta_weight > 0:
-                self.logger.experiment.add_scalar(
-                    "cond/pairwise_delta_loss", pairwise_delta_loss.item(), self.num_samples
-                )
-                self.logger.experiment.add_scalar(
-                    "cond/pairwise_delta", pd.item(), self.num_samples
-                )
-            if self.conf.contrastive_weight > 0:
-                self.logger.experiment.add_scalar(
-                    "cond/contrastive_loss", c_loss.item(), self.num_samples
-                )
-            if self.conf.cohort_weight > 0:
-                self.logger.experiment.add_scalar(
-                    "cond/cohort_loss", cohort_loss.item(), self.num_samples
-                )
-                self.logger.experiment.add_scalar(
-                    "cond/cohort_acc", cohort_acc.item(), self.num_samples
-                )
 
-        # guidance_delta: E[‖Δε_own − Δε_null‖²]
-        # Fires exactly once per interval (< batch_size, not < batch_size_effective).
-        # Uses fresh x_t with randomly drawn timesteps so consecutive measurements
-        # are independent of the training batch's t distribution.
+        # ── Periodic diagnostics (no gradient) ────────────────────────────
+        # guidance_delta = E[‖Δε_own − Δε_null‖²]: primary conditioning health metric.
+        # g_token_diversity: are tokens different across patients (encoder not collapsed)?
+        # g_vs_null_dist: are real tokens distinguishable from the null token?
         _gd_interval = 500 * self.conf.batch_size_effective
         if self.trainer.is_global_zero and (self.num_samples % _gd_interval < self.conf.batch_size):
             with torch.no_grad():
                 bm = min(16, B)
                 t_m = torch.randint(0, self.conf.T, (bm,), device=self.device)
                 x_t_m = self.sampler.q_sample(
-                    imgs[:bm].detach(), t_m,
-                    noise=torch.randn_like(imgs[:bm]),
+                    imgs[:bm].detach(), t_m, noise=torch.randn_like(imgs[:bm]),
                 )
                 g_tok_m = self.genomic_encoder(feats[:bm].detach())
                 null_m = self.null_token.unsqueeze(0).expand(bm, -1, -1).detach()
                 d_own_m = self.adapter(x_t_m, t_m, g_tok_m)
                 d_null_m = self.adapter(x_t_m, t_m, null_m)
                 guidance_delta = (d_own_m - d_null_m).pow(2).mean().item()
-                self.logger.experiment.add_scalar(
-                    "cond/guidance_delta", guidance_delta, self.num_samples
-                )
-
-                # Encoder health: are g_tokens diverse across patients?
-                # If g_token_diversity ≈ 0, the genomic encoder has collapsed.
-                # If g_vs_null_dist ≈ 0, real tokens ≈ null token → adapter can't distinguish.
-                g_tok_mean = g_tok_m.mean(dim=0, keepdim=True)
-                g_token_diversity = (g_tok_m - g_tok_mean).pow(2).mean().item()
+                g_token_diversity = (g_tok_m - g_tok_m.mean(dim=0, keepdim=True)).pow(2).mean().item()
                 g_vs_null = (g_tok_m - null_m).pow(2).mean().item()
-                self.logger.experiment.add_scalar(
-                    "cond/g_token_diversity", g_token_diversity, self.num_samples
-                )
-                self.logger.experiment.add_scalar(
-                    "cond/g_vs_null_dist", g_vs_null, self.num_samples
-                )
+                self.logger.experiment.add_scalar("cond/guidance_delta", guidance_delta, self.num_samples)
+                self.logger.experiment.add_scalar("cond/g_token_diversity", g_token_diversity, self.num_samples)
+                self.logger.experiment.add_scalar("cond/g_vs_null_dist", g_vs_null, self.num_samples)
 
-        # Sample image grid: clean | noisy | backbone_recon | cond_recon | guidance_delta_vis
         _si_interval = self.conf.reconstruct_every_samples
         if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
             self._log_sample_images(imgs.detach(), feats.detach())
