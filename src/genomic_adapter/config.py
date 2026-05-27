@@ -36,13 +36,23 @@ class GDAConfig(GenomicTrainConfig):
     # more gradient signal on real tokens during early training.
     cfg_dropout: float = 0.15
 
-    # ── Subtype contrastive loss ──────────────────────────────────────
-    # Supervised contrastive loss (SupCon) on mean-pooled g_tokens grouped
-    # by PAM50 subtype.  Pulls same-subtype token vectors together and pushes
-    # different-subtype vectors apart, directly regularising the bottleneck.
-    # Set to 0.0 to disable.
+    # ── Subtype contrastive loss (SupCon) ────────────────────────────────
+    # Supervised contrastive loss on mean-pooled g_tokens.
+    # Replaced by cohort_weight (cross-entropy) for binary tasks; set to
+    # 0.0 to disable.
     contrastive_weight: float = 0.01
     contrastive_temp: float = 0.1
+
+    # ── Cohort classification head ────────────────────────────────────────
+    # Cross-entropy loss on mean-pooled g_tokens against cohort integer labels.
+    # Creates a direct gradient path from cohort identity through the genomic
+    # encoder, forcing discriminative token embeddings.  Weight 1.0 makes this
+    # signal comparable to the MSE loss (~0.07 at convergence), overcoming the
+    # mean-encoding collapse that defeats the weaker SupCon signal.
+    # n_cohorts must equal the number of distinct subtype strings in the data.
+    # Set cohort_weight=0.0 to disable (default, backward-compatible).
+    cohort_weight: float = 0.0
+    n_cohorts: int = 2
 
     # ── Per-component learning rates ─────────────────────────────────
     # Parent's conf.lr is used for the backbone; adapter gets its own LR.
@@ -56,6 +66,16 @@ class GDAConfig(GenomicTrainConfig):
     # Set to 0.0 to disable (default, backward-compatible).
     # Recommended starting value: 1e-3.
     delta_encouragement_weight: float = 0.0
+
+    # ── Pairwise Δε loss (unsupervised) ──────────────────────────────
+    # Adds −pairwise_delta_weight × log(pairwise_delta + ε) to the loss,
+    # where pairwise_delta = E[‖Δε_own − Δε_perm‖²] and Δε_perm is the
+    # adapter output for the same noisy images but with cyclically shifted
+    # patient tokens.  Forces the adapter to produce different corrections
+    # for different patients' RNA-seq — no cohort labels required.
+    # Requires delta_encouragement_weight > 0 (shares the d_own forward pass).
+    # Set to 0.0 to disable (default, backward-compatible).
+    pairwise_delta_weight: float = 0.0
 
     # ── Split backbone/adapter loss (stop-gradient) ───────────────────
     # When True, the loss is split into two separate terms:

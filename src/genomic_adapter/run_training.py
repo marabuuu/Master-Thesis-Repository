@@ -342,7 +342,10 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         adapter_lr=float(_get("adapter_lr", 3e-4)),
         contrastive_weight=float(_get("contrastive_weight", 0.01)),
         contrastive_temp=float(_get("contrastive_temp", 0.1)),
+        cohort_weight=float(_get("cohort_weight", 0.0)),
+        n_cohorts=int(_get("n_cohorts", 2)),
         delta_encouragement_weight=float(_get("delta_encouragement_weight", 0.0)),
+        pairwise_delta_weight=float(_get("pairwise_delta_weight", 0.0)),
         split_backbone_adapter_loss=bool(_get("split_backbone_adapter_loss", False)),
         freeze_backbone=bool(_get("freeze_backbone", False)),
         # Unused parent fields set to neutral values

@@ -148,7 +148,8 @@ class GenomicTokenEncoder(nn.Module):
         )
 
     def forward(self, g: torch.Tensor) -> torch.Tensor:
-        return self.net(g).view(g.shape[0], self.n_tokens, self.token_dim)
+        tokens = self.net(g).view(g.shape[0], self.n_tokens, self.token_dim)
+        return F.normalize(tokens, dim=-1)  # unit sphere: prevents magnitude explosion, keeps SupCon gradient alive
 
 
 # ---------------------------------------------------------------------------

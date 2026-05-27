@@ -592,14 +592,25 @@ poc_breast_vs_liver_gda:
 
   # ── Delta encouragement loss ─────────────────────────────────────────
   # −lambda * log(guidance_delta + ε) pushes the adapter to produce non-zero Δε.
-  # v1 had delta_encouragement_weight=0.0 (off) → guidance_delta never emerged.
-  # 5e-3 is 5× the PAM50 v14 value (1e-3 was too weak there); starting from
-  # scratch so we can afford a stronger push.
   delta_encouragement_weight: 5.0e-3
 
-  # ── Contrastive loss ─────────────────────────────────────────────────
-  contrastive_weight: 0.01           # SupCon works with 2 classes (BRCA vs LIHC)
+  # ── Contrastive / classification losses — disabled in v5 ─────────────
+  # Replaced by the unsupervised pairwise Δε loss below, which requires no
+  # cohort labels and directly optimises the quantity we care about.
+  contrastive_weight: 0.0
   contrastive_temp: 0.1
+  cohort_weight: 0.0
+  n_cohorts: 2
+
+  # ── Pairwise Δε loss (unsupervised) ──────────────────────────────────
+  # For each batch: run the adapter with real tokens AND with cyclically
+  # shifted patient tokens (same noisy images, different RNA-seq).  Penalise
+  # −log(‖Δε_own − Δε_perm‖² + ε), forcing the adapter to produce different
+  # noise corrections for different patients without using any cohort labels.
+  # This directly implements the thesis goal: Δε must differ given different
+  # genomic tokens.  Combined with token L2-normalisation (adapter.py) which
+  # prevents the magnitude explosion that killed SupCon in v4.
+  pairwise_delta_weight: 5.0e-3
 
   # ── Optimisation ─────────────────────────────────────────────────────
   backbone_lr: 1.0e-4
@@ -626,9 +637,13 @@ poc_breast_vs_liver_gda:
   gpus: [0, 1, 2, 3]
 
   # ── Output ───────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260526_poc_brca_lihc_gda_v2
-  base_dir: ./experiments/20260526_poc_brca_lihc_gda_v2
-  logdir: ./experiments/20260526_poc_brca_lihc_gda_v2/logs
+  # v6: unsupervised pairwise Δε loss + L2-normalised encoder tokens.
+  # Resumes from v2 (clean encoder state); v5 had pairwise loss silently disabled
+  # due to missing _build_config wiring; v4 had token magnitude explosion.
+  output_dir: ./experiments/20260527_poc_brca_lihc_gda_v6
+  base_dir: ./experiments/20260527_poc_brca_lihc_gda_v6
+  logdir: ./experiments/20260527_poc_brca_lihc_gda_v6/logs
+  resume_from: ./experiments/20260526_poc_brca_lihc_gda_v2/gda/autoenc/last.ckpt
 
 # ── v13: Genomic Diffusion Adapter — joint from-scratch training (2026-05-17) ──────────────
 # Architecture: full MoPaDi backbone UNet + lightweight adapter UNet (~6M params).

@@ -102,6 +102,17 @@ class GDALitModel(_BaseGenomicLitModel):
             persistent=False,
         )
 
+        # ── Cohort classification head ─────────────────────────────────────
+        # Linear probe on mean-pooled g_tokens.  Forces the genomic encoder to
+        # produce cohort-discriminative embeddings; gradient flows only through
+        # genomic_encoder, never through the backbone.
+        if conf.cohort_weight > 0:
+            self.cohort_head: torch.nn.Linear | None = torch.nn.Linear(
+                conf.adapter_token_dim, conf.n_cohorts
+            )
+        else:
+            self.cohort_head = None
+
         # Freeze backbone when requested — must happen after super().__init__
         # which creates self.model and self.ema_model.
         if conf.freeze_backbone:
@@ -161,7 +172,8 @@ class GDALitModel(_BaseGenomicLitModel):
                 sum(1 for _ in self.model.parameters()),
                 sum(1 for _ in self.adapter.parameters())
                 + sum(1 for _ in self.genomic_encoder.parameters())
-                + 1,  # null_token
+                + 1  # null_token
+                + (sum(1 for _ in self.cohort_head.parameters()) if self.cohort_head is not None else 0),
             ]
             for i, (saved_opt, expected) in enumerate(zip(opt_states, current_sizes)):
                 saved_groups = saved_opt.get("param_groups", [])
@@ -259,6 +271,7 @@ class GDALitModel(_BaseGenomicLitModel):
             list(self.adapter.parameters())
             + list(self.genomic_encoder.parameters())
             + [self.null_token]
+            + (list(self.cohort_head.parameters()) if self.cohort_head is not None else [])
         )
         opt_adapter = torch.optim.AdamW(
             adapter_params,
@@ -367,6 +380,30 @@ class GDALitModel(_BaseGenomicLitModel):
         else:
             c_loss = feats.new_zeros(())
 
+        # ── Cohort classification head ──────────────────────────────────────
+        # Cross-entropy on mean-pooled g_tokens → cohort integer label.
+        # Weight ~1.0 makes this signal competitive with the MSE loss (~0.07)
+        # and overcomes the mean-encoding collapse seen at contrastive_weight=0.01.
+        # Gradient path: cohort_head → g_tokens → genomic_encoder only;
+        # backbone receives zero gradient from this term.
+        if self.conf.cohort_weight > 0 and self.cohort_head is not None and "subtype" in batch:
+            subtypes = batch["subtype"]
+            # Sort alphabetically for consistent label assignment across batches.
+            # TCGA-BRCA → 0, TCGA-LIHC → 1 (and any future cohort keeps order).
+            unique_sorted = sorted(set(subtypes))
+            label_map = {s: i for i, s in enumerate(unique_sorted)}
+            cohort_labels = torch.tensor(
+                [label_map[s] for s in subtypes], device=self.device, dtype=torch.long
+            )
+            g_pooled = g_tokens.float().mean(dim=1)          # (B, token_dim)
+            cohort_logits = self.cohort_head(g_pooled)       # (B, n_cohorts)
+            cohort_loss = F.cross_entropy(cohort_logits, cohort_labels)
+            with torch.no_grad():
+                cohort_acc = (cohort_logits.argmax(dim=-1) == cohort_labels).float().mean()
+        else:
+            cohort_loss = feats.new_zeros(())
+            cohort_acc = feats.new_zeros(())
+
         # ── Forward pass ─────────────────────────────────────────────────
         # NOTE: no inner torch.autocast block here — Lightning's precision plugin
         # (bf16-mixed or fp16-mixed) wraps training_step at the trainer level.
@@ -382,11 +419,12 @@ class GDALitModel(_BaseGenomicLitModel):
         )
         eps_backbone = backbone_out.pred                             # (B, 3, H, W)
 
-        use_delta = self.conf.delta_encouragement_weight > 0
-        use_split = self.conf.split_backbone_adapter_loss
+        use_delta    = self.conf.delta_encouragement_weight > 0
+        use_pairwise = self.conf.pairwise_delta_weight > 0
+        use_split    = self.conf.split_backbone_adapter_loss
 
-        if use_delta or use_split:
-            # Need d_own and d_null separately for delta loss or stop-grad.
+        if use_delta or use_pairwise or use_split:
+            # Need d_own and d_null separately for delta loss, pairwise loss, or stop-grad.
             d_own  = self.adapter(x_t, t, g_tokens)       # (B, 3, H, W) real tokens
             d_null = self.adapter(x_t, t, null_expanded)  # (B, 3, H, W) null token
             # Reconstruct CFG-dropout mix from the two precomputed outputs
@@ -413,7 +451,26 @@ class GDALitModel(_BaseGenomicLitModel):
         else:
             delta_loss = feats.new_zeros(())
 
-        loss = mse_loss + delta_loss + self.conf.contrastive_weight * c_loss
+        # ── Pairwise Δε loss (unsupervised) ──────────────────────────────────
+        # Compare adapter output for the same noisy images but cyclically shifted
+        # patient tokens: forces the adapter to produce different corrections for
+        # different patients' RNA-seq without requiring any cohort labels.
+        # Cyclic shift guarantees perm[i] ≠ i for all i (no trivial self-pairs).
+        if use_pairwise:
+            perm = (torch.arange(B, device=self.device) + 1) % B
+            d_perm = self.adapter(x_t, t, g_tokens[perm])
+            pd = (d_own.float() - d_perm.float()).pow(2).mean()
+            pairwise_delta_loss = -self.conf.pairwise_delta_weight * torch.log(pd + 1e-8)
+        else:
+            pairwise_delta_loss = feats.new_zeros(())
+
+        loss = (
+            mse_loss
+            + delta_loss
+            + pairwise_delta_loss
+            + self.conf.contrastive_weight * c_loss
+            + self.conf.cohort_weight * cohort_loss
+        )
 
         self.manual_backward(loss / accum)
 
@@ -448,9 +505,23 @@ class GDALitModel(_BaseGenomicLitModel):
                 self.logger.experiment.add_scalar(
                     "cond/guidance_delta_train", gd.item(), self.num_samples
                 )
+            if self.conf.pairwise_delta_weight > 0:
+                self.logger.experiment.add_scalar(
+                    "cond/pairwise_delta_loss", pairwise_delta_loss.item(), self.num_samples
+                )
+                self.logger.experiment.add_scalar(
+                    "cond/pairwise_delta", pd.item(), self.num_samples
+                )
             if self.conf.contrastive_weight > 0:
                 self.logger.experiment.add_scalar(
                     "cond/contrastive_loss", c_loss.item(), self.num_samples
+                )
+            if self.conf.cohort_weight > 0:
+                self.logger.experiment.add_scalar(
+                    "cond/cohort_loss", cohort_loss.item(), self.num_samples
+                )
+                self.logger.experiment.add_scalar(
+                    "cond/cohort_acc", cohort_acc.item(), self.num_samples
                 )
 
         # guidance_delta: E[‖Δε_own − Δε_null‖²]
