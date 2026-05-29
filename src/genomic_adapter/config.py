@@ -15,7 +15,7 @@ Key design:
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, Optional
+from typing import Dict
 
 from src.drafts.mopadi_genomic.config import GenomicTrainConfig
 
@@ -24,30 +24,36 @@ from src.drafts.mopadi_genomic.config import GenomicTrainConfig
 class GDAConfig(GenomicTrainConfig):
     # ── Adapter architecture ──────────────────────────────────────────
     adapter_base_ch: int = 64     # base channels; doubles at each down level
-    adapter_n_levels: int = 3     # number of stride-2 downsamplings
     adapter_n_tokens: int = 8     # genomic token sequence length for cross-attn
     adapter_token_dim: int = 256  # dim of each token vector
     adapter_t_dim: int = 256      # sinusoidal timestep embedding dim
     adapter_n_heads: int = 4      # attention heads in cross-attention layers
 
     # ── CFG ──────────────────────────────────────────────────────────
-    # Override parent's cond_dropout_prob with a clearer name.
-    # 15 % null dropout: enough for CFG at inference while giving the adapter
-    # more gradient signal on real tokens during early training.
     cfg_dropout: float = 0.15
 
     # ── Per-component learning rates ─────────────────────────────────
-    # Parent's conf.lr is used for the backbone; adapter gets its own LR.
     backbone_lr: float = 1e-4
     adapter_lr: float = 3e-4
 
+    # ── Adapter loss ─────────────────────────────────────────────────
+    # Weight for the delta-encouragement term: -weight * ||Δε_own - Δε_null||².
+    # Prevents adapter from ignoring token input when null_token is fixed at zeros.
+    # 0.0 = disabled. Keep small (0.001) so MSE still dominates.
+    delta_encouragement_weight: float = 0.0
+
     # ── Frozen backbone ───────────────────────────────────────────────
-    # When True, backbone weights are frozen at training start.  Only the
-    # adapter, genomic encoder, and null_token receive gradients.
-    # Eliminates backbone–adapter competition entirely: use when resuming
-    # from a well-trained backbone checkpoint (e.g. v13 epoch-13).
+    # When True, backbone weights are frozen at training start.
     # backbone_lr is ignored when freeze_backbone=True.
     freeze_backbone: bool = False
+
+    # Optional checkpoint used to initialize the backbone before freezing.
+    # Only backbone weights are loaded; conditioning path can be reinitialized.
+    backbone_ckpt_path: str = ""
+
+    # If True, the adapter, genomic encoder, and null token are reset to fresh
+    # initial weights after loading the backbone checkpoint.
+    reinit_adapter: bool = False
 
     def __post_init__(self):
         # Skip GenomicTrainConfig.__post_init__ feat_dim == style_ch check —

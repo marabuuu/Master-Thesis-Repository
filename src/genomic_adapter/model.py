@@ -10,11 +10,13 @@ Backbone UNet  : always receives  cond = zeros(B, style_ch)
 Adapter        : receives (x_t, t, g_tokens) → predicts Δε
                  → CFG null dropout (cfg_dropout %) replaces g_tokens with null_token
 
-Combined loss  : MSE(ε_backbone + Δε_adapter, noise)
+Combined loss  : L_bb  = MSE(ε_backbone, noise)
+                 L_ada = MSE(ε_backbone.detach() + Δε_adapter, noise)
 
-Both components receive gradients from the same loss and train jointly.
-The backbone optimises the unconditional component; the adapter learns the
-genomic-specific residual. No pretrained checkpoint is loaded.
+Backbone and adapter each receive gradient only from their own loss term.
+The backbone optimises unconditional denoising; the adapter learns the
+genomic-specific residual on top of a detached backbone prediction.
+No pretrained checkpoint is loaded.
 
 Monitoring
 ----------
@@ -37,7 +39,6 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
-from mopadi.utils.dist_utils import get_world_size
 
 from src.drafts.mopadi_genomic.train import GenomicLitModel as _BaseGenomicLitModel
 
@@ -76,9 +77,14 @@ class GDALitModel(_BaseGenomicLitModel):
             token_dim=conf.adapter_token_dim,
         )
 
-        # Null token for CFG: learned, initialised to zeros
+        # Null token for CFG: fixed at zeros — NOT learned.
+        # A learnable null token converges toward the average real-token direction
+        # (both minimise the same MSE residual), collapsing guidance_delta to zero.
+        # Fixed zeros means null conditioning = identity cross-attention (K=V=0,
+        # bias=False), giving a clean architectural null baseline.
         self.null_token = torch.nn.Parameter(
-            torch.zeros(conf.adapter_n_tokens, conf.adapter_token_dim)
+            torch.zeros(conf.adapter_n_tokens, conf.adapter_token_dim),
+            requires_grad=False,
         )
 
         # ── Adapter ───────────────────────────────────────────────────────
@@ -99,8 +105,13 @@ class GDALitModel(_BaseGenomicLitModel):
         self.register_buffer(
             "_ema_null_token",
             torch.zeros(conf.adapter_n_tokens, conf.adapter_token_dim),
-            persistent=False,
+            persistent=True,
         )
+
+        if conf.backbone_ckpt_path:
+            self._load_backbone_weights(conf.backbone_ckpt_path)
+            if conf.reinit_adapter:
+                self._reset_conditioning_modules()
 
         # Freeze backbone when requested — must happen after super().__init__
         # which creates self.model and self.ema_model.
@@ -118,6 +129,64 @@ class GDALitModel(_BaseGenomicLitModel):
             n_adapter, n_enc, list(self.null_token.shape),
         )
 
+    def _load_backbone_weights(self, ckpt_path: str) -> None:
+        """Load only backbone weights from a checkpoint into model and EMA model."""
+        ckpt_file = Path(ckpt_path)
+        if not ckpt_file.exists():
+            raise FileNotFoundError(f"backbone_ckpt_path not found: {ckpt_path}")
+
+        log.info("Loading backbone weights from checkpoint: %s", ckpt_file)
+        checkpoint = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        state_dict = checkpoint.get("state_dict", checkpoint)
+
+        backbone_state = {
+            k[len("model."):]: v
+            for k, v in state_dict.items()
+            if k.startswith("model.") and not k.startswith("model.adapter")
+        }
+        missing, unexpected = self.model.load_state_dict(backbone_state, strict=False)
+        log.info(
+            "Loaded backbone into model: missing=%d unexpected=%d",
+            len(missing), len(unexpected),
+        )
+
+        ema_state = {
+            k[len("ema_model."):]: v
+            for k, v in state_dict.items()
+            if k.startswith("ema_model.") and not k.startswith("ema_model.adapter")
+        }
+        missing_ema, unexpected_ema = self.ema_model.load_state_dict(ema_state, strict=False)
+        log.info(
+            "Loaded backbone into ema_model: missing=%d unexpected=%d",
+            len(missing_ema), len(unexpected_ema),
+        )
+
+    def _reset_conditioning_modules(self) -> None:
+        """Reinitialize adapter-side modules while keeping the backbone fixed."""
+        log.info("Reinitializing adapter, genomic encoder, and null token from scratch.")
+        self.genomic_encoder = GenomicTokenEncoder(
+            genomic_in=self.conf.feat_dim,
+            n_tokens=self.conf.adapter_n_tokens,
+            token_dim=self.conf.adapter_token_dim,
+        )
+        self.null_token = torch.nn.Parameter(
+            torch.zeros(self.conf.adapter_n_tokens, self.conf.adapter_token_dim),
+            requires_grad=False,
+        )
+        self.adapter = GenomicResidualAdapter(
+            in_ch=3,
+            base_ch=self.conf.adapter_base_ch,
+            t_dim=self.conf.adapter_t_dim,
+            token_dim=self.conf.adapter_token_dim,
+            n_heads=self.conf.adapter_n_heads,
+        )
+
+        self._ema_adapter = copy.deepcopy(self.adapter)
+        self._ema_adapter.requires_grad_(False)
+        self._ema_genomic_encoder = copy.deepcopy(self.genomic_encoder)
+        self._ema_genomic_encoder.requires_grad_(False)
+        self._ema_null_token.zero_()
+
     # ------------------------------------------------------------------
     # Checkpoint compatibility
     # ------------------------------------------------------------------
@@ -126,6 +195,21 @@ class GDALitModel(_BaseGenomicLitModel):
         # ── Model weights: fill in any new params not present in checkpoint ──
         # (e.g. decoder CA layers added after the first run)
         ckpt_sd = checkpoint.get("state_dict", {})
+
+        if self.conf.backbone_ckpt_path and self.conf.reinit_adapter:
+            ckpt_sd = {
+                k: v
+                for k, v in ckpt_sd.items()
+                if not (
+                    k.startswith("adapter.")
+                    or k.startswith("genomic_encoder.")
+                    or k.startswith("null_token")
+                    or k.startswith("_ema_adapter.")
+                    or k.startswith("_ema_genomic_encoder.")
+                    or k.startswith("_ema_null_token")
+                )
+            }
+
         model_sd = self.state_dict()
         added = []
         for k, v in model_sd.items():
@@ -135,6 +219,14 @@ class GDALitModel(_BaseGenomicLitModel):
         if added:
             log.info("on_load_checkpoint: initialised %d new params from scratch: %s",
                      len(added), added[:8])
+
+        # Always reset null_token and its EMA to zeros regardless of what the
+        # checkpoint stored.  A previously-learned null_token (e.g. from v9) would
+        # act as a biased non-zero null baseline, defeating the fixed-null design.
+        for key in ("null_token", "_ema_null_token"):
+            if key in ckpt_sd:
+                ckpt_sd[key] = torch.zeros_like(ckpt_sd[key])
+
         checkpoint["state_dict"] = ckpt_sd
 
         # ── Optimizer states ──────────────────────────────────────────────
@@ -156,12 +248,12 @@ class GDALitModel(_BaseGenomicLitModel):
         opt_states = checkpoint.get("optimizer_states")
         if opt_states:
             # opt_backbone → self.model.parameters()  (group index 0)
-            # opt_adapter  → adapter + genomic_encoder + null_token  (group index 1)
+            # opt_adapter  → adapter + genomic_encoder  (group index 1)
+            # null_token is fixed (requires_grad=False) and not in any optimizer
             current_sizes = [
                 sum(1 for _ in self.model.parameters()),
                 sum(1 for _ in self.adapter.parameters())
-                + sum(1 for _ in self.genomic_encoder.parameters())
-                + 1,  # null_token
+                + sum(1 for _ in self.genomic_encoder.parameters()),
             ]
             for i, (saved_opt, expected) in enumerate(zip(opt_states, current_sizes)):
                 saved_groups = saved_opt.get("param_groups", [])
@@ -219,7 +311,7 @@ class GDALitModel(_BaseGenomicLitModel):
         adapter_params = (
             list(self.adapter.parameters())
             + list(self.genomic_encoder.parameters())
-            + [self.null_token]
+            # null_token is fixed (requires_grad=False) — not in any optimizer
         )
         opt_adapter = torch.optim.AdamW(
             adapter_params,
@@ -327,8 +419,29 @@ class GDALitModel(_BaseGenomicLitModel):
 
         d_train = self.adapter(x_t, t, g_tokens_train)
 
+        # ── Split losses: backbone and adapter train on separate objectives ──
+        # Backbone: standard MSE on its own prediction.
+        # Adapter:  MSE on the residual relative to a detached backbone.
+        #   Detaching eps_backbone here ensures backbone gradients do not flow
+        #   through the adapter loss — eliminating the gradient conflict where
+        #   the backbone could learn to compensate for whatever the adapter adds.
         # Cast to float32: F.mse_loss is not autocast-eligible under bf16-mixed.
-        loss = F.mse_loss((eps_backbone + d_train).float(), noise.float())
+        noise_f = noise.float()
+        loss_bb = F.mse_loss(eps_backbone.float(), noise_f)
+        loss_ada = F.mse_loss((eps_backbone.detach().float() + d_train.float()), noise_f)
+
+        # Delta encouragement: prevent the adapter from ignoring its token input.
+        # With null_token fixed at zeros, Δε_null ≈ 0 (identity cross-attention).
+        # This term penalises ||Δε_own - 0||², forcing the adapter to produce
+        # non-zero output for real tokens. The MSE term then ensures these outputs
+        # are actually useful residual corrections, not arbitrary noise.
+        # No labels are used — the comparison is purely own-tokens vs null-tokens.
+        if self.conf.delta_encouragement_weight > 0:
+            d_null_train = self.adapter(x_t, t, null_expanded)
+            delta_sq = (d_train - d_null_train.detach()).pow(2).mean()
+            loss_ada = loss_ada - self.conf.delta_encouragement_weight * delta_sq
+
+        loss = loss_bb + loss_ada
 
         self.manual_backward(loss / accum)
 
@@ -367,10 +480,13 @@ class GDALitModel(_BaseGenomicLitModel):
                 d_null_m = self.adapter(x_t_m, t_m, null_m)
                 guidance_delta = (d_own_m - d_null_m).pow(2).mean().item()
                 g_token_diversity = (g_tok_m - g_tok_m.mean(dim=0, keepdim=True)).pow(2).mean().item()
-                g_vs_null = (g_tok_m - null_m).pow(2).mean().item()
+                # delta_magnitude: mean squared norm of the adapter's own output.
+                # With null_token fixed at zeros, d_null ≈ 0, so this ≈ guidance_delta.
+                # Tracks whether the adapter produces non-zero corrections at all.
+                delta_magnitude = d_own_m.pow(2).mean().item()
                 self.logger.experiment.add_scalar("cond/guidance_delta", guidance_delta, self.num_samples)
                 self.logger.experiment.add_scalar("cond/g_token_diversity", g_token_diversity, self.num_samples)
-                self.logger.experiment.add_scalar("cond/g_vs_null_dist", g_vs_null, self.num_samples)
+                self.logger.experiment.add_scalar("cond/delta_magnitude", delta_magnitude, self.num_samples)
 
         _si_interval = self.conf.reconstruct_every_samples
         if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
@@ -395,8 +511,7 @@ class GDALitModel(_BaseGenomicLitModel):
         decay = self.conf.ema_decay
         _ema_update(self._ema_adapter.parameters(), self.adapter.parameters(), decay)
         _ema_update(self._ema_genomic_encoder.parameters(), self.genomic_encoder.parameters(), decay)
-        with torch.no_grad():
-            self._ema_null_token.mul_(decay).add_(self.null_token.data, alpha=1.0 - decay)
+        # _ema_null_token is always zeros (null_token is fixed); no EMA update needed.
 
     # ------------------------------------------------------------------
     # Validation
@@ -518,26 +633,25 @@ class GDALitModel(_BaseGenomicLitModel):
             g_max = delta.flatten(1).max(1).values.view(-1, 1, 1, 1)
             return (2 * (delta - g_min) / (g_max - g_min + 1e-8) - 1).clamp(-1, 1)
 
-        rows = [imgs_s.clamp(-1, 1), x_t_vis.clamp(-1, 1)]
+        sac  = torch.as_tensor(
+            self.sampler.sqrt_alphas_cumprod, device=self.device, dtype=torch.float32
+        )
+        somc = torch.as_tensor(
+            self.sampler.sqrt_one_minus_alphas_cumprod, device=self.device, dtype=torch.float32
+        )
 
-        # Reconstruct x_0 from eps if the sampler exposes the alphas
-        try:
-            sac  = torch.as_tensor(
-                self.sampler.sqrt_alphas_cumprod, device=self.device, dtype=torch.float32
-            )
-            somc = torch.as_tensor(
-                self.sampler.sqrt_one_minus_alphas_cumprod, device=self.device, dtype=torch.float32
-            )
-            def _x0(x_t_, eps_, t_):
-                a = sac[t_].view(-1, 1, 1, 1)
-                b_ = somc[t_].view(-1, 1, 1, 1)
-                return ((x_t_ - b_ * eps_) / a).clamp(-1, 1)
+        def _x0(x_t_, eps_, t_):
+            a = sac[t_].view(-1, 1, 1, 1)
+            b_ = somc[t_].view(-1, 1, 1, 1)
+            return ((x_t_ - b_ * eps_) / a).clamp(-1, 1)
 
-            rows += [_x0(x_t_vis, eps_back, t_vis), _x0(x_t_vis, eps_back + d_own, t_vis)]
-        except AttributeError:
-            pass
-
-        rows.append(_guidance_vis(d_own - d_null))
+        rows = [
+            imgs_s.clamp(-1, 1),
+            x_t_vis.clamp(-1, 1),
+            _x0(x_t_vis, eps_back, t_vis),
+            _x0(x_t_vis, eps_back + d_own, t_vis),
+            _guidance_vis(d_own - d_null),
+        ]
         grid = make_grid(torch.cat(rows, dim=0), nrow=b, normalize=True,
                          value_range=(-1, 1), padding=2)
 
@@ -555,13 +669,13 @@ class GDALitModel(_BaseGenomicLitModel):
         d_own_ema  = self._ema_adapter(x_t_vis, t_vis, g_tok_ema).float()
         d_null_ema = self._ema_adapter(x_t_vis, t_vis, null_ema).float()
 
-        rows_ema = [imgs_s.clamp(-1, 1), x_t_vis.clamp(-1, 1)]
-        try:
-            rows_ema += [_x0(x_t_vis, eps_back_ema, t_vis),
-                         _x0(x_t_vis, eps_back_ema + d_own_ema, t_vis)]
-        except NameError:
-            pass
-        rows_ema.append(_guidance_vis(d_own_ema - d_null_ema))
+        rows_ema = [
+            imgs_s.clamp(-1, 1),
+            x_t_vis.clamp(-1, 1),
+            _x0(x_t_vis, eps_back_ema, t_vis),
+            _x0(x_t_vis, eps_back_ema + d_own_ema, t_vis),
+            _guidance_vis(d_own_ema - d_null_ema),
+        ]
 
         grid_ema = make_grid(torch.cat(rows_ema, dim=0), nrow=b, normalize=True,
                              value_range=(-1, 1), padding=2)
@@ -617,16 +731,11 @@ class GDALitModel(_BaseGenomicLitModel):
             delta_null = adapter(x_t, t, null_expanded)
             return eps_base + guidance_scale * (delta_own - delta_null)
 
-        # DDIM sampling loop (uses the sampler's sample method)
-        from mopadi.diffusion.base import DummyModel
-        import dataclasses
+        from mopadi.diffusion.base import DummyReturn
 
-        # Wrap our custom model_fn as a MoPaDi-compatible model
         class _WrappedModel(torch.nn.Module):
             def forward(self_, x, t, **kw):
-                from mopadi.diffusion.base import ModelReturn
-                pred = model_fn(x, t, **kw)
-                return ModelReturn(pred=pred)
+                return DummyReturn(pred=model_fn(x, t, **kw))
 
         out = sampler.sample(
             model=_WrappedModel(),

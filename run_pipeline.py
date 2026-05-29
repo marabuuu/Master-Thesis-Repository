@@ -231,24 +231,6 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'poc_breast_vs_liver_genomic_features' section in config.yaml")
         run_build_genomic_features(config["poc_breast_vs_liver_genomic_features"], verbose=verbose)
 
-    elif stage == "mopadi_genomic_crossattn":
-        from src.mopadi_genomic_crossattn.run_training import run_genomic_training
-        if "mopadi_genomic_crossattn" not in config:
-            raise ValueError("No 'mopadi_genomic_crossattn' section in config.yaml")
-        run_genomic_training(config["mopadi_genomic_crossattn"], verbose=verbose)
-
-    elif stage == "mopadi_genomic_ca":
-        from src.cross_attention.run_training import run_training_ca
-        if "mopadi_genomic_ca" not in config:
-            raise ValueError("No 'mopadi_genomic_ca' section in config.yaml")
-        run_training_ca(config["mopadi_genomic_ca"], verbose=verbose)
-
-    elif stage == "mopadi_genomic_ca_frozen":
-        from src.cross_attention_frozen.run_training import run_training_frozen
-        if "mopadi_genomic_ca_frozen" not in config:
-            raise ValueError("No 'mopadi_genomic_ca_frozen' section in config.yaml")
-        run_training_frozen(config["mopadi_genomic_ca_frozen"], verbose=verbose)
-
     elif stage == "genomic_adapter_training":
         from src.genomic_adapter.run_training import run_gda_training
         if "genomic_adapter_training" not in config:
@@ -282,7 +264,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, mopadi_genomic_crossattn, mopadi_genomic_ca, mopadi_genomic_ca_frozen, genomic_adapter_training, poc_breast_vs_liver_gda, virchow2_umap, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, virchow2_umap, evaluation, all"
         )
 
 
@@ -314,7 +296,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "mopadi_genomic_crossattn", "mopadi_genomic_ca", "mopadi_genomic_ca_frozen", "genomic_adapter_training", "poc_breast_vs_liver_gda", "virchow2_umap", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "virchow2_umap", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

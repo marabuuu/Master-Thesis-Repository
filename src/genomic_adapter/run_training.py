@@ -49,7 +49,6 @@ import json
 import logging
 import traceback
 import zipfile
-from collections import defaultdict
 from pathlib import Path
 from typing import Any, Dict
 
@@ -119,7 +118,7 @@ def _validate_cohort_coverage(
                 names = zf.namelist()
                 if names:
                     with zf.open(names[0]) as _f:
-                        _f.read()   # full decompress — catches zlib.error too
+                        _f.read(256)  # partial read — enough to catch zlib.error
             valid_pids.add(pid)
         except Exception as exc:
             invalid.append((pid, str(exc)))
@@ -166,19 +165,26 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     conf = _build_config(cfg)
     log.info(
         "GDAConfig: img_size=%d  feat_dim=%d  adapter_base_ch=%d  "
-        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f",
+        "backbone_lr=%.1e  adapter_lr=%.1e  cfg_dropout=%.2f  "
+        "freeze_backbone=%s  backbone_ckpt=%s  reinit_adapter=%s",
         conf.img_size, conf.feat_dim, conf.adapter_base_ch,
         conf.backbone_lr, conf.adapter_lr, conf.cfg_dropout,
+        conf.freeze_backbone,
+        Path(conf.backbone_ckpt_path).name if conf.backbone_ckpt_path else "none",
+        conf.reinit_adapter,
     )
 
-    # Validate that we haven't lost >30% of any minority cohort due to missing/
-    # corrupt zip archives.  Runs before GPU memory is allocated.
-    drop_threshold = float(cfg.get("lihc_drop_threshold", 0.30))
-    _validate_cohort_coverage(
-        patient_splits_path=conf.patient_splits_path,
-        zip_dir=conf.zip_dir,
-        drop_threshold=drop_threshold,
-    )
+    # Validate zip archives for both cohorts before GPU memory is allocated.
+    # The function silently skips any cohort absent from patient_splits.json,
+    # so this is safe for both PoC (BRCA+LIHC) and BRCA-only PAM50 runs.
+    drop_threshold = float(cfg.get("drop_threshold", 0.30))
+    for cohort in ("TCGA-BRCA", "TCGA-LIHC"):
+        _validate_cohort_coverage(
+            patient_splits_path=conf.patient_splits_path,
+            zip_dir=conf.zip_dir,
+            drop_threshold=drop_threshold,
+            check_cohort=cohort,
+        )
 
     conf.make_model_conf()
     model = GDALitModel(conf)
@@ -339,6 +345,9 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         backbone_lr=float(_get("backbone_lr", 1e-4)),
         adapter_lr=float(_get("adapter_lr", 3e-4)),
         freeze_backbone=bool(_get("freeze_backbone", False)),
+        backbone_ckpt_path=str(_get("backbone_ckpt_path", "")),
+        reinit_adapter=bool(_get("reinit_adapter", False)),
+        delta_encouragement_weight=float(_get("delta_encouragement_weight", 0.0)),
         # Unused parent fields set to neutral values
         counterfactual_loss_weight=0.0,
         cond_dropout_prob=0.0,

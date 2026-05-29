@@ -224,7 +224,10 @@ def select_top_genes(
 
 
 def remove_correlated_genes(
-    expr: pd.DataFrame, gene_list: list, corr_threshold: float = 0.90
+    expr: pd.DataFrame,
+    gene_list: list,
+    corr_threshold: float = 0.90,
+    protected_genes: Optional[Set[str]] = None,
 ) -> list:
     """Remove highly correlated genes to reduce redundancy.
 
@@ -236,22 +239,31 @@ def remove_correlated_genes(
         List of genes to filter.
     corr_threshold : float
         Pearson correlation threshold above which genes are considered redundant.
+    protected_genes : set, optional
+        Genes that must never be dropped regardless of correlation (e.g. PAM50
+        markers). A protected gene is always retained; if it is correlated with
+        an already-kept non-protected gene, both are kept (the protected gene
+        does not evict the earlier one, but it is never itself removed). The
+        final list may therefore contain correlated pairs when both genes are
+        protected, but the total count remains <= len(gene_list).
 
     Returns
     -------
     list
         Filtered gene list with correlated duplicates removed.
     """
+    if protected_genes is None:
+        protected_genes = set()
+
     X = expr[gene_list].values
     corr_mat = np.corrcoef(X, rowvar=False)
 
     keep_idx = []
     for i in range(len(gene_list)):
-        if any(
-            np.abs(corr_mat[i, j]) > corr_threshold for j in keep_idx
-        ):
-            continue
-        keep_idx.append(i)
+        if gene_list[i] in protected_genes:
+            keep_idx.append(i)
+        elif not any(np.abs(corr_mat[i, j]) > corr_threshold for j in keep_idx):
+            keep_idx.append(i)
 
     return [gene_list[i] for i in keep_idx]
 
@@ -325,7 +337,8 @@ def select_genes(
     if corr_threshold is not None and corr_threshold > 0:
         print(f"Removing correlated genes (threshold={corr_threshold})")
         selected = remove_correlated_genes(
-            expr, selected, corr_threshold=corr_threshold
+            expr, selected, corr_threshold=corr_threshold,
+            protected_genes=pam50_genes if force_pam50 else None,
         )
         print(f"After correlation filtering: {len(selected)} genes remain")
 
