@@ -221,7 +221,12 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     gpus = cfg.get("gpus", [0])
     accelerator = "gpu" if isinstance(gpus, (list, int)) else "cpu"
     devices = gpus if isinstance(gpus, list) else [gpus]
-    strategy = "ddp_find_unused_parameters_false" if len(devices) > 1 else "auto"
+    # freeze_backbone=True leaves backbone params unused in the backward graph;
+    # ddp_find_unused_parameters_false would hang waiting for their gradients.
+    if len(devices) > 1:
+        strategy = "ddp" if conf.freeze_backbone else "ddp_find_unused_parameters_false"
+    else:
+        strategy = "auto"
 
     if len(devices) > 1 and conf.batch_size % len(devices) != 0:
         raise ValueError(

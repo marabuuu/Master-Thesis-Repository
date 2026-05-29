@@ -432,14 +432,13 @@ class GDALitModel(_BaseGenomicLitModel):
 
         # Delta encouragement: prevent the adapter from ignoring its token input.
         # With null_token fixed at zeros, Δε_null ≈ 0 (identity cross-attention).
-        # This term penalises ||Δε_own - 0||², forcing the adapter to produce
-        # non-zero output for real tokens. The MSE term then ensures these outputs
-        # are actually useful residual corrections, not arbitrary noise.
-        # No labels are used — the comparison is purely own-tokens vs null-tokens.
+        # Reward adapter for producing non-zero output when real tokens are present.
+        # Uses d_train directly (no second forward pass) because null_token=zeros
+        # means Δε_null≈0, so ||d_train - d_null||² ≈ ||d_train||².
+        # MSE bounds d_train implicitly, so there is no unbounded-below risk.
+        # No labels: this is purely a magnitude reward, not a classification signal.
         if self.conf.delta_encouragement_weight > 0:
-            d_null_train = self.adapter(x_t, t, null_expanded)
-            delta_sq = (d_train - d_null_train.detach()).pow(2).mean()
-            loss_ada = loss_ada - self.conf.delta_encouragement_weight * delta_sq
+            loss_ada = loss_ada - self.conf.delta_encouragement_weight * d_train.pow(2).mean()
 
         loss = loss_bb + loss_ada
 
@@ -722,7 +721,7 @@ class GDALitModel(_BaseGenomicLitModel):
         x = torch.randn(B, 3, img_size, img_size, device=device)
         zeros_cond = torch.zeros(B, self.conf.feat_dim, device=device, dtype=torch.float32)
 
-        sampler = self.conf._make_diffusion_conf(self.conf.T_eval).make_sampler()
+        sampler = self.conf._make_diffusion_conf(n_steps).make_sampler()
 
         def model_fn(x_t, t, **kwargs):
             t_scaled = sampler._scale_timesteps(t)
