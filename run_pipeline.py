@@ -199,6 +199,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'tfd_separability' section in config.yaml")
         run_tfd_separability(config["tfd_separability"], verbose=verbose)
 
+    elif stage == "tfd_separability_poc":
+        from src.quality_assurance.tfd_separability import run_tfd_separability
+        if "tfd_separability_poc" not in config:
+            raise ValueError("No 'tfd_separability_poc' section in config.yaml")
+        run_tfd_separability(config["tfd_separability_poc"], verbose=verbose)
+
     elif stage == "tfd_separability_viz":
         from src.visualization.tfd_separability import run_tfd_separability_viz
         if "tfd_separability_viz" not in config:
@@ -243,6 +249,24 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'poc_breast_vs_liver_gda' section in config.yaml")
         run_gda_training(config["poc_breast_vs_liver_gda"], verbose=verbose)
 
+    elif stage == "poc_breast_vs_liver_cfg":
+        from src.genomic_adapter.run_training import run_gda_training
+        if "poc_breast_vs_liver_cfg" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_cfg' section in config.yaml")
+        run_gda_training(config["poc_breast_vs_liver_cfg"], verbose=verbose)
+
+    elif stage == "poc_breast_vs_liver_cfg_brca_init":
+        from src.genomic_adapter.run_training import run_gda_training
+        if "poc_breast_vs_liver_cfg_brca_init" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_cfg_brca_init' section in config.yaml")
+        run_gda_training(config["poc_breast_vs_liver_cfg_brca_init"], verbose=verbose)
+
+    elif stage == "brca_pam50_cfg":
+        from src.genomic_adapter.run_training import run_gda_training
+        if "brca_pam50_cfg" not in config:
+            raise ValueError("No 'brca_pam50_cfg' section in config.yaml")
+        run_gda_training(config["brca_pam50_cfg"], verbose=verbose)
+
     elif stage == "virchow2_umap":
         from src.visualization.virchow2_umap import run_virchow2_umap
         if "virchow2_umap" not in config:
@@ -264,7 +288,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, virchow2_umap, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_poc, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, poc_breast_vs_liver_cfg, poc_breast_vs_liver_cfg_brca_init, brca_pam50_cfg, virchow2_umap, evaluation, all"
         )
 
 
@@ -296,7 +320,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "virchow2_umap", "evaluation", "all"],
+        choices=["preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "virchow2_umap", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

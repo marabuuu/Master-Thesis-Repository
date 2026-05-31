@@ -59,6 +59,7 @@ from pytorch_lightning.callbacks import LearningRateMonitor, ModelCheckpoint
 from mopadi.configs.choices import ModelName
 
 from .config import GDAConfig
+from .cfg_model import CfgBackboneLitModel
 from .model import GDALitModel
 
 log = logging.getLogger(__name__)
@@ -178,6 +179,7 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     # The function silently skips any cohort absent from patient_splits.json,
     # so this is safe for both PoC (BRCA+LIHC) and BRCA-only PAM50 runs.
     drop_threshold = float(cfg.get("drop_threshold", 0.30))
+    assert conf.patient_splits_path and conf.zip_dir, "patient_splits_path and zip_dir are required"
     for cohort in ("TCGA-BRCA", "TCGA-LIHC"):
         _validate_cohort_coverage(
             patient_splits_path=conf.patient_splits_path,
@@ -187,7 +189,11 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         )
 
     conf.make_model_conf()
-    model = GDALitModel(conf)
+    _TRAINING_MODES = {"gda": GDALitModel, "cfg_backbone": CfgBackboneLitModel}
+    training_mode = cfg.get("training_mode", "gda")
+    model_cls = _TRAINING_MODES.get(training_mode, GDALitModel)
+    model = model_cls(conf)
+    log.info("Training mode: %s (%s)", training_mode, model_cls.__name__)
 
     logdir = Path(conf.logdir)
     autoenc_dir = logdir / "autoenc"
@@ -263,8 +269,6 @@ def run_gda_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
         resume_ckpt = str(last_ckpt) if last_ckpt.exists() else None
     if resume_ckpt:
         log.info("Resuming from checkpoint: %s", resume_ckpt)
-
-    model.expected_world_size = max(1, len(devices))
 
     try:
         trainer.fit(model, ckpt_path=resume_ckpt)
@@ -353,12 +357,10 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         backbone_ckpt_path=str(_get("backbone_ckpt_path", "")),
         reinit_adapter=bool(_get("reinit_adapter", False)),
         delta_encouragement_weight=float(_get("delta_encouragement_weight", 0.0)),
-        # Unused parent fields set to neutral values
-        counterfactual_loss_weight=0.0,
-        cond_dropout_prob=0.0,
+        genomic_recon_weight=float(_get("genomic_recon_weight", 0.0)),
     )
 
-    return GDAConfig(**fields)
+    return GDAConfig(**fields)  # type: ignore[arg-type]
 
 
 if __name__ == "__main__":

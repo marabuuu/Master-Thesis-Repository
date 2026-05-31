@@ -135,12 +135,7 @@ def _load_tiles_per_subtype(
     split: str,
 ) -> Dict[str, List[dict]]:
     """Return up to n_per_subtype items per subtype from the dataset."""
-    try:
-        from src.drafts.mopadi_genomic.dataset import ZipTilesWithGenomicFeatures
-    except ImportError:
-        import sys
-        sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
-        from src.drafts.mopadi_genomic.dataset import ZipTilesWithGenomicFeatures
+    from src.genomic_adapter.dataset import ZipTilesWithGenomicFeatures
 
     dataset = ZipTilesWithGenomicFeatures(
         zip_dir=conf.zip_dir,

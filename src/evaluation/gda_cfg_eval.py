@@ -106,7 +106,71 @@ def load_gda_v13(ckpt_path: str, gda_cfg: dict, device: torch.device):
              n_backbone, n_adapter, sum(p.numel() for p in enc.parameters()))
 
     sampler = conf._make_diffusion_conf(conf.T_eval).make_sampler()
+
+    _diagnose_loaded_modules(backbone, adapter, enc, conf, device)
+
     return backbone, adapter, enc, null_tok, sampler, conf
+
+
+@torch.no_grad()
+def _diagnose_loaded_modules(backbone, adapter, enc, conf, device) -> None:
+    """Print per-component health stats immediately after loading.
+
+    Checks:
+    1. Backbone final-conv weight magnitude (near-zero → zero_module init, not trained).
+    2. Backbone eps norm for t=0/500/999 with fixed dummy noise — if all three are
+       identical the backbone is ignoring the timestep (collapsed or untrained).
+    3. Adapter guidance_delta = ||Δε_own − Δε_null||² for the same timesteps.
+       Near-zero means the adapter isn't using its genomic tokens.
+    """
+    log.info("── Model diagnostics ──────────────────────────────────────────")
+
+    # 1. Final-conv weight magnitude (backbone)
+    out_conv = backbone.out[-1]  # zero_module conv in BeatGANsUNetModel
+    w_mag = out_conv.weight.abs().mean().item()
+    log.info("backbone.out[-1].weight |mean| = %.6f  (near-zero → not trained)", w_mag)
+
+    feat_dim = conf.feat_dim
+    img_size = conf.img_size
+    B = 1
+    x_dummy = torch.randn(B, 3, img_size, img_size, device=device)
+    zeros_cond = torch.zeros(B, feat_dim, device=device)
+
+    # Dummy genomic feats (random, L2-normalised by encoder)
+    g_raw = torch.randn(B, feat_dim, device=device)
+    g_tokens = enc(g_raw)                                        # (1, n, d)
+    null_tok = torch.zeros(
+        1, conf.adapter_n_tokens, conf.adapter_token_dim, device=device
+    )
+
+    # 2. Backbone eps vs timestep
+    eps_norms = {}
+    for t_val in (0, 500, 999):
+        t_tensor = torch.tensor([t_val], device=device, dtype=torch.long)
+        eps = backbone.forward(x=x_dummy, t=t_tensor, x_start=None, cond=zeros_cond).pred
+        eps_norms[t_val] = eps.norm().item()
+    log.info("backbone eps |norm|  t=0: %.4f  t=500: %.4f  t=999: %.4f",
+             eps_norms[0], eps_norms[500], eps_norms[999])
+
+    identical = abs(eps_norms[0] - eps_norms[500]) < 1e-5 and \
+                abs(eps_norms[0] - eps_norms[999]) < 1e-5
+    if identical:
+        log.warning("  ⚠ backbone norms are IDENTICAL — backbone ignores t "
+                    "(likely collapsed to near-zero; adapter must carry everything)")
+    elif w_mag < 1e-5:
+        log.warning("  ⚠ backbone final-conv weights are near-zero "
+                    "(ema_model not trained or not loaded from checkpoint)")
+
+    # 3. Adapter guidance delta vs timestep
+    for t_val in (0, 250, 500, 750, 999):
+        t_tensor = torch.tensor([t_val], device=device, dtype=torch.long)
+        xt_dummy = torch.randn(B, 3, img_size, img_size, device=device)
+        d_own  = adapter(xt_dummy, t_tensor, g_tokens)
+        d_null = adapter(xt_dummy, t_tensor, null_tok)
+        delta = (d_own - d_null).pow(2).mean().item()
+        log.info("  adapter guidance_delta  t=%-4d  Δε²=%.6f", t_val, delta)
+
+    log.info("───────────────────────────────────────────────────────────────")
 
 
 # ---------------------------------------------------------------------------
@@ -295,6 +359,7 @@ def run_evaluation(
     clf_path: Optional[str],
     output_dir: str,
     scales: Tuple[float, ...] = (1.0, 5.0, 10.0, 30.0, 50.0),
+    subtypes: Tuple[str, ...] = ("Basal", "LumA"),
     n_tiles_per_patient: int = 8,
     max_patients_per_subtype: Optional[int] = 4,
     device_str: str = "cuda",
@@ -336,7 +401,9 @@ def run_evaluation(
             return {pid: pats[pid] for pid in chosen}
         return pats
 
-    test_patients = {**_pick("Basal"), **_pick("LumA")}
+    test_patients = {}
+    for st in subtypes:
+        test_patients.update(_pick(st))
     log.info("Test patients: %d", len(test_patients))
 
     genomic_h5_dir = Path(genomic_h5_dir)
@@ -502,18 +569,23 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("--config",       required=True, help="Path to src/config.yaml")
-    parser.add_argument("--checkpoint",   default=None,
-                        help="GDA v13 checkpoint path (default: last-v3.ckpt in experiment dir)")
-    parser.add_argument("--output",       required=True, help="Output directory")
-    parser.add_argument("--scales",       type=float, nargs="+", default=[1.0, 5.0, 10.0, 30.0, 50.0])
-    parser.add_argument("--n-tiles",      type=int, default=8)
-    parser.add_argument("--max-patients", type=int, default=4,
-                        help="Max patients per subtype (Basal + LumA)")
-    parser.add_argument("--device",       default="cuda")
-    parser.add_argument("--seed",         type=int, default=42)
-    parser.add_argument("--save-tiles",   action="store_true")
-    parser.add_argument("--skip-virchow", action="store_true",
+    parser.add_argument("--config",          required=True, help="Path to src/config.yaml")
+    parser.add_argument("--config-section",  default="genomic_adapter_training",
+                        help="Top-level config.yaml section to use "
+                             "(e.g. poc_breast_vs_liver_gda for the PoC run)")
+    parser.add_argument("--checkpoint",      default=None,
+                        help="GDA checkpoint path (default: last.ckpt in experiment dir)")
+    parser.add_argument("--output",          required=True, help="Output directory")
+    parser.add_argument("--scales",          type=float, nargs="+", default=[1.0, 5.0, 10.0, 30.0, 50.0])
+    parser.add_argument("--subtypes",        nargs="+", default=["Basal", "LumA"],
+                        help="Subtype labels to evaluate, e.g. --subtypes TCGA-BRCA TCGA-LIHC")
+    parser.add_argument("--n-tiles",         type=int, default=8)
+    parser.add_argument("--max-patients",    type=int, default=4,
+                        help="Max patients per subtype")
+    parser.add_argument("--device",          default="cuda")
+    parser.add_argument("--seed",            type=int, default=42)
+    parser.add_argument("--save-tiles",      action="store_true")
+    parser.add_argument("--skip-virchow",    action="store_true",
                         help="Skip Virchow2 extraction (visual inspection only)")
     args = parser.parse_args()
 
@@ -529,7 +601,7 @@ def main() -> None:
     with open(config_path) as fh:
         full_cfg = yaml.safe_load(fh)
 
-    gda_cfg = full_cfg["genomic_adapter_training"]
+    gda_cfg = full_cfg[args.config_section]
 
     # Resolve relative paths in gda_cfg
     exp_root = (repo_root.parent / "experiments").resolve()
@@ -542,7 +614,7 @@ def main() -> None:
         s = raw[2:] if raw.startswith("./") else raw
         if s.startswith("experiments/"):
             return str((repo_root.parent / s).resolve())
-        if s.startswith("../data/") or s.startswith("../"):
+        if s.startswith("../data/") or s.startswith("../") or s.startswith("data/"):
             return str((repo_root.parent / s.lstrip("../")).resolve())
         return str((repo_root / s).resolve())
 
@@ -550,16 +622,29 @@ def main() -> None:
         if isinstance(v, str) and ("/" in v or v.startswith(".")):
             gda_cfg[k] = _resolve(v)
 
-    # Checkpoint: use latest if not specified
+    # Checkpoint: use latest if not specified.
+    # WARNING: do NOT blindly use last.ckpt — check TensorBoard for loss/val
+    # divergence before using a checkpoint.  A healthy checkpoint has
+    # loss/val ≈ stable/decreasing; a diverged run can have loss/val jump
+    # by 10× in the final steps (e.g. v10: 0.035 → 0.516).
     if args.checkpoint:
         ckpt_path = str(Path(args.checkpoint).resolve())
     else:
-        exp_dir = Path(_resolve(full_cfg["genomic_adapter_training"]["base_dir"]))
-        candidates = sorted((exp_dir / "gda" / "autoenc").glob("last*.ckpt"),
-                            key=lambda p: p.stat().st_mtime)
+        base_dir_key = args.config_section
+        exp_dir = Path(_resolve(full_cfg[base_dir_key]["base_dir"]))
+        ckpt_dir = exp_dir / "gda" / "autoenc"
+        # Prefer best-val checkpoint over last.ckpt (avoids using diverged runs)
+        candidates = sorted(
+            [p for p in ckpt_dir.glob("*.ckpt") if "last" not in p.name],
+            key=lambda p: p.stat().st_mtime,
+        )
         if not candidates:
-            raise FileNotFoundError(f"No checkpoint found under {exp_dir}/gda/autoenc/")
+            candidates = sorted(ckpt_dir.glob("last*.ckpt"),
+                                key=lambda p: p.stat().st_mtime)
+        if not candidates:
+            raise FileNotFoundError(f"No checkpoint found under {ckpt_dir}")
         ckpt_path = str(candidates[-1])
+        log.info("Auto-selected checkpoint (most recent non-last): %s", ckpt_path)
         log.info("Auto-selected checkpoint: %s", ckpt_path)
 
     clf_path = "/mnt/bulk-saturn/maralampert/genhist/experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib"
@@ -573,6 +658,7 @@ def main() -> None:
         clf_path=clf_path,
         output_dir=args.output,
         scales=tuple(args.scales),
+        subtypes=tuple(args.subtypes),
         n_tiles_per_patient=args.n_tiles,
         max_patients_per_subtype=args.max_patients,
         device_str=args.device,

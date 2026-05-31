@@ -141,15 +141,26 @@ class GenomicTokenEncoder(nn.Module):
         super().__init__()
         self.n_tokens = n_tokens
         self.token_dim = token_dim
+        self.genomic_in = genomic_in
         self.net = nn.Sequential(
             nn.Linear(genomic_in, 256),
             nn.SiLU(),
             nn.Linear(256, n_tokens * token_dim),
         )
+        # Reconstruction head: maps pre-norm hidden state back to gene expression.
+        # Used only during training (forward_with_recon) to give the encoder a direct
+        # gradient signal independent of whether cross-attention is currently using the tokens.
+        self.recon_head = nn.Linear(n_tokens * token_dim, genomic_in)
 
     def forward(self, g: torch.Tensor) -> torch.Tensor:
-        tokens = self.net(g).view(g.shape[0], self.n_tokens, self.token_dim)
-        return F.normalize(tokens, dim=-1)  # unit sphere: prevents token magnitude explosion
+        h = self.net(g)
+        return F.normalize(h.view(g.shape[0], self.n_tokens, self.token_dim), dim=-1)
+
+    def forward_with_recon(self, g: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Returns (tokens, recon) where recon reconstructs g from pre-norm hidden state."""
+        h = self.net(g)
+        tokens = F.normalize(h.view(g.shape[0], self.n_tokens, self.token_dim), dim=-1)
+        return tokens, self.recon_head(h)
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +241,8 @@ class GenomicResidualAdapter(nn.Module):
         # Zero-init final conv: Δε=0 at start → stable initialisation
         self.out_conv = nn.Conv2d(ch, in_ch, 1)
         nn.init.zeros_(self.out_conv.weight)
-        nn.init.zeros_(self.out_conv.bias)
+        if self.out_conv.bias is not None:
+            nn.init.zeros_(self.out_conv.bias)
 
     # ------------------------------------------------------------------
     # Attention capture utilities (for visualization — zero training cost)

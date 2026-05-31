@@ -40,10 +40,16 @@ from pathlib import Path
 import torch
 import torch.nn.functional as F
 
-from src.drafts.mopadi_genomic.train import GenomicLitModel as _BaseGenomicLitModel
+import numpy as np
+import random
+from typing import Optional, Any, cast
+
+from mopadi.train_diff_autoenc import LitModel
+from mopadi.utils.dist_utils import get_world_size
 
 from .adapter import GenomicResidualAdapter, GenomicTokenEncoder
 from .config import GDAConfig
+from .dataset import ZipTilesWithGenomicFeatures, patient_id_from_tile_path
 
 log = logging.getLogger(__name__)
 
@@ -54,7 +60,7 @@ def _ema_update(ema_params, model_params, decay: float) -> None:
             p_ema.mul_(decay).add_(p.data, alpha=1.0 - decay)
 
 
-class GDALitModel(_BaseGenomicLitModel):
+class GDALitModel(LitModel):
     """
     Jointly trains backbone UNet (unconditional) + genomic residual adapter.
 
@@ -64,7 +70,7 @@ class GDALitModel(_BaseGenomicLitModel):
     be suppressed by backbone gradient competition.
     """
 
-    automatic_optimization = False
+    automatic_optimization = False  # type: ignore[assignment]
 
     def __init__(self, conf: GDAConfig):
         super().__init__(conf)
@@ -107,6 +113,7 @@ class GDALitModel(_BaseGenomicLitModel):
             torch.zeros(conf.adapter_n_tokens, conf.adapter_token_dim),
             persistent=True,
         )
+        self._ema_null_token: torch.Tensor  # type annotation for pyright
 
         if conf.backbone_ckpt_path:
             self._load_backbone_weights(conf.backbone_ckpt_path)
@@ -268,6 +275,12 @@ class GDALitModel(_BaseGenomicLitModel):
                     checkpoint["optimizer_states"] = []
                     break
 
+    def on_fit_start(self) -> None:
+        # Parent LitModel.on_fit_start runs a WebDataset shard sanity check
+        # (self.conf.data_dirs) and feat_extractor device placement — neither
+        # applies to GDA which uses zip-based data and no tile feature extractor.
+        pass
+
     # ------------------------------------------------------------------
     # Sample counter
     # ------------------------------------------------------------------
@@ -279,6 +292,99 @@ class GDALitModel(_BaseGenomicLitModel):
         # The parent formula (global_step * batch_size_effective) would overcount by
         # accum_batches; use batch_size (= per-micro-batch global count) instead.
         return self.global_step * self.conf.batch_size
+
+    # ------------------------------------------------------------------
+    # Dataset setup (replaces drafts GenomicLitModel.setup)
+    # ------------------------------------------------------------------
+
+    def setup(self, stage=None) -> None:
+        if self.conf.seed is not None:
+            seed = self.conf.seed * get_world_size() + self.global_rank
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            log.info("Local seed: %d", seed)
+
+        assert self.conf.zip_dir, "zip_dir must be set in config"
+        assert self.conf.genomic_feature_dir, "genomic_feature_dir must be set in config"
+        assert self.conf.patient_splits_path, "patient_splits_path must be set in config"
+
+        self.train_data = ZipTilesWithGenomicFeatures(
+            zip_dir=self.conf.zip_dir,
+            genomic_h5_dir=self.conf.genomic_feature_dir,
+            patient_splits_path=self.conf.patient_splits_path,
+            split="train",
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
+            tile_sampling_seed=self.conf.tile_sampling_seed,
+            img_size=self.conf.img_size,
+            do_resize=self.conf.do_resize,
+            do_normalize=self.conf.do_normalize,
+            cache_pickle_tiles_path=self.conf.cache_pickle_tiles_path,
+        )
+        self.val_data = ZipTilesWithGenomicFeatures(
+            zip_dir=self.conf.zip_dir,
+            genomic_h5_dir=self.conf.genomic_feature_dir,
+            patient_splits_path=self.conf.patient_splits_path,
+            split="val",
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
+            tile_sampling_seed=self.conf.tile_sampling_seed,
+            img_size=self.conf.img_size,
+            do_resize=self.conf.do_resize,
+            do_normalize=self.conf.do_normalize,
+        )
+        if self.global_rank == 0:
+            log.info(
+                "train tiles: %d  |  val tiles: %d  |  genomic features: %d-dim",
+                len(self.train_data),
+                len(self.val_data),
+                next(iter(self.train_data._genomic_cache.values())).shape[0]
+                if self.train_data._genomic_cache else 0,
+            )
+
+    def val_dataloader(self):
+        import torch.utils.data as tud
+        from collections import defaultdict
+
+        limit = self.conf.val_limit_batches * self.conf.batch_size
+        try:
+            subtype_map = getattr(self.val_data, "_subtype_map", {})
+            tile_paths = getattr(self.val_data, "tile_paths", [])
+            if subtype_map and tile_paths:
+                subtype_indices: dict = defaultdict(list)
+                for idx, path in enumerate(tile_paths):
+                    pid = patient_id_from_tile_path(path)
+                    subtype_indices[subtype_map.get(pid, "unknown")].append(idx)
+                rng = random.Random(self.current_epoch + 42)
+                selected: list = []
+                per_subtype = max(1, limit // max(1, len(subtype_indices)))
+                for indices in subtype_indices.values():
+                    selected.extend(rng.sample(indices, min(per_subtype, len(indices))))
+                dataset = tud.Subset(self.val_data, selected[:limit])
+            else:
+                dataset = (
+                    tud.Subset(self.val_data, list(range(limit)))
+                    if len(self.val_data) > limit else self.val_data
+                )
+        except Exception as exc:
+            log.warning("Stratified val sampling failed: %s — using shuffled limit", exc)
+            if len(self.val_data) > limit:
+                rng = random.Random(self.current_epoch + 42)
+                indices = list(range(len(self.val_data)))
+                rng.shuffle(indices)
+                dataset = tud.Subset(self.val_data, indices[:limit])
+            else:
+                dataset = self.val_data
+
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(dataset, shuffle=False, drop_last=False)
+
+    @staticmethod
+    def _non_identity_permutation(n: int, device: torch.device) -> torch.Tensor:
+        perm = torch.randperm(n, device=device)
+        if n > 1 and torch.equal(perm, torch.arange(n, device=device)):
+            perm = torch.roll(perm, shifts=1)
+        return perm
 
     # ------------------------------------------------------------------
     # Batch helpers
@@ -307,7 +413,7 @@ class GDALitModel(_BaseGenomicLitModel):
     # Optimizers
     # ------------------------------------------------------------------
 
-    def configure_optimizers(self):
+    def configure_optimizers(self) -> dict:
         adapter_params = (
             list(self.adapter.parameters())
             + list(self.genomic_encoder.parameters())
@@ -319,16 +425,21 @@ class GDALitModel(_BaseGenomicLitModel):
             betas=(0.9, 0.999),
             weight_decay=1e-2,
         )
+        # Store adapters so training_step can access concrete optimizer objects
+        # without needing to rely on self.optimizers()' loosely-typed return.
+        self._opt_adapter = opt_adapter
         if self.conf.freeze_backbone:
             # Single optimizer — backbone has no trainable parameters.
-            return [opt_adapter], []
+            self._opt_backbone = None
+            return {"optimizer": [opt_adapter], "lr_scheduler": []}
         opt_backbone = torch.optim.AdamW(
             self.model.parameters(),
             lr=self.conf.backbone_lr,
             betas=(0.9, 0.999),
             weight_decay=1e-2,
         )
-        return [opt_backbone, opt_adapter], []
+        self._opt_backbone = opt_backbone
+        return {"optimizer": [opt_backbone, opt_adapter], "lr_scheduler": []}
 
     # ------------------------------------------------------------------
     # Data loading — subtype-balanced sampling
@@ -349,8 +460,6 @@ class GDALitModel(_BaseGenomicLitModel):
 
         import torch.utils.data as tud
 
-        from src.drafts.mopadi_genomic.dataset import patient_id_from_tile_path
-
         tile_paths = self.train_data.tile_paths
         subtype_map = self.train_data._subtype_map
 
@@ -362,10 +471,7 @@ class GDALitModel(_BaseGenomicLitModel):
             tile_subtypes.append(subtype)
             subtype_counts[subtype] += 1
 
-        weights = torch.tensor(
-            [1.0 / subtype_counts[s] for s in tile_subtypes],
-            dtype=torch.float32,
-        )
+        weights = [float(1.0 / subtype_counts[s]) for s in tile_subtypes]
         sampler = tud.WeightedRandomSampler(
             weights, num_samples=len(tile_paths), replacement=True
         )
@@ -384,11 +490,12 @@ class GDALitModel(_BaseGenomicLitModel):
     # Training
     # ------------------------------------------------------------------
 
-    def training_step(self, batch, batch_idx):
-        if self.conf.freeze_backbone:
-            opt_adapter = self.optimizers()
-        else:
-            opt_backbone, opt_adapter = self.optimizers()
+    def training_step(self, batch, batch_idx) -> dict:
+        # Use optimizer objects stored at `configure_optimizers` time. These
+        # are concrete torch Optimizer instances (or None for backbone when
+        # frozen), so static type-checkers accept calls to `.step()`/`.zero_grad()`.
+        opt_backbone = self._opt_backbone
+        opt_adapter = self._opt_adapter
         accum = self.conf.accum_batches
 
         batch, _ = self._flatten_bag_batch(batch)
@@ -404,11 +511,18 @@ class GDALitModel(_BaseGenomicLitModel):
         # Backbone always receives zeros — unconditional path
         zeros_cond = torch.zeros(B, self.conf.feat_dim, device=self.device, dtype=torch.float32)
 
-        # ── CFG null dropout for adapter ──────────────────────────────────
-        null_mask = torch.rand(B, device=self.device) < self.conf.cfg_dropout
-        g_tokens = self.genomic_encoder(feats)                          # (B, n, d)
-        null_expanded = self.null_token.unsqueeze(0).expand(B, -1, -1) # (B, n, d)
-        g_tokens_train = torch.where(null_mask[:, None, None], null_expanded, g_tokens)
+        # ── Adapter forward: always compute d_own and d_null separately ─────
+        # Rationale: the old single-pass approach (mixing tokens via CFG mask and
+        # computing ||d_train||² as the encouragement) is wrong when d_own ≈ d_null.
+        # The adapter can satisfy ||d_train||² > 0 while keeping d_own == d_null,
+        # meaning guidance_delta stays zero despite a non-zero encouragement term.
+        # We need the actual ||d_own − d_null||² and that requires two passes.
+        if self.conf.genomic_recon_weight > 0:
+            g_tokens, _g_recon = self.genomic_encoder.forward_with_recon(feats)  # (B, n, d)
+        else:
+            g_tokens = self.genomic_encoder(feats)                                # (B, n, d)
+            _g_recon = None
+        null_expanded = self.null_token.unsqueeze(0).expand(B, -1, -1)    # (B, n, d)
 
         # ── Forward pass ─────────────────────────────────────────────────
         # NOTE: no inner torch.autocast block here — Lightning's precision plugin
@@ -417,49 +531,70 @@ class GDALitModel(_BaseGenomicLitModel):
         backbone_out = self.model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=zeros_cond)
         eps_backbone = backbone_out.pred                             # (B, 3, H, W)
 
-        d_train = self.adapter(x_t, t, g_tokens_train)
+        d_own  = self.adapter(x_t, t, g_tokens)                    # real-token pass
+        d_null = self.adapter(x_t, t, null_expanded)               # null-token pass
+
+        # CFG training: mix d_own / d_null per-sample based on dropout mask.
+        # Gradient flows to both paths through loss_ada so the adapter learns to
+        # handle null tokens (needed for correct CFG inference behaviour).
+        null_mask = torch.rand(B, device=self.device) < self.conf.cfg_dropout
+        d_train = torch.where(null_mask[:, None, None, None], d_null, d_own)
 
         # ── Split losses: backbone and adapter train on separate objectives ──
         # Backbone: standard MSE on its own prediction.
         # Adapter:  MSE on the residual relative to a detached backbone.
-        #   Detaching eps_backbone here ensures backbone gradients do not flow
-        #   through the adapter loss — eliminating the gradient conflict where
-        #   the backbone could learn to compensate for whatever the adapter adds.
+        #   Detaching eps_backbone ensures backbone gradients do not flow
+        #   through the adapter loss.
         # Cast to float32: F.mse_loss is not autocast-eligible under bf16-mixed.
         noise_f = noise.float()
         loss_bb = F.mse_loss(eps_backbone.float(), noise_f)
         loss_ada = F.mse_loss((eps_backbone.detach().float() + d_train.float()), noise_f)
 
-        # Delta encouragement: prevent the adapter from ignoring its token input.
-        # With null_token fixed at zeros, Δε_null ≈ 0 (identity cross-attention).
-        # Reward adapter for producing non-zero output when real tokens are present.
-        # Uses d_train directly (no second forward pass) because null_token=zeros
-        # means Δε_null≈0, so ||d_train - d_null||² ≈ ||d_train||².
-        # MSE bounds d_train implicitly, so there is no unbounded-below risk.
-        # No labels: this is purely a magnitude reward, not a classification signal.
+        # Guidance encouragement: reward ||d_own − d_null||² being large.
+        # Gradient flows through d_own only (d_null is detached) so the reward
+        # pushes real-token outputs to differ from null-token outputs without
+        # destabilising the null path that loss_ada already trains correctly.
         if self.conf.delta_encouragement_weight > 0:
-            loss_ada = loss_ada - self.conf.delta_encouragement_weight * d_train.pow(2).mean()
+            guidance_reward = (d_own - d_null.detach()).pow(2).mean()
+            loss_ada = loss_ada - self.conf.delta_encouragement_weight * guidance_reward
 
         loss = loss_bb + loss_ada
+
+        # Genomic reconstruction loss: MSE(decoder(g_tokens), feats).
+        # Gives the encoder a direct gradient independent of cross-attention usage,
+        # breaking the deadlock where g_token_diversity stays near zero because the
+        # cross-attention never generates enough gradient to diversify the encoder.
+        if self.conf.genomic_recon_weight > 0 and _g_recon is not None:
+            loss_recon = F.mse_loss(_g_recon.float(), feats.float())
+            loss = loss + self.conf.genomic_recon_weight * loss_recon
+        else:
+            loss_recon = None
 
         self.manual_backward(loss / accum)
 
         if self.is_last_accum(batch_idx):
             if self.conf.grad_clip > 0:
-                if not self.conf.freeze_backbone:
+                if not self.conf.freeze_backbone and self._opt_backbone is not None:
                     torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.grad_clip)
                 torch.nn.utils.clip_grad_norm_(
                     list(self.adapter.parameters()) + list(self.genomic_encoder.parameters()),
                     self.conf.grad_clip,
                 )
-            if not self.conf.freeze_backbone:
-                opt_backbone.step()
-                opt_backbone.zero_grad()
-            opt_adapter.step()
-            opt_adapter.zero_grad()
+            if self._opt_backbone is not None:
+                self._opt_backbone.step()
+                self._opt_backbone.zero_grad()
+            if self._opt_adapter is not None:
+                self._opt_adapter.step()
+                self._opt_adapter.zero_grad()
 
         if self.trainer.is_global_zero:
-            self.logger.experiment.add_scalar("loss/train", loss.item(), self.num_samples)
+            exp = getattr(self.logger, "experiment", None)
+            if exp is not None:
+                exp.add_scalar("loss/train", loss.item(), self.num_samples)
+                exp.add_scalar("loss/backbone", loss_bb.item(), self.num_samples)
+                exp.add_scalar("loss/adapter", loss_ada.item(), self.num_samples)
+                if loss_recon is not None:
+                    exp.add_scalar("loss/genomic_recon", loss_recon.item(), self.num_samples)
 
         # ── Periodic diagnostics (no gradient) ────────────────────────────
         # guidance_delta = E[‖Δε_own − Δε_null‖²]: primary conditioning health metric.
@@ -479,19 +614,22 @@ class GDALitModel(_BaseGenomicLitModel):
                 d_null_m = self.adapter(x_t_m, t_m, null_m)
                 guidance_delta = (d_own_m - d_null_m).pow(2).mean().item()
                 g_token_diversity = (g_tok_m - g_tok_m.mean(dim=0, keepdim=True)).pow(2).mean().item()
-                # delta_magnitude: mean squared norm of the adapter's own output.
-                # With null_token fixed at zeros, d_null ≈ 0, so this ≈ guidance_delta.
-                # Tracks whether the adapter produces non-zero corrections at all.
                 delta_magnitude = d_own_m.pow(2).mean().item()
-                self.logger.experiment.add_scalar("cond/guidance_delta", guidance_delta, self.num_samples)
-                self.logger.experiment.add_scalar("cond/g_token_diversity", g_token_diversity, self.num_samples)
-                self.logger.experiment.add_scalar("cond/delta_magnitude", delta_magnitude, self.num_samples)
+                # null_magnitude: ‖d_null‖² — the ResBlocks-only (unconditional) output.
+                # Should be stable; a sudden rise indicates backbone destabilisation.
+                null_magnitude = d_null_m.pow(2).mean().item()
+                exp = getattr(self.logger, "experiment", None)
+                if exp is not None:
+                    exp.add_scalar("cond/guidance_delta", guidance_delta, self.num_samples)
+                    exp.add_scalar("cond/g_token_diversity", g_token_diversity, self.num_samples)
+                    exp.add_scalar("cond/delta_magnitude", delta_magnitude, self.num_samples)
+                    exp.add_scalar("cond/null_magnitude", null_magnitude, self.num_samples)
 
         _si_interval = self.conf.reconstruct_every_samples
         if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
             self._log_sample_images(imgs.detach(), feats.detach())
 
-        return loss
+        return {"loss": loss}
 
     # ------------------------------------------------------------------
     # EMA and epoch hooks
@@ -562,16 +700,12 @@ class GDALitModel(_BaseGenomicLitModel):
         val_loss_shuffled = self.trainer.callback_metrics.get("_val_loss_shuffled")
         if val_loss is not None:
             if self.trainer.is_global_zero:
-                self.logger.experiment.add_scalar(
-                    "loss/val", val_loss.item(), self.num_samples
-                )
-                if val_loss_shuffled is not None:
-                    self.logger.experiment.add_scalar(
-                        "loss/val_shuffled", val_loss_shuffled.item(), self.num_samples
-                    )
-                    self.logger.experiment.add_scalar(
-                        "cond/gap", val_loss_shuffled.item() - val_loss.item(), self.num_samples
-                    )
+                exp = getattr(self.logger, "experiment", None)
+                if exp is not None:
+                    exp.add_scalar("loss/val", val_loss.item(), self.num_samples)
+                    if val_loss_shuffled is not None:
+                        exp.add_scalar("loss/val_shuffled", val_loss_shuffled.item(), self.num_samples)
+                        exp.add_scalar("cond/gap", val_loss_shuffled.item() - val_loss.item(), self.num_samples)
             # sync_dist=False: already aggregated by validation_step's sync_dist=True
             self.log("loss/val_ckpt", val_loss, prog_bar=False, sync_dist=False)
 
@@ -609,7 +743,10 @@ class GDALitModel(_BaseGenomicLitModel):
         feats_s = self._sample_feats.to(self.device, dtype=torch.float32)
         b = imgs_s.shape[0]
 
-        t_vis = torch.full((b,), 250, device=self.device, dtype=torch.long)
+        # t=750 → ~5% signal remaining: tests backbone's generative ability,
+        # not just mild denoising.  t=250 (old default) left 51% signal —
+        # too easy, looked like denoising a slightly blurry image.
+        t_vis = torch.full((b,), 750, device=self.device, dtype=torch.long)
         x_t_vis = self.sampler.q_sample(
             imgs_s, t_vis, noise=torch.randn_like(imgs_s)
         )
@@ -654,7 +791,9 @@ class GDALitModel(_BaseGenomicLitModel):
         grid = make_grid(torch.cat(rows, dim=0), nrow=b, normalize=True,
                          value_range=(-1, 1), padding=2)
 
-        self.logger.experiment.add_image("samples/train", grid, self.num_samples)
+        exp = getattr(self.logger, "experiment", None)
+        if exp is not None:
+            exp.add_image("samples/train", grid, self.num_samples)
         samples_dir = Path(self.conf.logdir) / "samples"
         samples_dir.mkdir(parents=True, exist_ok=True)
         save_image(grid, samples_dir / f"samples_{self.num_samples:010d}.png")
@@ -678,8 +817,101 @@ class GDALitModel(_BaseGenomicLitModel):
 
         grid_ema = make_grid(torch.cat(rows_ema, dim=0), nrow=b, normalize=True,
                              value_range=(-1, 1), padding=2)
-        self.logger.experiment.add_image("samples/train_ema", grid_ema, self.num_samples)
+        exp = getattr(self.logger, "experiment", None)
+        if exp is not None:
+            exp.add_image("samples/train_ema", grid_ema, self.num_samples)
         save_image(grid_ema, samples_dir / f"samples_ema_{self.num_samples:010d}.png")
+
+        # ── DDIM generation from pure noise (2 patients, 20 steps) ───────────
+        # This is the definitive backbone health check: rows 3–4 above only show
+        # reconstruction from x_250 (moderate noise, ~46% signal remaining) and
+        # cannot distinguish a working backbone from one that copies x_t.
+        # Actual DDIM generation from x_T=noise tests the full denoising chain.
+        self._log_ddim_samples(imgs_s[:2], feats_s[:2], samples_dir)
+
+    # ------------------------------------------------------------------
+    # DDIM generation visualisation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _log_ddim_samples(
+        self,
+        imgs_ref: torch.Tensor,
+        feats_ref: torch.Tensor,
+        samples_dir: "Path",
+    ) -> None:
+        """Run actual DDIM from pure Gaussian noise and log to TensorBoard.
+
+        Generates two columns per patient:
+          left : unconditional  (scale=0, backbone + null adapter only)
+          right: conditioned    (scale=5, backbone + real genomic adapter)
+
+        If the backbone is healthy, both columns should look like H&E tissue.
+        If left == right, guidance_delta ≈ 0 (no conditioning signal yet, expected
+        early in training). If either is magenta/uniform noise, the backbone collapsed.
+        """
+        from torchvision.utils import make_grid, save_image
+        from mopadi.diffusion.base import DummyReturn
+
+        n = imgs_ref.shape[0]
+        device = self.device
+        feat_dim = self.conf.feat_dim
+
+        zeros_cond  = torch.zeros(n, feat_dim, device=device, dtype=torch.float32)
+        g_tokens    = self._ema_genomic_encoder(feats_ref.to(device, dtype=torch.float32))
+        null_tokens = self._ema_null_token.unsqueeze(0).expand(n, -1, -1)
+        backbone    = self.ema_model
+        adapter     = self._ema_adapter
+
+        # Capture outer `self` for use inside the nested model class without
+        # shadowing it with the nested instance's `self` parameter.
+        outer_self = self
+
+        def _make_model(guidance_scale: float) -> torch.nn.Module:
+            _gs = guidance_scale
+            class _M(torch.nn.Module):
+                def __init__(self):
+                    super().__init__()
+                    self._bb = backbone  # register so sampler can find device
+                def forward(self, x, t, **kw):
+                    t_sc = outer_self.sampler._scale_timesteps(t)
+                    eps_bb = backbone.forward(
+                        x=x, t=t_sc, x_start=None, cond=zeros_cond
+                    ).pred
+                    d_own  = adapter(x, t, g_tokens)
+                    d_null = adapter(x, t, null_tokens)
+                    eps = (eps_bb + d_null) + _gs * (d_own - d_null)
+                    return DummyReturn(pred=eps)
+            return _M()
+
+        try:
+            sampler_eval = self.conf._make_diffusion_conf(self.conf.T_eval).make_sampler()
+            noise = torch.randn(
+                n, 3, self.conf.img_size, self.conf.img_size, device=device
+            )
+            uncond = sampler_eval.sample(
+                model=cast(Any, _make_model(0.0)), shape=noise.shape,
+                noise=noise, model_kwargs={}, progress=False,
+            )
+            cond = sampler_eval.sample(
+                model=cast(Any, _make_model(5.0)), shape=noise.shape,
+                noise=noise, model_kwargs={}, progress=False,
+            )
+        except Exception:
+            log.warning("_log_ddim_samples failed", exc_info=True)
+            return
+
+        # Layout: reference | unconditional | conditioned (same noise seed)
+        rows = torch.cat([
+            imgs_ref.to(device).clamp(-1, 1),
+            uncond.clamp(-1, 1),
+            cond.clamp(-1, 1),
+        ], dim=0)
+        grid = make_grid(rows, nrow=n, normalize=True, value_range=(-1, 1), padding=2)
+        exp = getattr(self.logger, "experiment", None)
+        if exp is not None:
+            exp.add_image("samples/ddim_gen", grid, self.num_samples)
+        save_image(grid, samples_dir / f"ddim_gen_{self.num_samples:010d}.png")
 
     # ------------------------------------------------------------------
     # Inference helper (used by sampling scripts)
@@ -723,23 +955,29 @@ class GDALitModel(_BaseGenomicLitModel):
 
         sampler = self.conf._make_diffusion_conf(n_steps).make_sampler()
 
-        def model_fn(x_t, t, **kwargs):
-            t_scaled = sampler._scale_timesteps(t)
-            eps_base = backbone.forward(x=x_t, t=t_scaled, x_start=None, cond=zeros_cond).pred
-            delta_own = adapter(x_t, t, g_tokens)
-            delta_null = adapter(x_t, t, null_expanded)
-            return eps_base + guidance_scale * (delta_own - delta_null)
-
         from mopadi.diffusion.base import DummyReturn
 
         class _WrappedModel(torch.nn.Module):
-            def forward(self_, x, t, **kw):
-                return DummyReturn(pred=model_fn(x, t, **kw))
+            def __init__(self):
+                super().__init__()
+                self._bb = backbone  # register for device detection by sampler
+            def forward(self, x, t, **kw):
+                t_sc = sampler._scale_timesteps(t)
+                eps_base = backbone.forward(x=x, t=t_sc, x_start=None, cond=zeros_cond).pred
+                delta_own  = adapter(x, t, g_tokens)
+                delta_null = adapter(x, t, null_expanded)
+                # CFG: unconditional base includes null-adapter contribution.
+                # eps_base alone is near-zero (backbone suppressed by adapter);
+                # d_null carries the actual denoising signal at scale=0.
+                eps = (eps_base + delta_null) + guidance_scale * (delta_own - delta_null)
+                return DummyReturn(pred=eps)
 
+        noise = torch.randn(B, 3, img_size, img_size, device=device)
         out = sampler.sample(
-            model=_WrappedModel(),
-            shape=(B, 3, img_size, img_size),
-            device=device,
+            model=cast(Any, _WrappedModel()),
+            shape=noise.shape,
+            noise=noise,
+            model_kwargs={},
             progress=True,
         )
         return out

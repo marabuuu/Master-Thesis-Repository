@@ -1,66 +1,68 @@
 """
-GDAConfig — config for Genomic Diffusion Adapter training from scratch.
+GDAConfig — config for Genomic Diffusion Adapter training.
 
-Extends GenomicTrainConfig with adapter-specific fields.
-No pretrained checkpoint required; both backbone and adapter initialise
-from random weights and train jointly.
-
-Key design:
-  backbone_lr   — LR for the main MoPaDi UNet (always receives cond=zeros)
-  adapter_lr    — LR for the adapter + genomic encoder (higher, learns faster)
-  cfg_dropout   — fraction of steps where adapter receives null token instead
-                  of real genomic tokens, enabling CFG at inference
+Extends MoPaDi's TrainConfig with genomic dataset fields (previously in
+GenomicTrainConfig) and adapter-specific fields.  No dependency on src/drafts.
 """
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict
+from typing import Dict, Optional
 
-from src.drafts.mopadi_genomic.config import GenomicTrainConfig
+from mopadi.configs.config import TrainConfig
 
 
 @dataclass
-class GDAConfig(GenomicTrainConfig):
-    # ── Adapter architecture ──────────────────────────────────────────
-    adapter_base_ch: int = 64     # base channels; doubles at each down level
-    adapter_n_tokens: int = 8     # genomic token sequence length for cross-attn
-    adapter_token_dim: int = 256  # dim of each token vector
-    adapter_t_dim: int = 256      # sinusoidal timestep embedding dim
-    adapter_n_heads: int = 4      # attention heads in cross-attention layers
+class GDAConfig(TrainConfig):
+    # ── Genomic dataset ───────────────────────────────────────────────────
+    zip_dir: Optional[str] = None
+    genomic_feature_dir: Optional[str] = None
+    patient_splits_path: Optional[str] = None
+    max_tiles_by_subtype: Optional[Dict[str, Optional[int]]] = None
+    tile_sampling_seed: int = 42
+    cache_pickle_tiles_path: Optional[str] = None
 
-    # ── CFG ──────────────────────────────────────────────────────────
+    # ── Validation ────────────────────────────────────────────────────────
+    # Cap val batches directly (Lightning's limit_val_batches is unreliable
+    # with integer val_check_interval in 2.5.x).
+    val_limit_batches: int = 100
+
+    # ── Image pre-processing ──────────────────────────────────────────────
+    do_normalize: bool = True
+    do_resize: bool = False
+
+    # ── Adapter architecture ──────────────────────────────────────────────
+    adapter_base_ch: int = 64
+    adapter_n_tokens: int = 8
+    adapter_token_dim: int = 256
+    adapter_t_dim: int = 256
+    adapter_n_heads: int = 4
+
+    # ── CFG ───────────────────────────────────────────────────────────────
     cfg_dropout: float = 0.15
 
-    # ── Per-component learning rates ─────────────────────────────────
+    # ── Per-component learning rates ──────────────────────────────────────
     backbone_lr: float = 1e-4
     adapter_lr: float = 3e-4
 
-    # ── Adapter loss ─────────────────────────────────────────────────
-    # Weight for the delta-encouragement term: -weight * ||Δε_own - Δε_null||².
-    # Prevents adapter from ignoring token input when null_token is fixed at zeros.
-    # 0.0 = disabled. Keep small (0.001) so MSE still dominates.
+    # ── Adapter loss ──────────────────────────────────────────────────────
+    # Weight for -weight * ||Δε_own - Δε_null||².  Keep small so MSE dominates.
     delta_encouragement_weight: float = 0.0
 
-    # ── Frozen backbone ───────────────────────────────────────────────
-    # When True, backbone weights are frozen at training start.
-    # backbone_lr is ignored when freeze_backbone=True.
+    # Weight for genomic reconstruction loss: MSE(decoder(g_tokens), feats).
+    # Bootstraps encoder diversity when cross-attention is not yet active.
+    genomic_recon_weight: float = 0.0
+
+    # ── Frozen backbone ───────────────────────────────────────────────────
     freeze_backbone: bool = False
-
-    # Optional checkpoint used to initialize the backbone before freezing.
-    # Only backbone weights are loaded; conditioning path can be reinitialized.
     backbone_ckpt_path: str = ""
-
-    # If True, the adapter, genomic encoder, and null token are reset to fresh
-    # initial weights after loading the backbone checkpoint.
     reinit_adapter: bool = False
 
     def __post_init__(self):
-        # Skip GenomicTrainConfig.__post_init__ feat_dim == style_ch check —
-        # in GDA the backbone still uses style_ch-sized cond vectors (zeros),
-        # but the adapter uses adapter_token_dim, which is independent.
-        # We call the grandparent post_init (TrainConfig) instead.
-        from mopadi.configs.config import TrainConfig
+        # GDA: backbone sees cond=zeros (not feat_dim-sized genomic features),
+        # adapter uses adapter_token_dim for cross-attention (independent of style_ch).
+        # Skip the GenomicTrainConfig feat_dim == style_ch check; call TrainConfig directly.
         TrainConfig.__post_init__(self)
 
     @classmethod

@@ -167,6 +167,34 @@ tfd_separability:
   save_heatmap: true
   figsize: null
 
+# ── PoC: DeepCMorph segmentation on LIHC tiles (TCGA-BRCA vs TCGA-LIHC) ──────
+# Segments only LIHC patients (BRCA masks already at 20260509_tfd_separability).
+# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_poc
+tfd_separability_poc:
+  tiles_zip_dir: ../data/Liver-tumor-tiles-final
+  metadata_csv: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
+  patient_col: Patient_ID
+  subtype_col: cohort
+  classes:
+    - TCGA-LIHC
+  max_tiles_by_subtype:
+    TCGA-LIHC: null        # no cap — use all tiles per patient
+  masks_dir: ../experiments/20260529_tfd_separability_poc/lihc_masks
+  auto_segment: true
+  force_resegment: false
+  num_classes: 32
+  weights_dataset: TCGA
+  device: null
+  batch_size: 4
+  grouping_json: null
+  use_alpha_complex: true
+  n_landscape_bins: 100
+  n_landscape_layers: 1
+  min_cells_per_image: 3
+  compute_noise_floor: false  # single class — no pairwise TFD
+  output_dir: ../experiments/20260529_tfd_separability_poc/results
+  save_heatmap: false
+
 tfd_separability_viz:
   # ── Input ─────────────────────────────────────────────────────────────────
   results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
@@ -278,6 +306,178 @@ subtype_classifier:
 #   batch_size: 8 → 4 per GPU  (same per-GPU footprint as DGX v13 at 4/GPU)
 #   accumulate_grad_batches: 4 → effective global batch = 32 (unchanged)
 #   ~2× slower than 4-GPU DGX run; ~2–3 days for 5M samples
+brca_pam50_cfg:
+  # ── CFG backbone: PAM50 subtype conditioning on TCGA-BRCA ─────────────────
+  # Same architecture as poc_breast_vs_liver_cfg.
+  # 5 PAM50 subtypes: LumA (506), LumB (195), Basal (168), Her2 (74), Normal (38)
+  # Runs on Titan: 2× gpu48 (RTX 6000 Ada, 48 GiB each).
+  training_mode: cfg_backbone
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-final
+  genomic_feature_dir: ./experiments/20260528_genomic_features/genomic_h5
+  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+  max_tiles_by_subtype:
+
+  # ── Backbone UNet ─────────────────────────────────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: true
+
+  # ── CFG ───────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.20
+
+  # ── Optimisation ──────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 8          # 4 per GPU on 2× Titan gpu48 (RTX 6000 Ada = 48 GiB, not 70 GiB)
+  accumulate_grad_batches: 4   # effective global batch = 32
+  total_samples: 200000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  backbone_ckpt_path: ""   # train from scratch
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 16
+  gpus: [0, 1]
+  output_dir: ./experiments/20260529_brca_pam50_cfg_v1
+  base_dir: ./experiments/20260529_brca_pam50_cfg_v1
+  logdir: ./experiments/20260529_brca_pam50_cfg_v1/gda
+
+poc_breast_vs_liver_cfg:
+  # ── CFG backbone: genomic features feed directly into backbone style MLP ──
+  # The backbone IS the conditioned denoiser; no separate adapter.
+  # CFG dropout replaces features with zeros on cfg_dropout% of batches.
+  # Health metric: cond/signal = E[‖backbone(cond) − backbone(null)‖²] must grow.
+  # Inference: ε_guided = ε_null + scale * (ε_cond − ε_null)
+  training_mode: cfg_backbone
+
+  # ── Data ────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
+  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+  max_tiles_by_subtype:
+
+  # ── Backbone UNet ────────────────────────────────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  # Gradient checkpointing disabled: single forward pass + 80GB A100 has
+  # enough headroom. Checkpointing saves ~40% memory but costs ~30% compute.
+  net_beatgans_gradient_checkpoint: false
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.20   # 20% null batches — standard CFG training ratio
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 16               # 4 per GPU on 4×A100
+  accumulate_grad_batches: 2   # effective global batch = 32
+  total_samples: 200000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # Train from random init — no warm start.
+  # A backbone pre-trained without conditioning has no gradient incentive to
+  # start using it; conditioning and denoising must co-develop from step 1.
+  backbone_ckpt_path: ""
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 24
+  gpus: [0, 1, 2, 3]
+  output_dir: ./experiments/20260529_poc_brca_lihc_cfg_v1
+  base_dir: ./experiments/20260529_poc_brca_lihc_cfg_v1
+  logdir: ./experiments/20260529_poc_brca_lihc_cfg_v1/gda
+
+poc_breast_vs_liver_cfg_brca_init:
+  # ── CFG backbone rescue: initialize from a BRCA MoPaDi checkpoint ──
+  # Same conditioning path as poc_breast_vs_liver_cfg, but backbone weights
+  # are warm-started from a pretrained BRCA diffusion checkpoint.
+  # This is additive: it does not modify the from-scratch run above.
+  training_mode: cfg_backbone
+
+  # ── Data ────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
+  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+  max_tiles_by_subtype:
+
+  # ── Backbone UNet ────────────────────────────────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.20
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 8               # 4 per GPU on 2×48 GB Titan
+  accumulate_grad_batches: 4  # effective global batch = 32
+  total_samples: 2000000      # fast rescue run; increase later if needed
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # Warm-start from the BRCA-only backbone checkpoint.
+  backbone_ckpt_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260115_different_models_difficult_to_disentangle/TCGA-BRCA/splitting_mopadi_checkpoint/diffusion_only.ckpt
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 24
+  gpus: [0, 1]
+  output_dir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init
+  base_dir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init
+  logdir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init/gda
+
 poc_breast_vs_liver_gda:
   # ── Data ────────────────────────────────────────────────────────────────
   zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
@@ -315,14 +515,22 @@ poc_breast_vs_liver_gda:
   cfg_dropout: 0.30
 
   # ── Joint training — no frozen backbone ──────────────────────────────
-  # Backbone trains on its own MSE loss.
+  # Backbone trains on its own MSE loss (unconditional denoising).
   # Adapter trains on the residual with backbone stop-grad (see model.py).
-  # null_token is fixed at zeros (not learned) — null conditioning = identity
-  # cross-attention (K=V=0, bias=False). No genomic modulation at all.
-  # delta_encouragement_weight forces adapter output to be non-zero when real
-  # tokens are provided vs zero null-token. No labels; purely self-supervised.
+  # null_token fixed at zeros — null conditioning = zero-key cross-attention.
+  #
+  # Backbone from v11 step-8k (backbone has seen ~2.5M samples total from v10+v11,
+  # val_loss≈0.032 — already reconstructs tissue well at t=750). Adapter reinit.
   freeze_backbone: false
-  delta_encouragement_weight: 0.001
+  backbone_ckpt_path: ./experiments/20260529_poc_brca_lihc_gda_v11/gda/autoenc/last.ckpt
+  reinit_adapter: true
+  delta_encouragement_weight: 0.05
+
+  # Bootstrap loss: breaks encoder-collapse deadlock by giving the genomic encoder
+  # a direct gradient path independent of the cross-attention.
+  # MSE(recon_head(h_prenorm), feats) — forces patient-specific token directions.
+  # Weight 1.0: equal to denoising MSE to ensure encoder diversifies early.
+  genomic_recon_weight: 1.0
 
   # ── Optimisation ─────────────────────────────────────────────────────
   backbone_lr: 1.0e-4
@@ -348,12 +556,16 @@ poc_breast_vs_liver_gda:
   num_workers: 24
   gpus: [0, 1, 2, 3]
 
-  # ── Output ───────────────────────────────────────────────────────────
-  # v10: fixed null_token (zeros) + delta_encouragement. Resume from v9 backbone.
-  output_dir: ./experiments/20260528_poc_brca_lihc_gda_v10
-  base_dir: ./experiments/20260528_poc_brca_lihc_gda_v10
-  logdir: ./experiments/20260528_poc_brca_lihc_gda_v10/gda
-  resume_from: /mnt/bulk-saturn/maralampert/genhist/experiments/20260528_poc_brca_lihc_gda_v9/gda/autoenc/last.ckpt
+  # ── Output — v12: genomic reconstruction loss + all fixes 2026-05-29 ─────
+  # Key changes vs v11:
+  #   genomic_recon_weight=1.0  — breaks encoder-collapse deadlock
+  #   t_vis=750 in sample grid  — proper backbone generation test (5% signal)
+  #   _log_ddim_samples errors now visible in SLURM log
+  #   loss/backbone + loss/adapter logged separately
+  #   cond/null_magnitude logged
+  output_dir: ./experiments/20260529_poc_brca_lihc_gda_v12
+  base_dir: ./experiments/20260529_poc_brca_lihc_gda_v12
+  logdir: ./experiments/20260529_poc_brca_lihc_gda_v12/gda
 
 # ── v13: Genomic Diffusion Adapter — joint from-scratch training (2026-05-17) ──────────────
 # Architecture: full MoPaDi backbone UNet + lightweight adapter UNet (~6M params).
