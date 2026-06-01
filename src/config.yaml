@@ -478,6 +478,71 @@ poc_breast_vs_liver_cfg_brca_init:
   base_dir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init
   logdir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init/gda
 
+# ── PoC v2: CFG backbone on local Weka FS, 4×H100, 2-day run (2026-05-31) ────────────────────
+# Simpler than GDA: backbone receives genomic features directly with CFG dropout.
+# Uses CfgBackboneLitModel (no adapter), warm-started from GDA last.ckpt backbone weights.
+# Data is on local Weka FS (InfiniBand), not bulk-saturn — fixes the I/O bottleneck.
+# BRCA capped at 300 tiles/patient → ~300K train tiles → manageable epoch size.
+poc_brca_lihc_cfg_v2:
+  # ── Data (Weka FS — fast random access over InfiniBand) ─────────────────
+  zip_dir: /data/cat/ws/mala059b-rna2wsi/data/PoC-BRCA-LIHC-local
+  genomic_feature_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
+  patient_splits_path: /data/cat/ws/mala059b-rna2wsi/experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  # Cap BRCA at 300 tiles/patient (BRCA zips can have 5K–10K tiles; LIHC already small).
+  # With 1101 BRCA train patients × 300 tiles + ~290 LIHC train patients × ~120 tiles ≈ 365K train tiles.
+  # One epoch ≈ 365K / 16 = 22,800 steps. 5M samples = ~16 epochs — much more manageable.
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  # ── Warm-start: GDA run backbone (320K unconditional denoising steps) ───
+  # CfgBackboneLitModel._load_backbone_weights loads only backbone weights and
+  # resets style MLP + FiLM layers so they learn from real genomic inputs.
+  # Do NOT pass this as ckpt_path to Lightning — GDA architecture is incompatible.
+  backbone_ckpt_path: /data/cat/ws/mala059b-rna2wsi/experiments/20260529_poc_brca_lihc_cfg_v1/gda/autoenc/last.ckpt
+
+  # ── Architecture (same as v1 for comparison) ─────────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: true
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.20
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 16               # 4 per GPU × 4 H100s
+  accumulate_grad_batches: 2   # effective global batch = 32
+  total_samples: 2000000       # 2M — fits comfortably in 20h; enough to confirm cond/signal
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 8               # 8 workers/GPU; Weka FS handles concurrent reads well
+  gpus: [0, 1, 2, 3]
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  output_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260531_poc_brca_lihc_cfg_v2
+  base_dir: /data/cat/ws/mala059b-rna2wsi/experiments/20260531_poc_brca_lihc_cfg_v2
+
 poc_breast_vs_liver_gda:
   # ── Data ────────────────────────────────────────────────────────────────
   zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles

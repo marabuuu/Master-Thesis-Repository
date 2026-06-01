@@ -267,6 +267,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'brca_pam50_cfg' section in config.yaml")
         run_gda_training(config["brca_pam50_cfg"], verbose=verbose)
 
+    elif stage == "poc_brca_lihc_cfg_v2":
+        from src.genomic_adapter.run_cfg_training import run_cfg_training
+        if "poc_brca_lihc_cfg_v2" not in config:
+            raise ValueError("No 'poc_brca_lihc_cfg_v2' section in config.yaml")
+        run_cfg_training(config["poc_brca_lihc_cfg_v2"], verbose=verbose)
+
     elif stage == "virchow2_umap":
         from src.visualization.virchow2_umap import run_virchow2_umap
         if "virchow2_umap" not in config:
@@ -288,7 +294,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_poc, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, poc_breast_vs_liver_cfg, poc_breast_vs_liver_cfg_brca_init, brca_pam50_cfg, virchow2_umap, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_poc, tfd_separability_viz, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, poc_breast_vs_liver_cfg, poc_breast_vs_liver_cfg_brca_init, brca_pam50_cfg, poc_brca_lihc_cfg_v2, virchow2_umap, evaluation, all"
         )
 
 
