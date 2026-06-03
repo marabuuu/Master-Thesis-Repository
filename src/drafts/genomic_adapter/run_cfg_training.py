@@ -90,11 +90,12 @@ def run_cfg_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     if already_launched:
         # We are already one of N worker processes (SLURM tasks-per-node or torchrun).
         # CUDA_VISIBLE_DEVICES is set to our single assigned GPU.
-        # Lightning reads SLURM_NTASKS/SLURM_PROCID or RANK/WORLD_SIZE and builds DDP.
-        devices = 1
-        strategy = "ddp"
+        # Lightning 2.x validates devices == SLURM_NTASKS_PER_NODE; SLURMEnvironment
+        # then assigns ranks from SLURM_PROCID — no subprocess spawning occurs.
         n_devices = max(slurm_ntasks, torchrun_world)
-        log.info("Pre-launched DDP worker: rank=%s world=%d device=1",
+        devices = n_devices
+        strategy = "ddp"
+        log.info("Pre-launched DDP worker: rank=%s world=%d",
                  os.environ.get("SLURM_PROCID", os.environ.get("RANK", "?")), n_devices)
     else:
         # Single-process entry point: Lightning spawns subprocesses internally.
@@ -144,7 +145,7 @@ def run_cfg_training(cfg: Dict[str, Any], verbose: bool = True) -> None:
     else:
         log.info("Fresh start — backbone warm from backbone_ckpt_path if set")
 
-    model.expected_world_size = max(1, len(devices))
+    model.expected_world_size = max(1, n_devices)
 
     try:
         trainer.fit(model, ckpt_path=resume_ckpt)

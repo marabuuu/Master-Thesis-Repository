@@ -1251,6 +1251,196 @@ plot_gda_v13_diagnostics = plot_gda_diagnostics
 
 
 # ===================================================================
+#  CFG backbone — combined warm-start + main run diagnostics
+# ===================================================================
+
+
+def plot_cfg_diagnostics(
+    main_logdir: Union[str, Path],
+    warm_logdir: Optional[Union[str, Path]] = None,
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (16, 14),
+    cmap_name: str = CATEGORICAL_CMAP,
+    title: str = "CFG Backbone — Training Diagnostics",
+) -> "Figure":
+    """Four-panel diagnostic figure for a CFG backbone run, optionally stitched
+    to a warm-start predecessor run on a continuous x-axis (samples seen).
+
+    If *warm_logdir* is given, its events are placed first on the x-axis and the
+    main run's steps are offset by the warm run's final step so the combined curve
+    reads as a single uninterrupted training history.  A vertical dashed line marks
+    the stitch point.
+
+    Panels
+    ------
+    1. loss/train (EMA-smoothed) + loss/val (aggregated) — linear scale
+    2. loss/val (correct) vs loss/val_shuffled — same scale, shows conditioning gap
+    3. cond/gap  = loss(cross-cohort shuffle) − loss(correct)  — must be > 0
+    4. cond/signal = E[‖ε_cond − ε_null‖²]  — must grow monotonically
+
+    Parameters
+    ----------
+    main_logdir : str | Path
+        TFEvents directory for the primary / most recent run.
+    warm_logdir : str | Path | None
+        TFEvents directory for the warm-start predecessor.  ``None`` = single run.
+    save_path : str | Path | None
+    show : bool
+    """
+    _check_matplotlib()
+    setup_style()
+
+    def _load(logdir: Union[str, Path]) -> Dict[str, Tuple[List[float], List[float]]]:
+        return load_gda_tfevents(logdir)
+
+    def _get(data: Dict, tag: str) -> Tuple[List[float], List[float]]:
+        return data.get(tag, ([], []))
+
+    main_data = _load(main_logdir)
+
+    stitch_step: float = 0.0
+    warm_data: Dict[str, Tuple[List[float], List[float]]] = {}
+    if warm_logdir is not None:
+        warm_data = _load(warm_logdir)
+        # Determine the last step recorded in the warm run (use loss/train as reference).
+        w_steps, _ = _get(warm_data, "loss/train")
+        stitch_step = float(max(w_steps)) if w_steps else 0.0
+
+    def _combine(tag: str) -> Tuple[List[float], List[float]]:
+        """Return (steps_M, values) combining warm + main, x in millions of samples."""
+        ws, wv = _get(warm_data, tag) if warm_data else ([], [])
+        ms, mv = _get(main_data, tag)
+        # Offset main steps so they continue after warm
+        ms_off = [s + stitch_step for s in ms]
+        all_s = list(ws) + ms_off
+        all_v = list(wv) + list(mv)
+        pairs = sorted(zip(all_s, all_v))
+        if not pairs:
+            return [], []
+        s_sorted = [p[0] / 1e6 for p in pairs]
+        v_sorted = [p[1] for p in pairs]
+        return s_sorted, v_sorted
+
+    def _combine_agg(tag: str) -> Tuple[List[float], List[float]]:
+        """Combine and de-duplicate (aggregate) sparse val series."""
+        s, v = _combine(tag)
+        if not s:
+            return [], []
+        # _aggregate_by_step expects int-keyed steps; round M-scale back to steps
+        raw_steps = [round(x * 1e6) for x in s]
+        agg_s, agg_v = _aggregate_by_step(raw_steps, v)
+        return [x / 1e6 for x in agg_s], agg_v
+
+    stitch_M = (stitch_step / 1e6) if stitch_step > 0 else None
+
+    # --- load all series ------------------------------------------------
+    train_s, train_v         = _combine("loss/train")
+    val_s, val_v             = _combine_agg("loss/val")
+    shuffled_s, shuffled_v   = _combine_agg("loss/val_shuffled")
+    gap_s, gap_v             = _combine_agg("cond/gap")
+    signal_s, signal_v       = _combine("cond/signal")
+
+    # EMA-smooth train
+    ema_s, ema_v = _ema_series(train_s, train_v, alpha=0.005) if train_v else ([], [])
+
+    colors = get_categorical_colors(8, cmap_name=cmap_name)
+    seq_cmap = get_crameri_cmap(SEQUENTIAL_CMAP)
+
+    fig, axes = plt.subplots(2, 2, figsize=figsize)
+    axs = axes.flatten()
+
+    def _stitch_line(ax: Any) -> None:
+        if stitch_M is not None:
+            ax.axvline(stitch_M, color="grey", linewidth=1.2, linestyle="--", alpha=0.6,
+                       label=f"warm→main ({stitch_M:.1f}M)")
+
+    # ------------------------------------------------------------------
+    # Panel 1 — Training loss + validation loss (linear)
+    # ------------------------------------------------------------------
+    ax = axs[0]
+    if ema_s:
+        ax.plot(ema_s, ema_v, linewidth=2.2, color=colors[0], label="train loss (EMA)")
+    if val_v:
+        ax.plot(val_s, val_v, "-o", markersize=5, linewidth=1.8,
+                color=colors[1], label="val loss")
+        best_idx = int(np.argmin(val_v))
+        ax.scatter([val_s[best_idx]], [val_v[best_idx]], s=130, marker="*",
+                   color=colors[2], edgecolors="black", linewidth=0.6, zorder=5,
+                   label=f"best val  {val_v[best_idx]:.4f}")
+    _stitch_line(ax)
+    ax.set_title("Training & Validation Loss", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("MSE Loss")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 2 — Val correct vs val shuffled
+    # ------------------------------------------------------------------
+    ax = axs[1]
+    if val_v:
+        ax.plot(val_s, val_v, "-o", markersize=5, linewidth=1.8,
+                color=colors[1], label="val loss (correct g)")
+    if shuffled_v:
+        ax.plot(shuffled_s, shuffled_v, "-s", markersize=5, linewidth=1.8,
+                color=colors[3], label="val loss (shuffled g)")
+    _stitch_line(ax)
+    ax.set_title("Val Loss: Correct vs Cross-Cohort Shuffled Conditioning", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("MSE Loss")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22)
+
+    # ------------------------------------------------------------------
+    # Panel 3 — cond/gap
+    # ------------------------------------------------------------------
+    ax = axs[2]
+    if gap_v:
+        ax.plot(gap_s, gap_v, "-o", markersize=5, linewidth=1.8,
+                color=seq_cmap(0.8), label="cond/gap")
+        ax.fill_between(gap_s, 0, gap_v,
+                        where=[v >= 0 for v in gap_v],
+                        alpha=0.12, color=seq_cmap(0.8))
+    ax.axhline(0.0, color="grey", linewidth=1.0, alpha=0.5, linestyle="--")
+    _stitch_line(ax)
+    ax.set_title("cond/gap  =  loss(shuffled) − loss(correct)", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("cond/gap  [> 0 = conditioning works]")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22)
+    if not gap_v:
+        ax.text(0.5, 0.5, "No cond/gap data", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+
+    # ------------------------------------------------------------------
+    # Panel 4 — cond/signal
+    # ------------------------------------------------------------------
+    ax = axs[3]
+    if signal_v:
+        ax.plot(signal_s, signal_v, "-o", markersize=4, linewidth=1.6,
+                color=colors[4], label="cond/signal")
+        ax.axhline(0.0, color="grey", linewidth=0.8, alpha=0.4, linestyle="--")
+        positive = [v for v in signal_v if v > 0]
+        if positive and max(positive) / max(min(positive), 1e-12) > 20:
+            ax.set_yscale("log")
+    _stitch_line(ax)
+    ax.set_title("cond/signal  =  E[‖ε_cond − ε_null‖²]", fontweight="bold")
+    ax.set_xlabel("Samples Seen (millions)")
+    ax.set_ylabel("cond/signal  [must grow ↑]")
+    ax.legend(framealpha=0.9, fontsize=8)
+    ax.grid(True, alpha=0.22)
+    if not signal_v:
+        ax.text(0.5, 0.5, "No cond/signal data", ha="center", va="center",
+                transform=ax.transAxes, color="grey")
+
+    fig.suptitle(title, fontsize=14, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig
+
+
+# ===================================================================
 #  CLI entry-point
 # ===================================================================
 
@@ -1263,31 +1453,58 @@ if __name__ == "__main__":
         _sys.path.insert(0, _repo_root)
     # Re-import with absolute paths so the relative imports above resolve
     from src.visualization.training_plots import (  # noqa: E402
+        plot_cfg_diagnostics,
         plot_gda_diagnostics,
     )
 
-    _DEFAULT_LOGDIR = (
+    _CFG_MAIN = (
+        "/mnt/bulk-saturn/maralampert/genhist/experiments"
+        "/20260601_poc_brca_lihc_cfg_v2_dgx/gda"
+    )
+    _CFG_WARM = (
+        "/mnt/bulk-saturn/maralampert/genhist/experiments"
+        "/20260529_poc_brca_lihc_cfg_v1/gda"
+    )
+    _CFG_OUT = (
+        "/mnt/bulk-saturn/maralampert/genhist/experiments"
+        "/20260601_poc_brca_lihc_cfg_v2_dgx/cfg_diagnostics.png"
+    )
+    _GDA_LOGDIR = (
         "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2/gda"
     )
-    _DEFAULT_OUT = (
+    _GDA_OUT = (
         "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2"
         "/gda_diagnostics.png"
     )
 
     parser = argparse.ArgumentParser(
-        description="Plot GDA training diagnostics from TFEvents."
+        description="Plot training diagnostics from TFEvents."
     )
     parser.add_argument(
-        "--logdir", default=_DEFAULT_LOGDIR,
-        help="Directory containing TFEvents files",
+        "--mode", choices=["cfg", "gda"], default="cfg",
+        help="'cfg' = CFG backbone run (default); 'gda' = GDA v13 run.",
+    )
+    # CFG-mode args
+    parser.add_argument(
+        "--main-logdir", default=_CFG_MAIN,
+        help="[cfg] Main run TFEvents directory.",
     )
     parser.add_argument(
-        "--out", default=_DEFAULT_OUT,
-        help="Output figure path (PNG/PDF/SVG).",
+        "--warm-logdir", default=_CFG_WARM,
+        help="[cfg] Warm-start predecessor TFEvents directory (optional).",
+    )
+    # GDA-mode arg
+    parser.add_argument(
+        "--logdir", default=_GDA_LOGDIR,
+        help="[gda] Directory containing TFEvents files.",
+    )
+    parser.add_argument(
+        "--out", default=None,
+        help="Output figure path (PNG/PDF/SVG). Defaults per mode.",
     )
     parser.add_argument(
         "--title", default=None,
-        help="Figure title. Defaults to 'GDA — Training Diagnostics'.",
+        help="Figure title override.",
     )
     parser.add_argument(
         "--no-show", action="store_true",
@@ -1295,18 +1512,31 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    out_path = Path(args.out)
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-
-    kwargs = {}
+    kwargs: dict = {}
     if args.title:
         kwargs["title"] = args.title
 
-    print(f"Loading TFEvents from: {args.logdir}")
-    fig = plot_gda_diagnostics(
-        logdir=args.logdir,
-        save_path=out_path,
-        show=not args.no_show,
-        **kwargs,
-    )
+    if args.mode == "cfg":
+        out_path = Path(args.out or _CFG_OUT)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        warm = args.warm_logdir if args.warm_logdir else None
+        print(f"CFG mode | warm={warm} | main={args.main_logdir}")
+        fig = plot_cfg_diagnostics(
+            main_logdir=args.main_logdir,
+            warm_logdir=warm,
+            save_path=out_path,
+            show=not args.no_show,
+            **kwargs,
+        )
+    else:
+        out_path = Path(args.out or _GDA_OUT)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"GDA mode | logdir={args.logdir}")
+        fig = plot_gda_diagnostics(
+            logdir=args.logdir,
+            save_path=out_path,
+            show=not args.no_show,
+            **kwargs,
+        )
+
     print(f"Saved: {out_path}")

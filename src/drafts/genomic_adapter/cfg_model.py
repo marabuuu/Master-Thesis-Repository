@@ -1,0 +1,436 @@
+"""
+CfgBackboneLitModel — MoPaDi backbone trained with CFG dropout on genomic features.
+
+The backbone IS the conditioned denoiser — no separate adapter:
+  - Receives real genomic features as its style conditioning input
+  - CFG dropout replaces features with zeros on a fraction of batches
+  - Single MSE loss: MSE(backbone(x_t, t, cond_or_null), ε)
+  - CFG at inference: ε_guided = ε_null + s * (ε_cond − ε_null)
+
+The backbone is the artist; the genomic vector is the muse.
+
+Why this works where GDA failed:
+  GDA always passed zeros_cond to the backbone → backbone became unconditional
+  → adapter had to do ALL denoising → backbone gave up → oscillating loss ~1.0.
+  Here, the backbone IS conditioned: it receives the patient's genomic profile and
+  learns to generate different tissue for different patients. The gradient from
+  MSE(backbone(cond), ε) directly rewards patient-specific denoising.
+
+Health metric:
+  cond/signal = E[‖ε_cond − ε_null‖²]  — must grow as backbone learns to
+  produce different noise predictions for different patients vs null input.
+  cond/gap = loss/val_shuffled − loss/val — positive means conditioning carries
+  patient-specific information (shuffled patients → worse predictions).
+"""
+
+from __future__ import annotations
+
+import logging
+from pathlib import Path
+
+import numpy as np
+import torch
+from typing import Any, cast
+import torch.nn.functional as F
+from torchvision.utils import make_grid, save_image
+
+from mopadi.train_diff_autoenc import LitModel, ema as _ema_fn
+from mopadi.utils.dist_utils import get_world_size
+
+from .config import GDAConfig
+from .dataset import ZipTilesWithGenomicFeatures, patient_id_from_tile_path
+
+log = logging.getLogger(__name__)
+
+
+class CfgBackboneLitModel(LitModel):
+    """
+    Standard CFG training on MoPaDi backbone with genomic style conditioning.
+    No adapter — the backbone handles both denoising and genomic conditioning.
+    """
+
+    automatic_optimization = False
+
+    def __init__(self, conf: GDAConfig):
+        super().__init__(conf)
+        self.conf: GDAConfig = conf
+
+        if conf.backbone_ckpt_path:
+            self._load_backbone_weights(conf.backbone_ckpt_path)
+
+        n_bb = sum(p.numel() for p in self.model.parameters())
+        log.info("CfgBackboneLitModel: backbone params=%d", n_bb)
+
+    # ------------------------------------------------------------------
+    # Checkpoint loading
+    # ------------------------------------------------------------------
+
+    def _load_backbone_weights(self, ckpt_path: str) -> None:
+        ckpt_file = Path(ckpt_path)
+        if not ckpt_file.exists():
+            raise FileNotFoundError(f"backbone_ckpt_path not found: {ckpt_path}")
+
+        log.info("Loading backbone weights from: %s", ckpt_file)
+        ckpt = torch.load(ckpt_file, map_location="cpu", weights_only=False)
+        state = ckpt.get("state_dict", ckpt)
+
+        bb_state = {
+            k[len("model."):]: v
+            for k, v in state.items()
+            if k.startswith("model.") and not k.startswith("model.adapter")
+        }
+        missing, unexpected = self.model.load_state_dict(bb_state, strict=False)
+        log.info("model: missing=%d unexpected=%d", len(missing), len(unexpected))
+
+        ema_state = {
+            k[len("ema_model."):]: v
+            for k, v in state.items()
+            if k.startswith("ema_model.") and not k.startswith("ema_model.adapter")
+        }
+        if ema_state:
+            m2, u2 = self.ema_model.load_state_dict(ema_state, strict=False)
+            log.info("ema_model: missing=%d unexpected=%d", len(m2), len(u2))
+
+        # Re-initialise the conditioning pathway so it learns from scratch
+        # with real genomic inputs (the prior run used zeros_cond, so FiLM
+        # layers were trained on a constant input — wrong initialisation for
+        # variable genomic conditioning).
+        self._reinit_cond_layers()
+
+    def _reinit_cond_layers(self) -> None:
+        """Reset style MLP and per-ResBlock FiLM projections to random weights."""
+        n_reset = 0
+        for model in (self.model, self.ema_model):
+            # Style MLP in TimeStyleSeperateEmbed
+            if hasattr(model, "time_embed") and hasattr(model.time_embed, "style"):
+                for m in model.time_embed.style.modules():
+                    if hasattr(m, "reset_parameters"):
+                        m.reset_parameters()
+                        n_reset += 1
+            # cond_emb_layers in every ResBlock
+            for module in model.modules():
+                if hasattr(module, "cond_emb_layers"):
+                    for m in module.cond_emb_layers.modules():
+                        if hasattr(m, "reset_parameters"):
+                            m.reset_parameters()
+                            n_reset += 1
+        log.info("Re-initialised %d conditioning sub-modules", n_reset)
+
+    # ------------------------------------------------------------------
+    # Lightning hooks
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self) -> None:
+        pass  # skip parent's WebDataset sanity check
+
+    @property
+    def num_samples(self) -> int:
+        return self.global_step * self.conf.batch_size
+
+    def on_load_checkpoint(self, checkpoint: dict) -> None:
+        ckpt_sd = checkpoint.get("state_dict", {})
+        model_sd = self.state_dict()
+        new_keys = model_sd.keys() - ckpt_sd.keys()
+        if new_keys:
+            ckpt_sd.update({k: model_sd[k] for k in new_keys})
+            log.info("on_load_checkpoint: added %d new params from init", len(new_keys))
+        checkpoint["state_dict"] = ckpt_sd
+        # Reset optimizer states if param-group sizes changed
+        opt_states = checkpoint.get("optimizer_states") or []
+        if opt_states:
+            expected = sum(1 for _ in self.model.parameters())
+            saved = len((opt_states[0].get("param_groups") or [{}])[0].get("params", []))
+            if saved != expected:
+                log.warning("Optimizer state mismatch (saved=%d current=%d) — resetting Adam momentum.", saved, expected)
+                checkpoint["optimizer_states"] = []
+
+    # ------------------------------------------------------------------
+    # Dataset
+    # ------------------------------------------------------------------
+
+    def setup(self, stage=None) -> None:
+        if self.conf.seed is not None:
+            seed = self.conf.seed * get_world_size() + self.global_rank
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+
+        kwargs = dict(
+            zip_dir=self.conf.zip_dir,
+            genomic_h5_dir=self.conf.genomic_feature_dir,
+            patient_splits_path=self.conf.patient_splits_path,
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
+            tile_sampling_seed=self.conf.tile_sampling_seed,
+            img_size=self.conf.img_size,
+            do_resize=self.conf.do_resize,
+            do_normalize=self.conf.do_normalize,
+        )
+        self.train_data = ZipTilesWithGenomicFeatures(split="train", **kwargs)
+        self.val_data   = ZipTilesWithGenomicFeatures(split="val",   **kwargs)
+        if self.global_rank == 0:
+            log.info("train=%d  val=%d  tiles", len(self.train_data), len(self.val_data))
+
+        # Pre-compute subtype-balance weights once — these are fixed for the dataset.
+        from collections import Counter
+        subtype_map = self.train_data._subtype_map
+        counts: Counter = Counter()
+        for p in self.train_data.tile_paths:
+            counts[subtype_map.get(patient_id_from_tile_path(p), "unknown")] += 1
+        self._sampler_weights = torch.tensor(
+            [1.0 / counts[subtype_map.get(patient_id_from_tile_path(p), "unknown")]
+             for p in self.train_data.tile_paths],
+            dtype=torch.float32,
+        )
+        self._sampler_counts = counts
+        if self.global_rank == 0:
+            log.info("Subtype-balanced sampler: %s", dict(sorted(counts.items())))
+
+    def train_dataloader(self):
+        import torch.utils.data as tud
+
+        sampler = tud.WeightedRandomSampler(
+            self._sampler_weights, num_samples=len(self.train_data.tile_paths), replacement=True
+        )
+
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(self.train_data, drop_last=True, sampler=sampler)
+
+    def val_dataloader(self):
+        import torch.utils.data as tud
+        limit = self.conf.val_limit_batches * self.conf.batch_size
+        dataset = (
+            tud.Subset(self.val_data, list(range(limit)))
+            if len(self.val_data) > limit else self.val_data
+        )
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(dataset, shuffle=False, drop_last=False)
+
+    # ------------------------------------------------------------------
+    # Optimizers
+    # ------------------------------------------------------------------
+
+    def configure_optimizers(self):
+        opt = torch.optim.AdamW(
+            self.model.parameters(),
+            lr=self.conf.backbone_lr,
+            betas=(0.9, 0.999),
+            weight_decay=1e-2,
+        )
+        return [opt], []
+
+    # ------------------------------------------------------------------
+    # Training
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        opt = self.optimizers()
+        accum = self.conf.accum_batches
+
+        imgs = batch["img"].to(self.device)
+        feats = batch["feat"].to(self.device, dtype=torch.float32)
+        feats = F.normalize(feats, p=2, dim=-1)
+        B = imgs.shape[0]
+
+        t, _ = self.T_sampler.sample(B, imgs.device)
+        noise = torch.randn_like(imgs)
+        x_t = self.sampler.q_sample(imgs, t, noise=noise)
+        t_scaled = self.sampler._scale_timesteps(t)
+
+        # CFG dropout: replace genomic features with zeros for cfg_dropout% of samples
+        null_mask = (torch.rand(B, device=self.device) < self.conf.cfg_dropout)[:, None]
+        cond = torch.where(null_mask, torch.zeros_like(feats), feats)
+
+        eps_pred = self.model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=cond).pred
+        loss = F.mse_loss(eps_pred.float(), noise.float())
+
+        self.manual_backward(loss / accum)
+
+        if self.is_last_accum(batch_idx):
+            if self.conf.grad_clip > 0:
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), self.conf.grad_clip)
+            opt.step()
+            opt.zero_grad()
+
+        if self.trainer.is_global_zero:
+            exp = getattr(self.logger, "experiment", None)
+            if exp is not None:
+                exp.add_scalar("loss/train", loss.item(), self.num_samples)
+
+        # Conditioning health: ‖backbone(cond) − backbone(null)‖²
+        # Must grow as backbone learns to use the genomic signal.
+        _diag_interval = 500 * self.conf.batch_size_effective
+        if self.trainer.is_global_zero and self.global_step > 0 and (self.num_samples % _diag_interval < self.conf.batch_size):
+            with torch.no_grad():
+                bm = min(16, B)
+                # Reuse the already-sampled x_t and t rather than re-sampling.
+                zeros = torch.zeros(bm, self.conf.feat_dim, device=self.device)
+                eps_c = self.model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=feats[:bm].detach()).pred
+                eps_n = self.model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=zeros).pred
+                self.logger.experiment.add_scalar("cond/signal", (eps_c - eps_n).pow(2).mean().item(), self.num_samples)
+
+        _si_interval = self.conf.reconstruct_every_samples
+        if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
+            self._log_sample_images(imgs.detach(), feats.detach())
+
+        return {"loss": loss}
+
+    # ------------------------------------------------------------------
+    # EMA + batch end
+    # ------------------------------------------------------------------
+
+    def on_train_batch_end(self, outputs, batch, batch_idx: int) -> None:
+        if self.is_last_accum(batch_idx):
+            _ema_fn(self.model, self.ema_model, self.conf.ema_decay)
+
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
+
+    def validation_step(self, batch, batch_idx):
+        imgs = batch["img"].to(self.device)
+        feats = batch["feat"].to(self.device, dtype=torch.float32)
+        feats = F.normalize(feats, p=2, dim=-1)
+        B = imgs.shape[0]
+
+        t, _ = self.T_sampler.sample(B, imgs.device)
+        noise = torch.randn_like(imgs)
+        x_t = self.sampler.q_sample(imgs, t, noise=noise)
+        t_scaled = self.sampler._scale_timesteps(t)
+        zeros = torch.zeros(B, self.conf.feat_dim, device=self.device)
+
+        # Cross-cohort shuffle: BRCA tiles get LIHC features and vice versa.
+        # This gives a maximally wrong conditioning signal for the PoC (organ-level
+        # separation), making cond/gap a cleaner signal than within-batch randperm
+        # which can pair BRCA with BRCA (similar genomic profiles → weak mismatch).
+        subtypes = batch["subtype"]
+        brca_idx = torch.tensor([i for i, s in enumerate(subtypes) if "BRCA" in s],
+                                 device=self.device)
+        lihc_idx = torch.tensor([i for i, s in enumerate(subtypes) if "LIHC" in s],
+                                 device=self.device)
+        cross_feats = feats.clone()
+        if len(brca_idx) > 0 and len(lihc_idx) > 0:
+            cross_feats[brca_idx] = feats[lihc_idx[torch.randint(len(lihc_idx), (len(brca_idx),), device=self.device)]]
+            cross_feats[lihc_idx] = feats[brca_idx[torch.randint(len(brca_idx), (len(lihc_idx),), device=self.device)]]
+        else:
+            cross_feats = feats[torch.randperm(B, device=self.device)]
+
+        with torch.no_grad():
+            eps_cond     = self.ema_model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=feats).pred
+            eps_shuffled = self.ema_model.forward(x=x_t, t=t_scaled, x_start=imgs,
+                                                   cond=cross_feats).pred
+            noise_f = noise.float()
+            loss_val      = F.mse_loss(eps_cond.float(), noise_f)
+            loss_shuffled = F.mse_loss(eps_shuffled.float(), noise_f)
+
+        self.log("_val_loss",          loss_val,      on_step=False, on_epoch=True, sync_dist=True, prog_bar=True,  logger=False)
+        self.log("_val_loss_shuffled", loss_shuffled, on_step=False, on_epoch=True, sync_dist=True, prog_bar=False, logger=False)
+        return loss_val
+
+    def on_validation_epoch_end(self) -> None:
+        if self.trainer.state.stage == "sanity_check":
+            return
+        val_loss      = self.trainer.callback_metrics.get("_val_loss")
+        val_shuffled  = self.trainer.callback_metrics.get("_val_loss_shuffled")
+        if val_loss is not None and self.trainer.is_global_zero:
+            self.logger.experiment.add_scalar("loss/val",          val_loss.item(),     self.num_samples)
+            if val_shuffled is not None:
+                self.logger.experiment.add_scalar("loss/val_shuffled", val_shuffled.item(), self.num_samples)
+                self.logger.experiment.add_scalar("cond/gap",
+                    val_shuffled.item() - val_loss.item(), self.num_samples)
+        if val_loss is not None:
+            self.log("loss/val_ckpt", val_loss, prog_bar=False, sync_dist=False)
+
+    # ------------------------------------------------------------------
+    # Sample visualisation
+    # ------------------------------------------------------------------
+
+    @torch.no_grad()
+    def _log_sample_images(self, imgs: torch.Tensor, feats: torch.Tensor) -> None:
+        if not hasattr(self, "_sample_imgs"):
+            b = min(8, imgs.shape[0])
+            self._sample_imgs  = imgs[:b].clone().cpu()
+            self._sample_feats = feats[:b].clone().cpu()
+
+        imgs_s  = self._sample_imgs.to(self.device)
+        feats_s = self._sample_feats.to(self.device, dtype=torch.float32)
+        feats_s = F.normalize(feats_s, p=2, dim=-1)
+        b = imgs_s.shape[0]
+        zeros = torch.zeros(b, self.conf.feat_dim, device=self.device)
+
+        t_vis = torch.full((b,), 750, device=self.device, dtype=torch.long)
+        x_t_vis = self.sampler.q_sample(imgs_s, t_vis, noise=torch.randn_like(imgs_s))
+        t_sc = self.sampler._scale_timesteps(t_vis)
+
+        sac  = torch.as_tensor(self.sampler.sqrt_alphas_cumprod,           device=self.device, dtype=torch.float32)
+        somc = torch.as_tensor(self.sampler.sqrt_one_minus_alphas_cumprod, device=self.device, dtype=torch.float32)
+
+        def _x0(x_t_, eps_, t_):
+            a  = sac[t_].view(-1, 1, 1, 1)
+            b_ = somc[t_].view(-1, 1, 1, 1)
+            return ((x_t_ - b_ * eps_) / a).clamp(-1, 1)
+
+        def _vis(delta):
+            lo = delta.flatten(1).min(1).values.view(-1, 1, 1, 1)
+            hi = delta.flatten(1).max(1).values.view(-1, 1, 1, 1)
+            return (2 * (delta - lo) / (hi - lo + 1e-8) - 1).clamp(-1, 1)
+
+        # EMA model: unconditional vs conditioned
+        eps_null = self.ema_model.forward(x=x_t_vis, t=t_sc, x_start=imgs_s, cond=zeros).pred.float()
+        eps_cond = self.ema_model.forward(x=x_t_vis, t=t_sc, x_start=imgs_s, cond=feats_s).pred.float()
+
+        rows = [
+            imgs_s.clamp(-1, 1),              # original tiles
+            x_t_vis.clamp(-1, 1),             # noised at t=750
+            _x0(x_t_vis, eps_null, t_vis),    # unconditional x0
+            _x0(x_t_vis, eps_cond, t_vis),    # conditioned x0
+            _vis(eps_cond - eps_null),         # conditioning delta (where they differ)
+        ]
+        grid = make_grid(torch.cat(rows), nrow=b, normalize=True, value_range=(-1, 1), padding=2)
+        self.logger.experiment.add_image("samples/ema", grid, self.num_samples)
+
+        samples_dir = Path(self.conf.logdir) / "samples"
+        samples_dir.mkdir(parents=True, exist_ok=True)
+        save_image(grid, samples_dir / f"samples_{self.num_samples:010d}.png")
+
+        # DDIM generation: unconditional vs CFG-guided
+        self._log_ddim_samples(feats_s[:2], samples_dir)
+
+    @torch.no_grad()
+    def _log_ddim_samples(self, feats_ref, samples_dir: Path) -> None:
+        from mopadi.diffusion.base import DummyReturn
+
+        n = feats_ref.shape[0]
+        zeros = torch.zeros(n, self.conf.feat_dim, device=self.device)
+        backbone = self.ema_model
+        sampler = self.sampler
+
+        def _make_model(scale: float):
+            _s, _f, _z = scale, feats_ref, zeros
+            class _M(torch.nn.Module):
+                def __init__(self_):
+                    super().__init__()
+                    self_._bb = backbone
+                def forward(self_, x, t, **kw):
+                    t_sc = sampler._scale_timesteps(t)
+                    eps_null = backbone.forward(x=x, t=t_sc, x_start=None, cond=_z).pred
+                    if _s == 0.0:
+                        return DummyReturn(pred=eps_null)
+                    eps_cond = backbone.forward(x=x, t=t_sc, x_start=None, cond=_f).pred
+                    return DummyReturn(pred=eps_null + _s * (eps_cond - eps_null))
+            return _M()
+
+        try:
+            sampler = self.conf._make_diffusion_conf(self.conf.T_eval).make_sampler()
+            noise = torch.randn(n, 3, self.conf.img_size, self.conf.img_size, device=self.device)
+            uncond = sampler.sample(model=cast(Any, _make_model(0.0)), shape=noise.shape, noise=noise, model_kwargs={}, progress=False)
+            guided = sampler.sample(model=cast(Any, _make_model(5.0)), shape=noise.shape, noise=noise, model_kwargs={}, progress=False)
+        except Exception:
+            log.warning("_log_ddim_samples failed", exc_info=True)
+            return
+
+        rows = torch.cat([uncond.clamp(-1, 1), guided.clamp(-1, 1)])
+        grid = make_grid(rows, nrow=n, normalize=True, value_range=(-1, 1), padding=2)
+        self.logger.experiment.add_image("samples/ddim", grid, self.num_samples)
+        save_image(grid, samples_dir / f"ddim_{self.num_samples:010d}.png")

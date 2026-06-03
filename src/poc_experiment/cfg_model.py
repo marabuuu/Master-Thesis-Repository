@@ -230,6 +230,7 @@ class CfgBackboneLitModel(LitModel):
 
         imgs = batch["img"].to(self.device)
         feats = batch["feat"].to(self.device, dtype=torch.float32)
+        feats = F.normalize(feats, p=2, dim=-1)
         B = imgs.shape[0]
 
         t, _ = self.T_sampler.sample(B, imgs.device)
@@ -260,7 +261,7 @@ class CfgBackboneLitModel(LitModel):
         # Conditioning health: ‖backbone(cond) − backbone(null)‖²
         # Must grow as backbone learns to use the genomic signal.
         _diag_interval = 500 * self.conf.batch_size_effective
-        if self.trainer.is_global_zero and (self.num_samples % _diag_interval < self.conf.batch_size):
+        if self.trainer.is_global_zero and self.global_step > 0 and (self.num_samples % _diag_interval < self.conf.batch_size):
             with torch.no_grad():
                 bm = min(16, B)
                 # Reuse the already-sampled x_t and t rather than re-sampling.
@@ -290,6 +291,7 @@ class CfgBackboneLitModel(LitModel):
     def validation_step(self, batch, batch_idx):
         imgs = batch["img"].to(self.device)
         feats = batch["feat"].to(self.device, dtype=torch.float32)
+        feats = F.normalize(feats, p=2, dim=-1)
         B = imgs.shape[0]
 
         t, _ = self.T_sampler.sample(B, imgs.device)
@@ -298,10 +300,26 @@ class CfgBackboneLitModel(LitModel):
         t_scaled = self.sampler._scale_timesteps(t)
         zeros = torch.zeros(B, self.conf.feat_dim, device=self.device)
 
+        # Cross-cohort shuffle: BRCA tiles get LIHC features and vice versa.
+        # This gives a maximally wrong conditioning signal for the PoC (organ-level
+        # separation), making cond/gap a cleaner signal than within-batch randperm
+        # which can pair BRCA with BRCA (similar genomic profiles → weak mismatch).
+        subtypes = batch["subtype"]
+        brca_idx = torch.tensor([i for i, s in enumerate(subtypes) if "BRCA" in s],
+                                 device=self.device)
+        lihc_idx = torch.tensor([i for i, s in enumerate(subtypes) if "LIHC" in s],
+                                 device=self.device)
+        cross_feats = feats.clone()
+        if len(brca_idx) > 0 and len(lihc_idx) > 0:
+            cross_feats[brca_idx] = feats[lihc_idx[torch.randint(len(lihc_idx), (len(brca_idx),), device=self.device)]]
+            cross_feats[lihc_idx] = feats[brca_idx[torch.randint(len(brca_idx), (len(lihc_idx),), device=self.device)]]
+        else:
+            cross_feats = feats[torch.randperm(B, device=self.device)]
+
         with torch.no_grad():
             eps_cond     = self.ema_model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=feats).pred
             eps_shuffled = self.ema_model.forward(x=x_t, t=t_scaled, x_start=imgs,
-                                                   cond=feats[torch.randperm(B, device=self.device)]).pred
+                                                   cond=cross_feats).pred
             noise_f = noise.float()
             loss_val      = F.mse_loss(eps_cond.float(), noise_f)
             loss_shuffled = F.mse_loss(eps_shuffled.float(), noise_f)
@@ -337,6 +355,7 @@ class CfgBackboneLitModel(LitModel):
 
         imgs_s  = self._sample_imgs.to(self.device)
         feats_s = self._sample_feats.to(self.device, dtype=torch.float32)
+        feats_s = F.normalize(feats_s, p=2, dim=-1)
         b = imgs_s.shape[0]
         zeros = torch.zeros(b, self.conf.feat_dim, device=self.device)
 

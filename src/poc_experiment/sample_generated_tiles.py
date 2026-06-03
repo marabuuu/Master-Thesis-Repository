@@ -1,21 +1,13 @@
-"""Generate diffusion samples for random BRCA and LIHC patients.
+"""Generate diffusion samples for BRCA and LIHC patients (CFG backbone only).
 
-This script is meant for sanity-checking the learned denoising path from pure
-noise using patient-level genomic conditioning vectors.
-
-It supports both genomic_adapter training modes used in this repository:
-
-- ``cfg_backbone``: the backbone itself is conditioned on genomic features.
-- ``gda``: the backbone is unconditional and a genomic adapter supplies the
-  residual.
-
-For each selected patient, the script writes a side-by-side pair of images:
-
+For each selected patient, writes a side-by-side pair:
 - unconditional / null-conditioned output
 - conditioned output using the real patient genomic vector
 
-The outputs are saved as PNG files plus a metadata JSON file listing the chosen
-patients, subtypes, and source checkpoint.
+Usage:
+    python -m src.poc_experiment.sample_generated_tiles \\
+        --run-dir experiments/20260601_poc_brca_lihc_cfg_v2_dgx/gda \\
+        --subtypes BRCA LIHC --n-per-subtype 2
 """
 
 from __future__ import annotations
@@ -30,7 +22,7 @@ from typing import Any, Iterable, Sequence
 
 try:
     import yaml
-except Exception as exc:  # pragma: no cover - import error is environment-specific
+except Exception as exc:
     raise RuntimeError("PyYAML is required to read hparams.yaml") from exc
 
 from .config import GDAConfig
@@ -55,7 +47,6 @@ def _load_yaml(path: Path) -> dict[str, Any]:
 
 def _to_float(value: Any) -> float | None:
     import torch
-
     if value is None:
         return None
     if isinstance(value, (int, float)):
@@ -111,31 +102,27 @@ def _resolve_checkpoint(run_dir: Path, explicit_ckpt: str | None = None) -> Path
     fallback: list[tuple[int, Path]] = []
     for ckpt in ckpts:
         try:
+            import torch
             payload = torch.load(ckpt, map_location="cpu", weights_only=False)
         except Exception as exc:
             log.warning("Could not inspect checkpoint %s: %s", ckpt.name, exc)
             fallback.append((0, ckpt))
             continue
-
         scores = list(_iter_checkpoint_scores(payload))
         if scores:
             scored.append((min(scores), ckpt))
             continue
-
         fallback.append((int(payload.get("global_step", 0)), ckpt))
 
     if scored:
         return min(scored, key=lambda item: item[0])[1]
-
     if fallback:
         return max(fallback, key=lambda item: item[0])[1]
-
     return ckpts[-1]
 
 
 def _build_config(run_dir: Path) -> GDAConfig:
     from mopadi.configs.choices import ModelName
-
     hparams_path = run_dir / "hparams.yaml"
     if not hparams_path.exists():
         raise FileNotFoundError(f"Missing hparams.yaml in {run_dir}")
@@ -145,34 +132,23 @@ def _build_config(run_dir: Path) -> GDAConfig:
     return conf
 
 
-def _infer_model_kind(state_dict: dict[str, Any]) -> str:
-    keys = state_dict.keys()
-    if any(key.startswith(("adapter.", "genomic_encoder.", "_ema_adapter.", "_ema_genomic_encoder.")) for key in keys):
-        return "gda"
-    return "cfg_backbone"
-
-
-def _load_model(conf: GDAConfig, ckpt_path: Path) -> tuple[nn.Module, str]:
+def _load_model(conf: GDAConfig, ckpt_path: Path):
     import torch
-
     from .cfg_model import CfgBackboneLitModel
-    from .model import GDALitModel
 
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = payload.get("state_dict", payload)
     if not isinstance(state_dict, dict):
         raise ValueError(f"Unsupported checkpoint structure in {ckpt_path}")
 
-    model_kind = _infer_model_kind(state_dict)
-    model_cls = GDALitModel if model_kind == "gda" else CfgBackboneLitModel
-    model = model_cls(conf)
+    model = CfgBackboneLitModel(conf)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
         log.info("Loaded %s with %d missing keys", ckpt_path.name, len(missing))
     if unexpected:
         log.info("Loaded %s with %d unexpected keys", ckpt_path.name, len(unexpected))
     model.eval()
-    return model, model_kind
+    return model, "cfg_backbone"
 
 
 def _normalise_subtype(value: str) -> str:
@@ -185,45 +161,28 @@ def _match_subtype(subtype: str, wanted: Sequence[str]) -> bool:
 
 
 def _select_patients(
-    dataset: ZipTilesWithGenomicFeatures,
+    dataset: Any,
     wanted_subtypes: Sequence[str],
     n_per_subtype: int,
     seed: int,
 ) -> list[tuple[str, str]]:
     rng = random.Random(seed)
-    patient_ids: dict[str, str] = {}
+    by_subtype: dict[str, list[str]] = {}
     for pid, subtype in dataset._subtype_map.items():
         if _match_subtype(subtype, wanted_subtypes):
-            patient_ids[pid] = subtype
+            by_subtype.setdefault(subtype, []).append(pid)
 
     selected: list[tuple[str, str]] = []
-    by_subtype: dict[str, list[str]] = {}
-    for pid, subtype in patient_ids.items():
-        by_subtype.setdefault(subtype, []).append(pid)
-
     for subtype, pids in sorted(by_subtype.items()):
-        if not pids:
-            continue
-        if len(pids) <= n_per_subtype:
-            chosen = list(pids)
-        else:
-            chosen = rng.sample(pids, n_per_subtype)
+        chosen = pids if len(pids) <= n_per_subtype else rng.sample(pids, n_per_subtype)
         for pid in chosen:
             selected.append((pid, subtype))
-
     return selected
 
 
-def _sample_cfg_backbone_pair(
-    model: Any,
-    feats: torch.Tensor,
-    guidance_scale: float,
-    n_steps: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
+def _sample_cfg_backbone_pair(model, feats, guidance_scale, n_steps, device):
     import torch
     import torch.nn as nn
-
     from mopadi.diffusion.base import DummyReturn
 
     backbone = model.ema_model
@@ -238,7 +197,6 @@ def _sample_cfg_backbone_pair(
             def __init__(self) -> None:
                 super().__init__()
                 self._bb = backbone
-
             def forward(self, x, t, **kw):
                 t_sc = sampler._scale_timesteps(t)
                 eps_null = backbone.forward(x=x, t=t_sc, x_start=None, cond=zeros).pred
@@ -246,81 +204,35 @@ def _sample_cfg_backbone_pair(
                     return DummyReturn(pred=eps_null)
                 eps_cond = backbone.forward(x=x, t=t_sc, x_start=None, cond=feats).pred
                 return DummyReturn(pred=eps_null + scale * (eps_cond - eps_null))
-
         return _Wrapped()
 
-    uncond = sampler.sample(
-        model=make_model(0.0),
-        shape=noise.shape,
-        noise=noise,
-        model_kwargs={},
-        progress=False,
-    )
-    cond = sampler.sample(
-        model=make_model(guidance_scale),
-        shape=noise.shape,
-        noise=noise,
-        model_kwargs={},
-        progress=False,
-    )
+    uncond = sampler.sample(model=make_model(0.0), shape=noise.shape, noise=noise, model_kwargs={}, progress=False)
+    cond   = sampler.sample(model=make_model(guidance_scale), shape=noise.shape, noise=noise, model_kwargs={}, progress=False)
     return uncond, cond
 
 
-def _sample_pair(
-    model: nn.Module,
-    feats: torch.Tensor,
-    guidance_scale: float,
-    n_steps: int,
-    device: torch.device,
-) -> tuple[torch.Tensor, torch.Tensor]:
-    import torch
-    from .cfg_model import CfgBackboneLitModel
-
-    if hasattr(model, "sample_conditional"):
-        uncond = model.sample_conditional(
-            genomic_feats=feats.view(1, -1),
-            guidance_scale=0.0,
-            n_steps=n_steps,
-            device=str(device),
-            use_ema=True,
-        )
-        cond = model.sample_conditional(
-            genomic_feats=feats.view(1, -1),
-            guidance_scale=guidance_scale,
-            n_steps=n_steps,
-            device=str(device),
-            use_ema=True,
-        )
-        return uncond, cond
-
-    if isinstance(model, CfgBackboneLitModel):
-        return _sample_cfg_backbone_pair(model, feats, guidance_scale, n_steps, device)
-
-    raise TypeError(f"Unsupported model type: {type(model)!r}")
-
-
-def _save_pair_image(uncond: torch.Tensor, cond: torch.Tensor, out_path: Path) -> None:
+def _save_pair_image(uncond, cond, out_path: Path) -> None:
     import torch
     from torchvision.utils import make_grid, save_image
-
     pair = torch.cat([uncond, cond], dim=0)
     grid = make_grid(pair, nrow=2, normalize=True, value_range=(-1, 1), padding=4)
     save_image(grid, out_path)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate conditional diffusion samples for BRCA and LIHC patients.")
-    parser.add_argument("--run-dir", type=Path, required=True, help="Run directory containing hparams.yaml and autoenc/.")
-    parser.add_argument("--checkpoint", type=str, default=None, help="Optional checkpoint path relative to run-dir or absolute path.")
-    parser.add_argument("--output-dir", type=Path, default=None, help="Directory to write generated tiles.")
-    parser.add_argument("--n-per-subtype", type=int, default=2, help="Number of patients to sample per requested subtype.")
-    parser.add_argument("--subtypes", nargs="*", default=["BRCA", "LIHC"], help="Subtype substrings to match, e.g. BRCA LIHC.")
-    parser.add_argument("--guidance-scale", type=float, default=5.0, help="CFG guidance scale for conditioned samples.")
-    parser.add_argument("--steps", type=int, default=20, help="DDIM steps used for sampling.")
-    parser.add_argument("--seed", type=int, default=42, help="Random seed for patient selection and noise.")
-    parser.add_argument("--split", type=str, default="all", choices=["train", "val", "test", "all"], help="Dataset split to use when selecting patients.")
-    parser.add_argument("--device", type=str, default=None, help="Override device, e.g. cuda or cpu.")
-    parser.add_argument("--verbose", action="store_true", help="Enable INFO-level logging.")
+    parser = argparse.ArgumentParser(description="Generate conditional diffusion samples.")
+    parser.add_argument("--run-dir", type=Path, required=True)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--output-dir", type=Path, default=None)
+    parser.add_argument("--n-per-subtype", type=int, default=2)
+    parser.add_argument("--n-tiles", type=int, default=1, help="Tiles to sample per patient")
+    parser.add_argument("--subtypes", nargs="*", default=["BRCA", "LIHC"])
+    parser.add_argument("--guidance-scale", type=float, default=5.0)
+    parser.add_argument("--steps", type=int, default=20)
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--split", type=str, default="all", choices=["train", "val", "test", "all"])
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -350,14 +262,12 @@ def main() -> None:
 
     print(f"[4/4] loading genomic features and selecting patients on {device}", flush=True)
 
-    # Load splits + subtype map directly from JSON — avoids scanning 1000+ zip files.
     splits_raw, subtype_map = _load_splits_and_subtypes(conf.patient_splits_path)
     if args.split == "all":
         eligible = set(splits_raw.keys())
     else:
         eligible = {pid for pid, fold in splits_raw.items() if fold == args.split}
 
-    # Build genomic cache only for patients that match the requested subtypes and split.
     wanted_norm = [s.strip().lower() for s in args.subtypes]
     candidates = {
         pid for pid in eligible
@@ -367,14 +277,12 @@ def main() -> None:
     if missing:
         print(f"  warning: {len(missing)} patients have no H5 file, skipping them", flush=True)
 
-    # Reconstruct a minimal dataset-like namespace for _select_patients.
     class _FakeDataset:
         def __init__(self):
-            self._subtype_map = subtype_map
+            self._subtype_map = {pid: st for pid, st in subtype_map.items() if pid in eligible}
     fake_ds = _FakeDataset()
 
     selected = _select_patients(fake_ds, args.subtypes, args.n_per_subtype, args.seed)
-    # Drop any patient whose genomic features could not be loaded.
     selected = [(pid, st) for pid, st in selected if pid in genomic_cache]
     if not selected:
         raise RuntimeError(f"No patients matched subtypes {args.subtypes!r} in split '{args.split}'")
@@ -383,65 +291,50 @@ def main() -> None:
     manifest: list[dict[str, Any]] = []
 
     for index, (pid, subtype) in enumerate(selected):
-        print(f"sampling {index + 1}/{len(selected)}: {subtype} {pid}", flush=True)
+        print(f"sampling {index + 1}/{len(selected)}: {subtype} {pid} ({args.n_tiles} tile(s))", flush=True)
         feats = genomic_cache[pid].clone().to(dtype=torch.float32)
-        tile_path = None  # tile paths not enumerated (avoids zip scan)
-
-        noise_seed = args.seed + index * 1000
-        torch.manual_seed(noise_seed)
-        if torch.cuda.is_available():
-            torch.cuda.manual_seed_all(noise_seed)
-
-        uncond, cond = _sample_pair(
-            model=model,
-            feats=feats,
-            guidance_scale=args.guidance_scale,
-            n_steps=args.steps,
-            device=device,
-        )
-
         safe_subtype = subtype.replace("/", "_")
         safe_pid = pid.replace("/", "_")
-        pair_path = output_dir / f"{safe_subtype}__{safe_pid}__pair.png"
-        uncond_path = output_dir / f"{safe_subtype}__{safe_pid}__uncond.png"
-        cond_path = output_dir / f"{safe_subtype}__{safe_pid}__cond.png"
 
-        _save_pair_image(uncond, cond, pair_path)
-        save_image(uncond.clamp(-1, 1), uncond_path, normalize=True, value_range=(-1, 1))
-        save_image(cond.clamp(-1, 1), cond_path, normalize=True, value_range=(-1, 1))
+        for tile_idx in range(args.n_tiles):
+            noise_seed = args.seed + index * 1000 + tile_idx
+            torch.manual_seed(noise_seed)
+            if torch.cuda.is_available():
+                torch.cuda.manual_seed_all(noise_seed)
 
-        manifest.append(
-            {
-                "patient_id": pid,
-                "subtype": subtype,
-                "tile_path": tile_path,
-                "checkpoint": str(ckpt_path),
-                "model_kind": model_kind,
+            uncond, cond = _sample_cfg_backbone_pair(model, feats, args.guidance_scale, args.steps, device)
+
+            suffix = f"__{tile_idx:02d}" if args.n_tiles > 1 else ""
+            pair_path   = output_dir / f"{safe_subtype}__{safe_pid}{suffix}__pair.png"
+            uncond_path = output_dir / f"{safe_subtype}__{safe_pid}{suffix}__uncond.png"
+            cond_path   = output_dir / f"{safe_subtype}__{safe_pid}{suffix}__cond.png"
+
+            _save_pair_image(uncond, cond, pair_path)
+            save_image(uncond.clamp(-1, 1), uncond_path, normalize=True, value_range=(-1, 1))
+            save_image(cond.clamp(-1, 1), cond_path, normalize=True, value_range=(-1, 1))
+
+            manifest.append({
+                "patient_id": pid, "subtype": subtype, "tile_idx": tile_idx,
+                "checkpoint": str(ckpt_path), "model_kind": model_kind,
                 "noise_seed": noise_seed,
-                "pair_path": str(pair_path),
-                "uncond_path": str(uncond_path),
-                "cond_path": str(cond_path),
-            }
-        )
+                "pair_path": str(pair_path), "uncond_path": str(uncond_path), "cond_path": str(cond_path),
+            })
+
+    import enum
+    def _json_default(obj: Any) -> Any:
+        if isinstance(obj, enum.Enum):
+            return obj.value
+        raise TypeError(f"Object of type {type(obj).__name__} is not JSON serializable")
 
     manifest_path = output_dir / "manifest.json"
     with manifest_path.open("w", encoding="utf-8") as f:
-        json.dump(
-            {
-                "run_dir": str(run_dir),
-                "checkpoint": str(ckpt_path),
-                "model_kind": model_kind,
-                "guidance_scale": args.guidance_scale,
-                "steps": args.steps,
-                "seed": args.seed,
-                "split": args.split,
-                "subtypes": list(args.subtypes),
-                "selected": manifest,
-                "config": asdict(conf),
-            },
-            f,
-            indent=2,
-        )
+        json.dump({
+            "run_dir": str(run_dir), "checkpoint": str(ckpt_path),
+            "model_kind": model_kind, "guidance_scale": args.guidance_scale,
+            "steps": args.steps, "seed": args.seed, "split": args.split,
+            "subtypes": list(args.subtypes), "selected": manifest,
+            "config": asdict(conf),
+        }, f, indent=2, default=_json_default)
 
     print(f"Wrote {len(manifest)} patient pairs to {output_dir}")
     print(f"Manifest: {manifest_path}")
