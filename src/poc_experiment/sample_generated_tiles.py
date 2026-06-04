@@ -141,6 +141,10 @@ def _load_model(conf: GDAConfig, ckpt_path: Path):
     if not isinstance(state_dict, dict):
         raise ValueError(f"Unsupported checkpoint structure in {ckpt_path}")
 
+    # backbone_ckpt_path in hparams.yaml points to the warm-start predecessor run.
+    # We are loading a full checkpoint state dict below, so the warm-start load in
+    # __init__ would be wasted (and slow — the file is ~20 GB).  Clear it first.
+    conf.backbone_ckpt_path = None
     model = CfgBackboneLitModel(conf)
     missing, unexpected = model.load_state_dict(state_dict, strict=False)
     if missing:
@@ -273,9 +277,32 @@ def main() -> None:
         pid for pid in eligible
         if any(tok in subtype_map.get(pid, "").lower() for tok in wanted_norm)
     }
-    genomic_cache, missing = _build_genomic_cache(candidates, conf.genomic_feature_dir)
-    if missing:
-        print(f"  warning: {len(missing)} patients have no H5 file, skipping them", flush=True)
+
+    conditioning_type = getattr(conf, "conditioning_type", "real")
+    feat_dim = conf.feat_dim
+
+    if conditioning_type == "real":
+        genomic_cache, missing = _build_genomic_cache(candidates, conf.genomic_feature_dir)
+        if missing:
+            print(f"  warning: {len(missing)} patients have no H5 file, skipping them", flush=True)
+    else:
+        # Synthetic conditioning: build the same fixed vectors the dataset would return.
+        import torch
+        from .dataset import _ONEHOT_COHORT_INDEX
+        genomic_cache = {}
+        for pid in candidates:
+            subtype = subtype_map.get(pid, "unknown")
+            if conditioning_type == "zeros":
+                genomic_cache[pid] = torch.zeros(feat_dim)
+            elif conditioning_type == "noise":
+                v = torch.randn(feat_dim)
+                genomic_cache[pid] = v / v.norm().clamp(min=1e-8)
+            elif conditioning_type == "one_hot":
+                if subtype not in _ONEHOT_COHORT_INDEX:
+                    raise KeyError(f"one_hot: unknown subtype '{subtype}'")
+                v = torch.zeros(feat_dim)
+                v[_ONEHOT_COHORT_INDEX[subtype]] = 1.0
+                genomic_cache[pid] = v
 
     class _FakeDataset:
         def __init__(self):
@@ -292,7 +319,9 @@ def main() -> None:
 
     for index, (pid, subtype) in enumerate(selected):
         print(f"sampling {index + 1}/{len(selected)}: {subtype} {pid} ({args.n_tiles} tile(s))", flush=True)
+        import torch.nn.functional as F
         feats = genomic_cache[pid].clone().to(dtype=torch.float32)
+        feats = F.normalize(feats, p=2, dim=-1)   # must match training_step normalisation
         safe_subtype = subtype.replace("/", "_")
         safe_pid = pid.replace("/", "_")
 

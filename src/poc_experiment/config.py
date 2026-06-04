@@ -28,6 +28,10 @@ class GDAConfig(TrainConfig):
     # with integer val_check_interval in 2.5.x).
     val_limit_batches: int = 100
 
+    # Sample image logging cadence. Keep this much slower than validation so
+    # the samples directory does not fill up during fast runs.
+    sample_every_samples: int = 250_000
+
     # ── Image pre-processing ──────────────────────────────────────────────
     do_normalize: bool = True
     do_resize: bool = False
@@ -38,6 +42,13 @@ class GDAConfig(TrainConfig):
     adapter_token_dim: int = 256
     adapter_t_dim: int = 256
     adapter_n_heads: int = 4
+
+    # ── Conditioning type ─────────────────────────────────────────────────
+    # "real"    — RNA-seq from H5 files (requires genomic_feature_dir)
+    # "zeros"   — 512-dim zero vector (unconditional baseline)
+    # "noise"   — fresh unit-sphere random vector per sample (random baseline)
+    # "one_hot" — fixed orthogonal unit vector per cohort (BRCA→e₁, LIHC→e₂)
+    conditioning_type: str = "real"
 
     # ── CFG ───────────────────────────────────────────────────────────────
     cfg_dropout: float = 0.15

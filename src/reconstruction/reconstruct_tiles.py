@@ -513,6 +513,12 @@ def _detect_joint_variant(hp: dict, joint_cfg: dict) -> str:
 
 def _resolve_joint_model_class(variant: str):
     """Resolve Lightning model class for a given joint-training variant."""
+    # Models that live under src/drafts/ need that directory on sys.path so their
+    # internal relative imports (e.g. gene_token_transformer_joint_training) resolve.
+    import sys as _sys
+    _drafts = str(Path(__file__).resolve().parents[2] / "src" / "drafts")
+    if _drafts not in _sys.path:
+        _sys.path.insert(0, _drafts)
     if variant == "joint_training":
         try:
             from src.joint_training.model import JointLitModel  # type: ignore[import-not-found]
@@ -531,14 +537,20 @@ def _resolve_joint_model_class(variant: str):
         try:
             from src.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
         except ImportError:
-            from ..gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
+            try:
+                from ..gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
+            except ImportError:
+                from src.drafts.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel  # type: ignore[import-not-found]
         return GeneTokenTransformerJointLitModel
 
     if variant == "gene_token_cross_attention_joint_training":
         try:
             from src.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
         except ImportError:
-            from ..gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
+            try:
+                from ..gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
+            except ImportError:
+                from src.drafts.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel  # type: ignore[import-not-found]
         return GeneTokenCrossAttentionJointLitModel
 
     raise ValueError(

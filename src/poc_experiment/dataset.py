@@ -20,6 +20,7 @@ from typing import Dict, List, Optional, Set
 import h5py
 import numpy as np
 import torch
+import torch.nn.functional as F
 
 from mopadi.dataset import DefaultTilesDataset
 
@@ -68,21 +69,62 @@ def find_genomic_h5(patient_id: str, genomic_h5_dir: str) -> Optional[str]:
 # Dataset
 # ---------------------------------------------------------------------------
 
+_ONEHOT_COHORT_INDEX = {
+    "TCGA-BRCA": 0,
+    "TCGA-LIHC": 1,
+}
+
+
+def _make_orthogonal_binary_codes(feat_dim: int) -> Dict[str, torch.Tensor]:
+    """Return two unit-norm complementary binary codes for BRCA and LIHC."""
+    if feat_dim < 2:
+        raise ValueError(f"feat_dim must be at least 2, got {feat_dim}")
+    if feat_dim % 2 != 0:
+        raise ValueError(
+            f"feat_dim must be even for alternating orthogonal codes, got {feat_dim}"
+        )
+
+    brca = torch.zeros(feat_dim, dtype=torch.float32)
+    lihc = torch.zeros(feat_dim, dtype=torch.float32)
+    brca[1::2] = 1.0
+    lihc[0::2] = 1.0
+
+    brca = F.normalize(brca, p=2, dim=-1)
+    lihc = F.normalize(lihc, p=2, dim=-1)
+
+    dot = torch.dot(brca, lihc).item()
+    log.info(
+        "Synthetic one_hot conditioning uses alternating binary codes: "
+        "BRCA=0101..., LIHC=1010..., dot=%.1f, norms=(%.1f, %.1f), feat_dim=%d",
+        dot, float(brca.norm().item()), float(lihc.norm().item()), feat_dim,
+    )
+    return {
+        "TCGA-BRCA": brca,
+        "TCGA-LIHC": lihc,
+    }
+
+
 class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     """Pairs ZIP-archived tile images with patient-level genomic conditioning vectors.
 
     Each ``__getitem__`` returns a dict with keys:
       ``img``      — (3, H, W) float32 in [-1, 1]
-      ``feat``     — (n_genes,) float32 normalised gene expression
+      ``feat``     — (feat_dim,) float32 conditioning vector
       ``coords``   — (2,) tile coordinates (from parent)
       ``filename`` — str tile path (from parent)
       ``subtype``  — str subtype/cohort label (for balanced sampling only)
+
+    conditioning_type controls what ``feat`` contains:
+      ``"real"``    — log1p+StandardScaler normalised RNA-seq from H5 files (requires genomic_h5_dir)
+      ``"zeros"``   — zero vector of length feat_dim
+      ``"noise"``   — fresh unit-sphere random vector each call (different per sample)
+      ``"one_hot"`` — fixed orthogonal unit vector indexed by cohort (BRCA→e₁, LIHC→e₂)
     """
 
     def __init__(
         self,
         zip_dir: str,
-        genomic_h5_dir: str,
+        genomic_h5_dir: Optional[str],
         patient_splits_path: str,
         split: str = "train",
         max_tiles_by_subtype: Optional[Dict[str, Optional[int]]] = None,
@@ -91,9 +133,18 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         do_resize: bool = False,
         do_normalize: bool = True,
         cache_pickle_tiles_path: Optional[str] = None,
+        conditioning_type: str = "real",
+        feat_dim: int = 512,
     ):
         if split not in {"train", "val", "test", "all"}:
             raise ValueError(f"split must be one of train/val/test/all, got '{split}'")
+        if conditioning_type not in {"real", "zeros", "noise", "one_hot"}:
+            raise ValueError(f"conditioning_type must be real/zeros/noise/one_hot, got '{conditioning_type}'")
+        if conditioning_type == "real" and genomic_h5_dir is None:
+            raise ValueError("genomic_h5_dir is required when conditioning_type='real'")
+
+        self._conditioning_type = conditioning_type
+        self._feat_dim = feat_dim
 
         self._splits, self._subtype_map = _load_splits_and_subtypes(patient_splits_path)
         if split == "all":
@@ -106,6 +157,7 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         log.info("ZipTilesWithGenomicFeatures: split='%s', %d patients", split, len(self._split_patients))
 
         self._img_size = img_size
+        self._orthogonal_codes: Optional[Dict[str, torch.Tensor]] = None
         super().__init__(
             root_dirs=[zip_dir],
             split="none",
@@ -135,26 +187,31 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
             log.info("After tile capping: %d tiles", len(self.tile_paths))
 
         unique_patients = {patient_id_from_tile_path(p) for p in self.tile_paths}
-        self._genomic_cache, missing = _build_genomic_cache(unique_patients, genomic_h5_dir)
-
-        if missing:
-            warnings.warn(
-                f"{len(missing)} patients have no matching H5 file and will be excluded: "
-                f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}",
-                UserWarning,
-                stacklevel=2,
-            )
-            self.tile_paths = [
-                p for p in self.tile_paths
-                if patient_id_from_tile_path(p) not in missing
-            ]
-            log.info("After removing patients with no H5: %d tiles remain", len(self.tile_paths))
+        if conditioning_type == "real":
+            self._genomic_cache, missing = _build_genomic_cache(unique_patients, genomic_h5_dir)
+            if missing:
+                warnings.warn(
+                    f"{len(missing)} patients have no matching H5 file and will be excluded: "
+                    f"{sorted(missing)[:10]}{'...' if len(missing) > 10 else ''}",
+                    UserWarning,
+                    stacklevel=2,
+                )
+                self.tile_paths = [
+                    p for p in self.tile_paths
+                    if patient_id_from_tile_path(p) not in missing
+                ]
+                log.info("After removing patients with no H5: %d tiles remain", len(self.tile_paths))
+        else:
+            self._genomic_cache = {}
+            self._orthogonal_codes = _make_orthogonal_binary_codes(feat_dim) if conditioning_type == "one_hot" else None
+            log.info("Synthetic conditioning ('%s'): skipping H5 loading", conditioning_type)
 
         log.info(
-            "Dataset ready: %d tiles, %d patients, %d genes",
+            "Dataset ready: %d tiles, %d patients, conditioning='%s' feat_dim=%d",
             len(self.tile_paths),
-            len(self._genomic_cache),
-            next(iter(self._genomic_cache.values())).shape[0] if self._genomic_cache else 0,
+            len(unique_patients),
+            conditioning_type,
+            feat_dim,
         )
 
     def __getitem__(self, index: int) -> Dict:
@@ -174,8 +231,25 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         if item is None:
             raise RuntimeError(f"All {len(self.tile_paths)} tiles are corrupt or wrong size starting at index {index}")
         pid = patient_id_from_tile_path(item["filename"])
-        item["feat"] = self._genomic_cache[pid]
         item["subtype"] = self._subtype_map.get(pid, "unknown")
+
+        if self._conditioning_type == "real":
+            item["feat"] = self._genomic_cache[pid]
+        elif self._conditioning_type == "zeros":
+            item["feat"] = torch.zeros(self._feat_dim)
+        elif self._conditioning_type == "noise":
+            # Fresh unit-sphere random vector every call — no consistent signal by design.
+            v = torch.randn(self._feat_dim)
+            item["feat"] = v / v.norm().clamp(min=1e-8)
+        elif self._conditioning_type == "one_hot":
+            subtype = item["subtype"]
+            if self._orthogonal_codes is None or subtype not in self._orthogonal_codes:
+                known = list(self._orthogonal_codes.keys()) if self._orthogonal_codes is not None else list(_ONEHOT_COHORT_INDEX.keys())
+                raise KeyError(
+                    f"one_hot conditioning: unknown subtype '{subtype}'. "
+                    f"Known: {known}"
+                )
+            item["feat"] = self._orthogonal_codes[subtype].clone()
         return item
 
 

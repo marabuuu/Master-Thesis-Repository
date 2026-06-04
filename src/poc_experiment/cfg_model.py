@@ -26,8 +26,10 @@ Health metric:
 from __future__ import annotations
 
 import logging
+import random
 from pathlib import Path
 
+from collections import defaultdict
 import numpy as np
 import torch
 from typing import Any, cast
@@ -41,6 +43,48 @@ from .config import GDAConfig
 from .dataset import ZipTilesWithGenomicFeatures, patient_id_from_tile_path
 
 log = logging.getLogger(__name__)
+
+
+def _stratified_subset_indices(
+    tile_paths: list[str],
+    subtype_map: dict[str, str],
+    limit: int,
+    seed: int,
+) -> list[int]:
+    """Select a deterministic mixed subset of tile indices across subtypes."""
+    by_subtype: dict[str, list[int]] = defaultdict(list)
+    for idx, tile_path in enumerate(tile_paths):
+        pid = patient_id_from_tile_path(tile_path)
+        by_subtype[subtype_map.get(pid, "unknown")].append(idx)
+
+    groups = [indices for subtype, indices in sorted(by_subtype.items()) if subtype != "unknown"]
+    if not groups:
+        return list(range(min(limit, len(tile_paths))))
+
+    rng = random.Random(seed)
+    for indices in groups:
+        rng.shuffle(indices)
+
+    selected: list[int] = []
+    cursor = 0
+    while len(selected) < limit:
+        progressed = False
+        for indices in groups:
+            if cursor < len(indices):
+                selected.append(indices[cursor])
+                progressed = True
+                if len(selected) >= limit:
+                    break
+        if not progressed:
+            break
+        cursor += 1
+
+    if len(selected) < limit:
+        remaining = [idx for indices in groups for idx in indices[cursor:]]
+        rng.shuffle(remaining)
+        selected.extend(remaining[: limit - len(selected)])
+
+    return sorted(selected[:limit])
 
 
 class CfgBackboneLitModel(LitModel):
@@ -164,6 +208,8 @@ class CfgBackboneLitModel(LitModel):
             img_size=self.conf.img_size,
             do_resize=self.conf.do_resize,
             do_normalize=self.conf.do_normalize,
+            conditioning_type=self.conf.conditioning_type,
+            feat_dim=self.conf.feat_dim,
         )
         self.train_data = ZipTilesWithGenomicFeatures(split="train", **kwargs)
         self.val_data   = ZipTilesWithGenomicFeatures(split="val",   **kwargs)
@@ -199,10 +245,16 @@ class CfgBackboneLitModel(LitModel):
     def val_dataloader(self):
         import torch.utils.data as tud
         limit = self.conf.val_limit_batches * self.conf.batch_size
-        dataset = (
-            tud.Subset(self.val_data, list(range(limit)))
-            if len(self.val_data) > limit else self.val_data
-        )
+        if len(self.val_data) > limit:
+            indices = _stratified_subset_indices(
+                tile_paths=self.val_data.tile_paths,
+                subtype_map=self.val_data._subtype_map,
+                limit=limit,
+                seed=self.conf.seed,
+            )
+            dataset = tud.Subset(self.val_data, indices)
+        else:
+            dataset = self.val_data
         conf = self.conf.clone()
         conf.batch_size = self.batch_size
         return conf.make_loader(dataset, shuffle=False, drop_last=False)
@@ -270,7 +322,10 @@ class CfgBackboneLitModel(LitModel):
                 eps_n = self.model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=zeros).pred
                 self.logger.experiment.add_scalar("cond/signal", (eps_c - eps_n).pow(2).mean().item(), self.num_samples)
 
-        _si_interval = self.conf.reconstruct_every_samples
+        _si_interval = max(
+            self.conf.reconstruct_every_samples,
+            getattr(self.conf, "sample_every_samples", self.conf.reconstruct_every_samples),
+        )
         if self.trainer.is_global_zero and (self.num_samples % _si_interval < self.conf.batch_size):
             self._log_sample_images(imgs.detach(), feats.detach())
 

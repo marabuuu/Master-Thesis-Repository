@@ -285,6 +285,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'poc_brca_lihc_cfg_v2_dgx' section in config.yaml")
         run_cfg_training(config["poc_brca_lihc_cfg_v2_dgx"], verbose=verbose)
 
+    elif stage in ("poc_128_1hot", "poc_128_zero", "poc_128_noise", "poc_128_rna"):
+        from src.poc_experiment.run_cfg_training import run_cfg_training
+        if stage not in config:
+            raise ValueError(f"No '{stage}' section in config.yaml")
+        run_cfg_training(config[stage], verbose=verbose)
+
     elif stage == "virchow2_umap":
         from src.visualization.virchow2_umap import run_virchow2_umap
         if "virchow2_umap" not in config:
@@ -338,7 +344,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "virchow2_umap", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_zero", "poc_128_noise", "poc_128_rna", "virchow2_umap", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

@@ -93,13 +93,17 @@ def _validate_cohort_coverage(
 
 
 def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
-    for key in ("zip_dir", "genomic_feature_dir", "patient_splits_path"):
+    conditioning_type = cfg.get("conditioning_type", "real")
+    for key in ("zip_dir", "patient_splits_path"):
         if not cfg.get(key):
             raise ValueError(f"Missing required key '{key}' in config.")
     if not Path(cfg["patient_splits_path"]).exists():
         raise FileNotFoundError(f"patient_splits_path not found: {cfg['patient_splits_path']}")
-    if not Path(cfg["genomic_feature_dir"]).is_dir():
-        raise FileNotFoundError(f"genomic_feature_dir not found: {cfg['genomic_feature_dir']}")
+    if conditioning_type == "real":
+        if not cfg.get("genomic_feature_dir"):
+            raise ValueError("genomic_feature_dir is required when conditioning_type='real'")
+        if not Path(cfg["genomic_feature_dir"]).is_dir():
+            raise FileNotFoundError(f"genomic_feature_dir not found: {cfg['genomic_feature_dir']}")
 
     model_cfg = cfg.get("model", {})
 
@@ -147,10 +151,12 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         steps_per_epoch=int(_get("steps_per_epoch", 5_000)),
         save_every_samples=int(_get("save_every_samples", 200_000)),
         reconstruct_every_samples=int(_get("reconstruct_every_samples", 50_000)),
+        sample_every_samples=int(_get("sample_every_samples", 250_000)),
         sample_size=int(_get("sample_size", 16)),
         zip_dir=cfg["zip_dir"],
-        genomic_feature_dir=cfg["genomic_feature_dir"],
+        genomic_feature_dir=cfg.get("genomic_feature_dir"),
         patient_splits_path=cfg["patient_splits_path"],
+        conditioning_type=conditioning_type,
         max_tiles_by_subtype=cfg.get("max_tiles_by_subtype"),
         tile_sampling_seed=int(cfg.get("tile_sampling_seed", 42)),
         do_normalize=bool(cfg.get("do_normalize", True)),
