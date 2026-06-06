@@ -75,8 +75,19 @@ _ONEHOT_COHORT_INDEX = {
 }
 
 
-def _make_orthogonal_binary_codes(feat_dim: int) -> Dict[str, torch.Tensor]:
-    """Return two unit-norm complementary binary codes for BRCA and LIHC."""
+# Fixed cohort → integer index for class_embed conditioning.
+# Order must match nn.Embedding indices in CfgBackboneLitModel.
+COHORT_INDEX: Dict[str, int] = {"TCGA-BRCA": 0, "TCGA-LIHC": 1}
+
+
+def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict[str, torch.Tensor]:
+    """Return two complementary binary codes for BRCA and LIHC.
+
+    With normalize=True (default) both codes are L2-normalised to unit norm.
+    With normalize=False they retain their natural magnitude (norm = sqrt(feat_dim/2)
+    ≈ 16 for feat_dim=512), giving a stronger raw conditioning signal into the
+    style MLP.
+    """
     if feat_dim < 2:
         raise ValueError(f"feat_dim must be at least 2, got {feat_dim}")
     if feat_dim % 2 != 0:
@@ -89,14 +100,15 @@ def _make_orthogonal_binary_codes(feat_dim: int) -> Dict[str, torch.Tensor]:
     brca[1::2] = 1.0
     lihc[0::2] = 1.0
 
-    brca = F.normalize(brca, p=2, dim=-1)
-    lihc = F.normalize(lihc, p=2, dim=-1)
+    if normalize:
+        brca = F.normalize(brca, p=2, dim=-1)
+        lihc = F.normalize(lihc, p=2, dim=-1)
 
     dot = torch.dot(brca, lihc).item()
     log.info(
-        "Synthetic one_hot conditioning uses alternating binary codes: "
-        "BRCA=0101..., LIHC=1010..., dot=%.1f, norms=(%.1f, %.1f), feat_dim=%d",
-        dot, float(brca.norm().item()), float(lihc.norm().item()), feat_dim,
+        "Synthetic one_hot conditioning: BRCA=0101..., LIHC=1010..., "
+        "normalize=%s, dot=%.1f, norms=(%.3f, %.3f), feat_dim=%d",
+        normalize, dot, float(brca.norm().item()), float(lihc.norm().item()), feat_dim,
     )
     return {
         "TCGA-BRCA": brca,
@@ -118,7 +130,9 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
       ``"real"``    — log1p+StandardScaler normalised RNA-seq from H5 files (requires genomic_h5_dir)
       ``"zeros"``   — zero vector of length feat_dim
       ``"noise"``   — fresh unit-sphere random vector each call (different per sample)
-      ``"one_hot"`` — fixed orthogonal unit vector indexed by cohort (BRCA→e₁, LIHC→e₂)
+      ``"one_hot"``     — fixed orthogonal unit vector indexed by cohort (BRCA→e₁, LIHC→e₂)
+      ``"class_embed"`` — integer class index as torch.long tensor of shape (1,);
+                          the model owns the nn.Embedding that maps it to a vector
     """
 
     def __init__(
@@ -135,11 +149,12 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         cache_pickle_tiles_path: Optional[str] = None,
         conditioning_type: str = "real",
         feat_dim: int = 512,
+        normalize_feats: bool = True,
     ):
         if split not in {"train", "val", "test", "all"}:
             raise ValueError(f"split must be one of train/val/test/all, got '{split}'")
-        if conditioning_type not in {"real", "zeros", "noise", "one_hot"}:
-            raise ValueError(f"conditioning_type must be real/zeros/noise/one_hot, got '{conditioning_type}'")
+        if conditioning_type not in {"real", "zeros", "noise", "one_hot", "class_embed"}:
+            raise ValueError(f"conditioning_type must be real/zeros/noise/one_hot/class_embed, got '{conditioning_type}'")
         if conditioning_type == "real" and genomic_h5_dir is None:
             raise ValueError("genomic_h5_dir is required when conditioning_type='real'")
 
@@ -203,7 +218,10 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
                 log.info("After removing patients with no H5: %d tiles remain", len(self.tile_paths))
         else:
             self._genomic_cache = {}
-            self._orthogonal_codes = _make_orthogonal_binary_codes(feat_dim) if conditioning_type == "one_hot" else None
+            self._orthogonal_codes = (
+                _make_orthogonal_binary_codes(feat_dim, normalize=normalize_feats)
+                if conditioning_type == "one_hot" else None
+            )
             log.info("Synthetic conditioning ('%s'): skipping H5 loading", conditioning_type)
 
         log.info(
@@ -241,6 +259,11 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
             # Fresh unit-sphere random vector every call — no consistent signal by design.
             v = torch.randn(self._feat_dim)
             item["feat"] = v / v.norm().clamp(min=1e-8)
+        elif self._conditioning_type == "class_embed":
+            subtype = item["subtype"]
+            if subtype not in COHORT_INDEX:
+                raise KeyError(f"class_embed conditioning: unknown subtype '{subtype}'. Known: {list(COHORT_INDEX)}")
+            item["feat"] = torch.tensor([COHORT_INDEX[subtype]], dtype=torch.long)
         elif self._conditioning_type == "one_hot":
             subtype = item["subtype"]
             if self._orthogonal_codes is None or subtype not in self._orthogonal_codes:

@@ -55,7 +55,8 @@ def main() -> None:
     model.eval()
 
     feat_dim = conf.feat_dim
-    codes = _make_orthogonal_binary_codes(feat_dim)
+    normalize_feats = getattr(conf, "normalize_feats", True)
+    codes = _make_orthogonal_binary_codes(feat_dim, normalize=normalize_feats)
     e1 = codes["TCGA-BRCA"]
     e2 = codes["TCGA-LIHC"]
     print(

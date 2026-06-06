@@ -40,7 +40,7 @@ from mopadi.train_diff_autoenc import LitModel, ema as _ema_fn
 from mopadi.utils.dist_utils import get_world_size
 
 from .config import GDAConfig
-from .dataset import ZipTilesWithGenomicFeatures, patient_id_from_tile_path
+from .dataset import ZipTilesWithGenomicFeatures, patient_id_from_tile_path, _make_orthogonal_binary_codes, COHORT_INDEX
 
 log = logging.getLogger(__name__)
 
@@ -101,6 +101,10 @@ class CfgBackboneLitModel(LitModel):
 
         if conf.backbone_ckpt_path:
             self._load_backbone_weights(conf.backbone_ckpt_path)
+
+        if conf.conditioning_type == "class_embed":
+            self.class_embedding = torch.nn.Embedding(conf.num_classes, conf.feat_dim)
+            log.info("CfgBackboneLitModel: class_embedding (%d × %d)", conf.num_classes, conf.feat_dim)
 
         n_bb = sum(p.numel() for p in self.model.parameters())
         log.info("CfgBackboneLitModel: backbone params=%d", n_bb)
@@ -210,6 +214,7 @@ class CfgBackboneLitModel(LitModel):
             do_normalize=self.conf.do_normalize,
             conditioning_type=self.conf.conditioning_type,
             feat_dim=self.conf.feat_dim,
+            normalize_feats=self.conf.normalize_feats,
         )
         self.train_data = ZipTilesWithGenomicFeatures(split="train", **kwargs)
         self.val_data   = ZipTilesWithGenomicFeatures(split="val",   **kwargs)
@@ -273,6 +278,34 @@ class CfgBackboneLitModel(LitModel):
         return [opt], []
 
     # ------------------------------------------------------------------
+    # Conditioning helpers
+    # ------------------------------------------------------------------
+
+    def _resolve_feats(self, batch: dict) -> torch.Tensor:
+        """Return a (B, feat_dim) float conditioning tensor for this batch.
+
+        For class_embed: looks up the learnable embedding by class index.
+        For all other types: casts the pre-built feat vector to float and
+        optionally L2-normalises it.
+        """
+        if self.conf.conditioning_type == "class_embed":
+            idx = batch["feat"].squeeze(-1).to(self.device, dtype=torch.long)
+            return self.class_embedding(idx)
+        feats = batch["feat"].to(self.device, dtype=torch.float32)
+        if self.conf.normalize_feats:
+            feats = F.normalize(feats, p=2, dim=-1)
+        return feats
+
+    def _class_embed_pair(self, n: int) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (e_brca, e_lihc) embedding vectors expanded to batch size n.
+
+        Used by the brca_lihc_sep diagnostic for class_embed runs.
+        """
+        brca_idx = torch.zeros(n, device=self.device, dtype=torch.long)
+        lihc_idx = torch.ones(n,  device=self.device, dtype=torch.long)
+        return self.class_embedding(brca_idx), self.class_embedding(lihc_idx)
+
+    # ------------------------------------------------------------------
     # Training
     # ------------------------------------------------------------------
 
@@ -281,8 +314,7 @@ class CfgBackboneLitModel(LitModel):
         accum = self.conf.accum_batches
 
         imgs = batch["img"].to(self.device)
-        feats = batch["feat"].to(self.device, dtype=torch.float32)
-        feats = F.normalize(feats, p=2, dim=-1)
+        feats = self._resolve_feats(batch)
         B = imgs.shape[0]
 
         t, _ = self.T_sampler.sample(B, imgs.device)
@@ -290,7 +322,7 @@ class CfgBackboneLitModel(LitModel):
         x_t = self.sampler.q_sample(imgs, t, noise=noise)
         t_scaled = self.sampler._scale_timesteps(t)
 
-        # CFG dropout: replace genomic features with zeros for cfg_dropout% of samples
+        # CFG dropout: replace conditioning with zeros for cfg_dropout% of samples
         null_mask = (torch.rand(B, device=self.device) < self.conf.cfg_dropout)[:, None]
         cond = torch.where(null_mask, torch.zeros_like(feats), feats)
 
@@ -318,9 +350,26 @@ class CfgBackboneLitModel(LitModel):
                 bm = min(16, B)
                 # Reuse the already-sampled x_t and t rather than re-sampling.
                 zeros = torch.zeros(bm, self.conf.feat_dim, device=self.device)
-                eps_c = self.model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=feats[:bm].detach()).pred
-                eps_n = self.model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=zeros).pred
+                eps_c = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=feats[:bm].detach()).pred
+                eps_n = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=zeros).pred
                 self.logger.experiment.add_scalar("cond/signal", (eps_c - eps_n).pow(2).mean().item(), self.num_samples)
+
+                # PoC metric: do BRCA and LIHC get different noise predictions?
+                # Should grow monotonically if the model learns to distinguish cohorts.
+                if self.conf.conditioning_type == "one_hot":
+                    if not hasattr(self, "_diag_codes"):
+                        codes = _make_orthogonal_binary_codes(self.conf.feat_dim, normalize=self.conf.normalize_feats)
+                        self._diag_codes = {k: v.to(self.device) for k, v in codes.items()}
+                    e_brca = self._diag_codes["TCGA-BRCA"].unsqueeze(0).expand(bm, -1)
+                    e_lihc = self._diag_codes["TCGA-LIHC"].unsqueeze(0).expand(bm, -1)
+                    eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
+                    eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
+                    self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
+                elif self.conf.conditioning_type == "class_embed":
+                    e_brca, e_lihc = self._class_embed_pair(bm)
+                    eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
+                    eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
+                    self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
 
         _si_interval = max(
             self.conf.reconstruct_every_samples,
@@ -345,8 +394,7 @@ class CfgBackboneLitModel(LitModel):
 
     def validation_step(self, batch, batch_idx):
         imgs = batch["img"].to(self.device)
-        feats = batch["feat"].to(self.device, dtype=torch.float32)
-        feats = F.normalize(feats, p=2, dim=-1)
+        feats = self._resolve_feats(batch)
         B = imgs.shape[0]
 
         t, _ = self.T_sampler.sample(B, imgs.device)
@@ -355,21 +403,31 @@ class CfgBackboneLitModel(LitModel):
         t_scaled = self.sampler._scale_timesteps(t)
         zeros = torch.zeros(B, self.conf.feat_dim, device=self.device)
 
-        # Cross-cohort shuffle: BRCA tiles get LIHC features and vice versa.
-        # This gives a maximally wrong conditioning signal for the PoC (organ-level
-        # separation), making cond/gap a cleaner signal than within-batch randperm
-        # which can pair BRCA with BRCA (similar genomic profiles → weak mismatch).
         subtypes = batch["subtype"]
-        brca_idx = torch.tensor([i for i, s in enumerate(subtypes) if "BRCA" in s],
-                                 device=self.device)
-        lihc_idx = torch.tensor([i for i, s in enumerate(subtypes) if "LIHC" in s],
-                                 device=self.device)
         cross_feats = feats.clone()
-        if len(brca_idx) > 0 and len(lihc_idx) > 0:
-            cross_feats[brca_idx] = feats[lihc_idx[torch.randint(len(lihc_idx), (len(brca_idx),), device=self.device)]]
-            cross_feats[lihc_idx] = feats[brca_idx[torch.randint(len(brca_idx), (len(lihc_idx),), device=self.device)]]
+        if self.conf.val_swap_basal_luma:
+            # BRCA-only: give Basal tiles LumA features and vice versa.
+            # Maximally wrong for the Basal/LumA contrast — the key diagnostic.
+            basal_idx = torch.tensor([i for i, s in enumerate(subtypes) if s == "Basal"],
+                                     device=self.device)
+            luma_idx  = torch.tensor([i for i, s in enumerate(subtypes) if s == "LumA"],
+                                     device=self.device)
+            if len(basal_idx) > 0 and len(luma_idx) > 0:
+                cross_feats[basal_idx] = feats[luma_idx[torch.randint(len(luma_idx), (len(basal_idx),), device=self.device)]]
+                cross_feats[luma_idx]  = feats[basal_idx[torch.randint(len(basal_idx), (len(luma_idx),), device=self.device)]]
+            else:
+                cross_feats = feats[torch.randperm(B, device=self.device)]
         else:
-            cross_feats = feats[torch.randperm(B, device=self.device)]
+            # PoC (BRCA+LIHC): swap organ-level features for a strong mismatch signal.
+            brca_idx = torch.tensor([i for i, s in enumerate(subtypes) if "BRCA" in s],
+                                     device=self.device)
+            lihc_idx = torch.tensor([i for i, s in enumerate(subtypes) if "LIHC" in s],
+                                     device=self.device)
+            if len(brca_idx) > 0 and len(lihc_idx) > 0:
+                cross_feats[brca_idx] = feats[lihc_idx[torch.randint(len(lihc_idx), (len(brca_idx),), device=self.device)]]
+                cross_feats[lihc_idx] = feats[brca_idx[torch.randint(len(brca_idx), (len(lihc_idx),), device=self.device)]]
+            else:
+                cross_feats = feats[torch.randperm(B, device=self.device)]
 
         with torch.no_grad():
             eps_cond     = self.ema_model.forward(x=x_t, t=t_scaled, x_start=imgs, cond=feats).pred
@@ -409,8 +467,11 @@ class CfgBackboneLitModel(LitModel):
             self._sample_feats = feats[:b].clone().cpu()
 
         imgs_s  = self._sample_imgs.to(self.device)
+        # _sample_feats are already resolved floats (embedding vectors for class_embed,
+        # or raw/normalised genomic vectors for other types). No re-lookup needed.
         feats_s = self._sample_feats.to(self.device, dtype=torch.float32)
-        feats_s = F.normalize(feats_s, p=2, dim=-1)
+        if self.conf.normalize_feats and self.conf.conditioning_type != "class_embed":
+            feats_s = F.normalize(feats_s, p=2, dim=-1)
         b = imgs_s.shape[0]
         zeros = torch.zeros(b, self.conf.feat_dim, device=self.device)
 

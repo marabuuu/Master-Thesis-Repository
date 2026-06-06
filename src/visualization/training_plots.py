@@ -1441,6 +1441,149 @@ def plot_cfg_diagnostics(
 
 
 # ===================================================================
+#  PoC conditioning-mode ablation — four runs overlaid
+# ===================================================================
+
+
+def plot_poc_ablation(
+    logdirs: Dict[str, Union[str, Path]],
+    save_path: Optional[Union[str, Path]] = None,
+    show: bool = True,
+    figsize: Tuple[float, float] = (14, 14),
+    cmap_name: str = CATEGORICAL_CMAP,
+    title: str = "Investigation of Conditioning",
+) -> "Figure":
+    """4 × 3 grid comparing the four PoC conditioning modes.
+
+    Rows (one per conditioning mode) × columns:
+      Col 0 — Train loss (EMA-smoothed, solid) + Validation loss (dashed)
+      Col 1 — Conditioning Signal  E[‖ε_cond − ε_null‖²]  (must grow)
+      Col 2 — Conditioning Gap  L(shuffled) − L(correct)  (must be > 0)
+
+    Axes within each column share their x-axis scale.  Each row is labelled
+    with its conditioning mode name on the left.
+
+    Parameters
+    ----------
+    logdirs : dict[label → path]
+        Ordered mapping of human-readable run label to the TFEvents directory,
+        e.g. ``{"Zero": "…/zero/gda", "1-hot": "…/orthogonal/gda", …}``.
+    """
+    _check_matplotlib()
+    setup_style()
+
+    n_runs = len(logdirs)
+    colors = get_categorical_colors(max(n_runs, 4), cmap_name=cmap_name)
+
+    # Load all runs up front
+    all_data: List[Tuple[str, Dict]] = []
+    for label, logdir in logdirs.items():
+        data = load_gda_tfevents(logdir)
+        all_data.append((label, data))
+
+    # Determine column-level y-range helpers for shared axes
+    # (sharex per column; sharey is intentionally NOT shared — each row may
+    # differ in scale for signal/gap, but loss rows benefit from a common y)
+    fig, axes = plt.subplots(
+        n_runs, 3,
+        figsize=figsize,
+        sharex="col",
+        sharey="col",
+    )
+    # Ensure axes is always 2-D
+    if n_runs == 1:
+        axes = axes[None, :]
+
+    col_titles = [
+        "Train & Validation Loss",
+        "Conditioning Signal\n"
+        r"$\mathbb{E}[\|\hat{\varepsilon}_\mathrm{cond} - \hat{\varepsilon}_\mathrm{null}\|^2]$",
+        "Conditioning Gap\n"
+        r"$\mathcal{L}(\hat{\varepsilon}_\mathrm{shuffled}) - \mathcal{L}(\hat{\varepsilon}_\mathrm{cond})$",
+    ]
+
+    # Collect signal values across runs to decide log-scale
+    all_sig_vals = [
+        v for _, d in all_data
+        for v in d.get("cond/signal", ([], []))[1]
+        if v > 0
+    ]
+    signal_log = bool(all_sig_vals and max(all_sig_vals) / max(min(all_sig_vals), 1e-12) > 20)
+
+    for row, (label, data) in enumerate(all_data):
+        color = colors[row]
+        ax_loss, ax_signal, ax_gap = axes[row]
+
+        # ── Col 0: train + val loss ──────────────────────────────────────
+        train_steps, train_vals = data.get("loss/train", ([], []))
+        val_steps_raw, val_vals_raw = data.get("loss/val", ([], []))
+        if not val_vals_raw:
+            val_steps_raw, val_vals_raw = data.get("loss/val_ckpt", ([], []))
+        val_steps, val_vals = _aggregate_by_step(val_steps_raw, val_vals_raw)
+
+        if train_vals:
+            s_M, v = _ema_series(
+                [s / 1e6 for s in train_steps], list(train_vals), alpha=0.005
+            )
+            ax_loss.plot(s_M, v, linewidth=2.0, color=color, label="Train (smoothed)")
+        if val_vals:
+            ax_loss.plot(
+                [s / 1e6 for s in val_steps], val_vals,
+                linewidth=1.8, linestyle="--", color=color,
+                label="Validation", alpha=0.85,
+            )
+        ax_loss.legend(framealpha=0.9, fontsize=8)
+        ax_loss.set_ylabel("MSE Loss")
+        ax_loss.grid(True, alpha=0.22)
+
+        # ── Col 1: conditioning signal ───────────────────────────────────
+        sig_steps, sig_vals = data.get("cond/signal", ([], []))
+        if sig_vals:
+            ax_signal.plot(
+                [s / 1e6 for s in sig_steps], sig_vals,
+                "-o", markersize=3, linewidth=1.8, color=color,
+            )
+        ax_signal.axhline(0.0, color="grey", linewidth=0.8, alpha=0.4, linestyle="--")
+        ax_signal.set_ylabel("Conditioning Signal")
+        if signal_log:
+            ax_signal.set_yscale("log")
+        ax_signal.grid(True, alpha=0.22)
+
+        # ── Col 2: conditioning gap ──────────────────────────────────────
+        gap_steps_raw, gap_vals_raw = data.get("cond/gap", ([], []))
+        gap_steps, gap_vals = _aggregate_by_step(gap_steps_raw, gap_vals_raw)
+        if gap_vals:
+            ax_gap.plot(
+                [s / 1e6 for s in gap_steps], gap_vals,
+                "-o", markersize=3, linewidth=1.8, color=color,
+            )
+            ax_gap.fill_between(
+                [s / 1e6 for s in gap_steps], 0, gap_vals,
+                where=[v >= 0 for v in gap_vals],
+                alpha=0.10, color=color,
+            )
+        ax_gap.axhline(0.0, color="grey", linewidth=1.0, alpha=0.5, linestyle="--")
+        ax_gap.set_ylabel("Conditioning Gap")
+        ax_gap.grid(True, alpha=0.22)
+
+        # Row label on the left side of the loss panel
+        ax_loss.set_title(label, loc="left", fontsize=10, fontweight="bold", color=color)
+
+    # Column titles on top row only
+    for col, col_title in enumerate(col_titles):
+        axes[0, col].set_title(col_title, fontsize=10, fontweight="bold")
+
+    # x-axis labels only on the bottom row
+    for col in range(3):
+        axes[-1, col].set_xlabel("Samples Seen (millions)")
+
+    fig.suptitle(title, fontsize=13, fontweight="bold")
+    fig.tight_layout(rect=(0, 0, 1, 0.97))
+    show_or_save(fig, save_path=save_path, show=show)
+    return fig
+
+
+# ===================================================================
 #  CLI entry-point
 # ===================================================================
 
@@ -1455,34 +1598,29 @@ if __name__ == "__main__":
     from src.visualization.training_plots import (  # noqa: E402
         plot_cfg_diagnostics,
         plot_gda_diagnostics,
+        plot_poc_ablation,
     )
 
-    _CFG_MAIN = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments"
-        "/20260601_poc_brca_lihc_cfg_v2_dgx/gda"
-    )
-    _CFG_WARM = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments"
-        "/20260529_poc_brca_lihc_cfg_v1/gda"
-    )
-    _CFG_OUT = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments"
-        "/20260601_poc_brca_lihc_cfg_v2_dgx/cfg_diagnostics.png"
-    )
-    _GDA_LOGDIR = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2/gda"
-    )
-    _GDA_OUT = (
-        "/mnt/bulk-saturn/maralampert/genhist/experiments/20260526_poc_brca_lihc_gda_v2"
-        "/gda_diagnostics.png"
-    )
+    _BASE = "/mnt/bulk-saturn/maralampert/genhist/experiments"
+    _CFG_MAIN = f"{_BASE}/20260601_poc_brca_lihc_cfg_v2_dgx/gda"
+    _CFG_WARM = f"{_BASE}/20260529_poc_brca_lihc_cfg_v1/gda"
+    _CFG_OUT  = f"{_BASE}/20260601_poc_brca_lihc_cfg_v2_dgx/cfg_diagnostics.png"
+    _GDA_LOGDIR = f"{_BASE}/20260526_poc_brca_lihc_gda_v2/gda"
+    _GDA_OUT    = f"{_BASE}/20260526_poc_brca_lihc_gda_v2/gda_diagnostics.png"
+    _POC_OUT    = f"{_BASE}/poc_ablation_conditioning.png"
+    _POC_LOGDIRS: "dict[str, str]" = {
+        "Zero":    f"{_BASE}/20260603_poc_128_zero/gda",
+        "Noise":   f"{_BASE}/20260603_poc_128_noise/gda",
+        "1-hot":   f"{_BASE}/20260603_poc_128_orthogonal/gda",
+        "Genomic": f"{_BASE}/20260603_poc_128_rna/gda",
+    }
 
     parser = argparse.ArgumentParser(
         description="Plot training diagnostics from TFEvents."
     )
     parser.add_argument(
-        "--mode", choices=["cfg", "gda"], default="cfg",
-        help="'cfg' = CFG backbone run (default); 'gda' = GDA v13 run.",
+        "--mode", choices=["cfg", "gda", "poc_ablation"], default="cfg",
+        help="'cfg' = CFG backbone run; 'gda' = GDA v13; 'poc_ablation' = 4-mode PoC comparison.",
     )
     # CFG-mode args
     parser.add_argument(
@@ -1528,12 +1666,22 @@ if __name__ == "__main__":
             show=not args.no_show,
             **kwargs,
         )
-    else:
+    elif args.mode == "gda":
         out_path = Path(args.out or _GDA_OUT)
         out_path.parent.mkdir(parents=True, exist_ok=True)
         print(f"GDA mode | logdir={args.logdir}")
         fig = plot_gda_diagnostics(
             logdir=args.logdir,
+            save_path=out_path,
+            show=not args.no_show,
+            **kwargs,
+        )
+    else:  # poc_ablation
+        out_path = Path(args.out or _POC_OUT)
+        out_path.parent.mkdir(parents=True, exist_ok=True)
+        print(f"PoC ablation mode | runs: {list(_POC_LOGDIRS.keys())}")
+        fig = plot_poc_ablation(
+            logdirs=_POC_LOGDIRS,
             save_path=out_path,
             show=not args.no_show,
             **kwargs,

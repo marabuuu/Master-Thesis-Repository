@@ -23,6 +23,7 @@ Usage (via run_pipeline.py)
 
 Config section (config.yaml)
 ------------------------------
+    # PAM50 mode (existing):
     virchow2_umap:
       features_dir: /path/to/virchow2_h5_files
       csv_path: ../dataframes/brca_subtypes.csv
@@ -40,6 +41,23 @@ Config section (config.yaml)
       dpi: 200
       point_size: 80
       alpha: 0.8
+
+    # BRCA vs LIHC cohort mode:
+    #   label_source: splits        — derive cohort labels from patient_splits_path
+    #                                 (reads the "subtype" field, e.g. TCGA-BRCA/TCGA-LIHC)
+    #   features_dirs: [dir1, dir2] — merge H5 files from multiple directories
+    virchow2_umap_cohort:
+      label_source: splits
+      features_dirs:
+        - /path/to/brca_virchow2_h5
+        - /path/to/lihc_virchow2_h5
+      patient_splits_path: /path/to/patient_splits.json
+      output_dir: ./experiments/virchow2_umap_cohort
+      max_tiles_per_patient: 100
+      n_neighbors: 15
+      min_dist: 0.1
+      metric: cosine
+      seed: 42
 """
 
 from __future__ import annotations
@@ -304,7 +322,11 @@ def plot_umap_scatter(
     has_multiple_splits = tmp["Split"].nunique() > 1
 
     unit = "tiles" if mode == "tile" else "patients"
-    title = f"Virchow2 Feature UMAP — PAM50 Subtypes ({len(tmp):,} {unit})"
+    unique_labels = sorted(set(subtypes))
+    group_label = (
+        "Cohort" if any("TCGA-" in s for s in unique_labels) else "PAM50 Subtype"
+    )
+    title = f"Virchow2 Feature UMAP — {group_label} ({len(tmp):,} {unit})"
 
     fig, ax = plt.subplots(figsize=figsize)
     sns.scatterplot(
@@ -353,11 +375,18 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
 
     setup_style()
 
-    features_dir = Path(cfg["features_dir"])
-    if not features_dir.exists():
-        raise FileNotFoundError(f"features_dir not found: {features_dir}")
+    # Support a single dir (features_dir) or a list (features_dirs).
+    _dirs_cfg = cfg.get("features_dirs") or ([cfg["features_dir"]] if "features_dir" in cfg else None)
+    if not _dirs_cfg:
+        raise KeyError("Config must specify 'features_dir' or 'features_dirs'")
+    features_dirs_list = [Path(d) for d in _dirs_cfg]
+    for _d in features_dirs_list:
+        if not _d.exists():
+            raise FileNotFoundError(f"features_dir not found: {_d}")
+    # Keep features_dir pointing at the first entry for backwards compatibility.
+    features_dir = features_dirs_list[0]
 
-    csv_path           = cfg["csv_path"]
+    csv_path           = cfg.get("csv_path")   # optional when label_source=splits
     patient_col        = cfg.get("patient_col", "Patient_ID")
     subtype_col        = cfg.get("subtype_col", "Majority_Subtype_mRNA")
     splits_path        = cfg.get("patient_splits_path")
@@ -392,29 +421,77 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     elif splits_path:
         print(f"[Virchow2UMAP][WARN] patient_splits_path not found: {splits_path} — using all patients")
 
-    # ── Subtype map ───────────────────────────────────────────────────────────
-    meta_df = pd.read_csv(csv_path, low_memory=False)
-    meta_df[patient_col] = (
-        meta_df[patient_col].astype(str).str.strip().apply(canonical_patient_id)
-    )
-    meta_df = meta_df.drop_duplicates(subset=[patient_col])
-    subtype_map: Dict[str, str] = {
-        pid: sub
-        for pid, sub in zip(meta_df[patient_col], meta_df[subtype_col].astype(str).str.strip())
-        if sub and sub.lower() not in {"nan", ""}
-    }
-    if verbose:
-        print(f"[Virchow2UMAP] Subtype map: {len(subtype_map):,} patients from {Path(csv_path).name}")
+    # ── Subtype / cohort map ──────────────────────────────────────────────────
+    label_source = cfg.get("label_source", "csv")  # "csv" or "splits"
 
-    # ── Load features ─────────────────────────────────────────────────────────
-    if mode == "tile":
-        embeddings, patient_ids, subtypes, splits = load_tile_level_features(
-            features_dir, subtype_map, pid_to_split, max_tiles, seed, verbose
+    if label_source == "splits":
+        # Derive labels directly from the patient_splits JSON.
+        # Expects each entry to have a "subtype" field, e.g.
+        #   {"TCGA-A1-A0SJ": {"subtype": "TCGA-BRCA"}, ...}
+        if not splits_path or not Path(splits_path).exists():
+            raise FileNotFoundError(
+                "label_source='splits' requires a valid patient_splits_path"
+            )
+        with open(splits_path) as _f:
+            _raw = json.load(_f)
+        subtype_map = {}
+        for _fold_entries in _raw.values():
+            if not isinstance(_fold_entries, dict):
+                continue
+            for _pid, _meta in _fold_entries.items():
+                if _pid.startswith("_"):
+                    continue
+                _label = (
+                    _meta.get("subtype")
+                    if isinstance(_meta, dict)
+                    else str(_meta)
+                )
+                if _label:
+                    subtype_map[canonical_patient_id(_pid)] = _label
+        if verbose:
+            from collections import Counter
+            print(
+                f"[Virchow2UMAP] Cohort map from splits: {len(subtype_map):,} patients — "
+                + ", ".join(f"{k}={v}" for k, v in sorted(Counter(subtype_map.values()).items()))
+            )
+    else:
+        if not csv_path:
+            raise KeyError("Config must specify 'csv_path' when label_source='csv' (the default)")
+        meta_df = pd.read_csv(csv_path, low_memory=False)
+        meta_df[patient_col] = (
+            meta_df[patient_col].astype(str).str.strip().apply(canonical_patient_id)
+        )
+        meta_df = meta_df.drop_duplicates(subset=[patient_col])
+        subtype_map = {
+            pid: sub
+            for pid, sub in zip(meta_df[patient_col], meta_df[subtype_col].astype(str).str.strip())
+            if sub and sub.lower() not in {"nan", ""}
+        }
+        if verbose:
+            print(f"[Virchow2UMAP] Subtype map: {len(subtype_map):,} patients from {Path(csv_path).name}")
+
+    # ── Load features (one or more directories, merged) ───────────────────────
+    _load_fn = load_tile_level_features if mode == "tile" else load_patient_level_features
+    if len(features_dirs_list) == 1:
+        embeddings, patient_ids, subtypes, splits = _load_fn(
+            features_dirs_list[0], subtype_map, pid_to_split, max_tiles, seed, verbose
         )
     else:
-        embeddings, patient_ids, subtypes, splits = load_patient_level_features(
-            features_dir, subtype_map, pid_to_split, max_tiles, seed, verbose
-        )
+        all_emb, all_pids, all_subs, all_spls = [], [], [], []
+        for _fdir in features_dirs_list:
+            if verbose:
+                print(f"[Virchow2UMAP] Loading from {_fdir.name}…")
+            _e, _p, _s, _sp = _load_fn(
+                _fdir, subtype_map, pid_to_split, max_tiles, seed, verbose
+            )
+            all_emb.append(_e)
+            all_pids.extend(_p)
+            all_subs.extend(_s)
+            all_spls.extend(_sp)
+        embeddings  = np.concatenate(all_emb, axis=0)
+        patient_ids = all_pids
+        subtypes    = all_subs
+        splits      = all_spls
 
     if verbose:
         from collections import Counter

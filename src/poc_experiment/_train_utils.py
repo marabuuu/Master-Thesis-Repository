@@ -168,6 +168,8 @@ def _build_config(cfg: Dict[str, Any]) -> GDAConfig:
         adapter_token_dim=int(_get("adapter_token_dim", 256)),
         adapter_t_dim=int(_get("adapter_t_dim", 256)),
         adapter_n_heads=int(_get("adapter_n_heads", 4)),
+        normalize_feats=bool(_get("normalize_feats", True)),
+        val_swap_basal_luma=bool(_get("val_swap_basal_luma", False)),
         cfg_dropout=float(_get("cfg_dropout", 0.30)),
         backbone_lr=float(_get("backbone_lr", 1e-4)),
         adapter_lr=float(_get("adapter_lr", 3e-4)),

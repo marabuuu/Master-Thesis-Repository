@@ -50,6 +50,30 @@ class GDAConfig(TrainConfig):
     # "one_hot" — fixed orthogonal unit vector per cohort (BRCA→e₁, LIHC→e₂)
     conditioning_type: str = "real"
 
+    # ── Feature normalisation ─────────────────────────────────────────────
+    # True (default): L2-normalise feats to unit norm before the style MLP.
+    # False: pass raw feats at their natural magnitude — only valid for
+    # one_hot conditioning where larger norm may strengthen the signal.
+    normalize_feats: bool = True
+
+    # ── Validation shuffle strategy ───────────────────────────────────────
+    # When True, cond/gap swaps Basal ↔ LumA features instead of randperm.
+    # Set True for BRCA-only runs; leave False for BRCA+LIHC PoC runs.
+    val_swap_basal_luma: bool = False
+
+    # ── Feature dimension ─────────────────────────────────────────────────
+    # Must equal style_ch (512); kept as an explicit field because it is
+    # referenced throughout cfg_model.py and sample scripts.
+    feat_dim: int = 512
+
+    # ── Training cadence ──────────────────────────────────────────────────
+    steps_per_epoch: int = 5_000
+    reconstruct_every_samples: int = 50_000
+
+    # ── Class embedding (conditioning_type="class_embed") ─────────────────
+    # Number of discrete classes; sets the size of nn.Embedding(num_classes, feat_dim).
+    num_classes: int = 2
+
     # ── CFG ───────────────────────────────────────────────────────────────
     cfg_dropout: float = 0.15
 

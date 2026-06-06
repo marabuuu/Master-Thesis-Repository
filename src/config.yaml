@@ -202,6 +202,31 @@ tfd_separability_poc:
   output_dir: ../experiments/20260529_tfd_separability_poc/results
   save_heatmap: false
 
+# ── TopoFD separability on generated tiles (cross-attention experiment) ────────
+# Segments generated Basal and LumA tiles, then computes pairwise TFD between
+# the two classes to measure whether the model has learned morphologically
+# distinct outputs for each subtype.
+# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_generated
+tfd_separability_generated:
+  class_tiles_dirs:
+    Basal: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/generated/Basal
+    LumA: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/generated/LumA
+  masks_dir: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/tfd_masks
+  output_dir: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/tfd_results
+  auto_segment: true
+  force_resegment: false
+  num_classes: 32
+  weights_dataset: TCGA
+  device: null
+  max_tiles_by_class: {}
+  use_alpha_complex: true
+  n_landscape_bins: 100
+  n_landscape_layers: 1
+  min_cells_per_image: 3
+  compute_noise_floor: true
+  n_noise_floor_splits: 5
+  save_heatmap: true
+
 tfd_separability_viz:
   # ── Input ─────────────────────────────────────────────────────────────────
   results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
@@ -684,6 +709,331 @@ poc_128_1hot:
   base_dir: ./experiments/20260603_poc_128_orthogonal
   logdir: ./experiments/20260603_poc_128_orthogonal/gda
 
+poc_128_1hot_nonorm:
+  training_mode: cfg_backbone
+  conditioning_type: one_hot
+  normalize_feats: false    # codes keep natural magnitude (norm≈16) — tests whether unit-norm drowns the signal
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 5000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260605_poc_128_orthogonal_nonorm
+  base_dir: ./experiments/20260605_poc_128_orthogonal_nonorm
+  logdir: ./experiments/20260605_poc_128_orthogonal_nonorm/gda
+
+poc_128_1hot_nonorm_30M:
+  training_mode: cfg_backbone
+  conditioning_type: one_hot
+  normalize_feats: false
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260605_poc_128_orthogonal_nonorm_30M
+  base_dir: ./experiments/20260605_poc_128_orthogonal_nonorm_30M
+  logdir: ./experiments/20260605_poc_128_orthogonal_nonorm_30M/gda
+
+poc_128_class_embed_30M:
+  training_mode: cfg_backbone
+  conditioning_type: class_embed
+  normalize_feats: false  # no-op: embedding output is already in learned space
+  num_classes: 2          # TCGA-BRCA=0, TCGA-LIHC=1
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1]
+
+  output_dir: ./experiments/20260605_poc_128_class_embed_30M
+  base_dir: ./experiments/20260605_poc_128_class_embed_30M
+  logdir: ./experiments/20260605_poc_128_class_embed_30M/gda
+
+poc_128_zero_30M:
+  training_mode: cfg_backbone
+  conditioning_type: zeros
+  normalize_feats: false
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260605_poc_128_zero_30M
+  base_dir: ./experiments/20260605_poc_128_zero_30M
+  logdir: ./experiments/20260605_poc_128_zero_30M/gda
+
+poc_128_noise_30M:
+  training_mode: cfg_backbone
+  conditioning_type: noise
+  normalize_feats: false
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260605_poc_128_noise_30M
+  base_dir: ./experiments/20260605_poc_128_noise_30M
+  logdir: ./experiments/20260605_poc_128_noise_30M/gda
+
+poc_128_rna_30M:
+  training_mode: cfg_backbone
+  conditioning_type: real
+  normalize_feats: false
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260605_poc_128_rna_30M
+  base_dir: ./experiments/20260605_poc_128_rna_30M
+  logdir: ./experiments/20260605_poc_128_rna_30M/gda
+
 poc_128_zero:
   training_mode: cfg_backbone
   conditioning_type: zeros
@@ -1040,6 +1390,107 @@ virchow2_umap:
   metric: cosine
   seed: 42
   cmap_categorical: romaO           # same palette as dataset_statistics + genomic UMAP
+  figsize:
+  - 10
+  - 8
+  dpi: 200
+  point_size: 80
+  alpha: 0.8
+
+# ── BRCA PAM50 CFG v2 (DGX, 4×A100 80GB) ────────────────────────────────────
+# CFG backbone on TCGA-BRCA, all 5 PAM50 subtypes.
+# Uses poc_experiment run_cfg_training (not the old brca_pam50_cfg GDA path).
+# From-scratch training — no warm start.
+#
+# Per-patient tile counts (sampled medians):
+#   Basal  168 pts  ~2500/pt → cap at 300 to prevent per-patient dominance
+#   Her2    74 pts  ~1500/pt → cap at 300
+#   Normal  38 pts  ~1100/pt → uncapped (too few patients to waste any)
+#   LumA   506 pts   ~366/pt → uncapped (already low tile count)
+#   LumB   195 pts   ~259/pt → uncapped (even lower)
+# WeightedRandomSampler balances batch representation across all 5 subtypes.
+brca_pam50_cfg_v2:
+  training_mode: cfg_backbone
+  conditioning_type: real
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-final
+  genomic_feature_dir: ./experiments/20260528_genomic_features/genomic_h5
+  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+
+  # Caps calibrated so each subtype contributes ~22K total tiles (≈ Her2's natural
+  # ceiling of 74 pts × 300). Normal (38 pts) is left uncapped — too few patients.
+  #   LumA  506 pts × 45  = ~22.8K
+  #   LumB  195 pts × 120 = ~23.4K
+  #   Basal 168 pts × 135 = ~22.7K
+  #   Her2   74 pts × 300 = ~22.2K
+  #   Normal  38 pts, uncapped → ~41K (all tiles kept)
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  backbone_ckpt_path: ""   # train from scratch
+  val_swap_basal_luma: true  # cond/gap swaps Basal ↔ LumA features (BRCA-specific)
+
+  # ── Architecture (512×512, same as brca_pam50_cfg) ────────────────────────
+  img_size: 512
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false  # A100 80GB — no need
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.15
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 16               # 4 per GPU × 4 A100s
+  accumulate_grad_batches: 2   # adjusts val/ckpt cadence; trainer accum=1
+  total_samples: 200000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 16
+  gpus: [0, 1, 2, 3]
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260605_brca_pam50_cfg_v2
+  base_dir: ./experiments/20260605_brca_pam50_cfg_v2
+  logdir: ./experiments/20260605_brca_pam50_cfg_v2/gda
+
+virchow2_umap_cohort:
+  label_source: splits                 # read TCGA-BRCA / TCGA-LIHC labels from patient_splits.json
+  features_dirs:
+    - /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3   # BRCA (same as virchow2_umap)
+    - /mnt/bulk-neptune/laura/mopadiv2/features/new/virchow2/TCGA-LIHC/virchow2-02627079                                   # ← fill in your LIHC path here
+  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+  mode: patient                        # "patient" (1 pt per patient) or "tile" (1 pt per tile)
+  output_dir: ./experiments/virchow2_umap_cohort
+  max_tiles_per_patient: 50           # consistent with virchow2_umap (PAM50)
+  n_neighbors: 15
+  min_dist: 0.1
+  metric: cosine
+  seed: 42
+  cmap_categorical: romaO
   figsize:
   - 10
   - 8

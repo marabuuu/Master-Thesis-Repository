@@ -960,3 +960,301 @@ def _print_summary(result: TFDSeparabilityResult) -> None:
     for cls, n in sorted(result.n_samples.items()):
         print(f"  {cls:<20}  {n:>6} masks")
     print("=" * 60)
+
+
+# ===================================================================
+# § 6  Directory-based pipeline (for generated tiles organised by class)
+# ===================================================================
+
+def _iter_all_masks_from_dir(
+    masks_subdir: Path,
+    *,
+    cls_suffix: str = "_cls.npy",
+    max_tiles: Optional[int] = None,
+    seed: int = 42,
+) -> Iterable[np.ndarray]:
+    """Yield classification masks from all ZIP archives in a directory.
+
+    Unlike ``_iter_masks_for_class``, this does not require a patient-ID list —
+    it iterates every ZIP in ``masks_subdir``.  Used for generated-tile
+    directories where class identity comes from the subdirectory name rather
+    than a metadata CSV.
+
+    If ``max_tiles`` is set, a random subsample of that size is drawn across all
+    ZIPs (names are collected first, then sampled).
+    """
+    rng = np.random.default_rng(seed)
+    zip_files = sorted(masks_subdir.glob("*.zip"))
+
+    # Collect (zip_path, entry_name) pairs so we can subsample globally.
+    all_entries: List[Tuple[Path, str]] = []
+    for zp in zip_files:
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                for name in zf.namelist():
+                    if name.endswith(cls_suffix):
+                        all_entries.append((zp, name))
+        except Exception:
+            logger.warning("Failed to inspect ZIP: %s", zp)
+
+    if max_tiles is not None and len(all_entries) > max_tiles:
+        idx = rng.choice(len(all_entries), max_tiles, replace=False)
+        all_entries = [all_entries[i] for i in sorted(idx)]
+
+    for zp, name in all_entries:
+        try:
+            with zipfile.ZipFile(zp, "r") as zf:
+                with zf.open(name) as f:
+                    m = np.load(BytesIO(f.read()))
+            if m.ndim == 3 and m.shape[0] < m.shape[1]:
+                m = np.transpose(m, (1, 2, 0))
+            yield m
+        except Exception:
+            logger.warning("Failed to load %s from %s", name, zp)
+
+
+def _run_segmentation_dir(
+    cfg: Dict,
+    tiles_dir: Path,
+    masks_dir: Path,
+    *,
+    device: str,
+    verbose: bool = True,
+) -> None:
+    """Run DeepCMorph on all ZIPs in ``tiles_dir``, saving masks to ``masks_dir``."""
+    from src.classifier.segment_and_classify_cells import (
+        DeepCMorphSegmenter,
+        process_tiles_from_zips,
+    )
+
+    masks_dir.mkdir(parents=True, exist_ok=True)
+    zip_files = list(tiles_dir.glob("*.zip"))
+    if not zip_files:
+        logger.warning("No ZIPs found in %s — skipping segmentation", tiles_dir)
+        return
+
+    if verbose:
+        print(
+            f"[TopoFD-Sep-Dirs] Segmenting {len(zip_files)} ZIPs "
+            f"from {tiles_dir} → {masks_dir}"
+        )
+
+    segmenter = DeepCMorphSegmenter(
+        num_classes=cfg.get("num_classes", 32),
+        weights_dataset=cfg.get("weights_dataset", "TCGA"),
+        device=device,
+    )
+    n = process_tiles_from_zips(
+        input_dir=tiles_dir,
+        output_dir=masks_dir,
+        segmenter=segmenter,
+        save_seg=False,
+    )
+    if verbose:
+        print(f"[TopoFD-Sep-Dirs] Segmentation complete — {n:,} tiles processed.")
+
+
+def run_tfd_separability_from_dirs(cfg: Dict, verbose: bool = True) -> None:
+    """Config-driven TFD separability pipeline for pre-organised generated tiles.
+
+    Use this when tiles are already split into per-class directories (e.g. the
+    output of ``fid_evaluation.py``) rather than being mixed with a metadata CSV
+    mapping patient IDs to subtypes.
+
+    Expected config keys (``tfd_separability_generated`` section of config.yaml)
+    -----------------------------------------------------------------------------
+    class_tiles_dirs : dict[str, str]
+        Class name → path to directory containing that class's tile ZIPs.
+        Example::
+
+            class_tiles_dirs:
+              Basal: experiments/.../generated/Basal
+              LumA:  experiments/.../generated/LumA
+
+    masks_dir : str
+        Root for segmentation outputs; each class gets a subdirectory
+        ``masks_dir/<class>/``.
+    output_dir : str
+        Where to write ``tfd_separability_results.json`` and the heatmap PNG.
+    auto_segment : bool (default true)
+        Run DeepCMorph if masks are missing.
+    force_resegment : bool (default false)
+        Re-run segmentation even when masks already exist.
+    num_classes, weights_dataset, device
+        Forwarded to DeepCMorph.
+    max_tiles_by_class : dict[str, int or null] (default {})
+        Optional per-class tile cap applied across all patients.
+    use_alpha_complex, n_landscape_bins, n_landscape_layers, min_cells_per_image
+        TDA parameters.
+    compute_noise_floor : bool (default true)
+    n_noise_floor_splits : int (default 5)
+    save_heatmap : bool (default true)
+    """
+    import torch
+
+    class_tiles_dirs: Dict[str, Path] = {
+        cls: Path(p) for cls, p in cfg["class_tiles_dirs"].items()
+    }
+    masks_root = Path(cfg["masks_dir"])
+    output_dir = Path(cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    classes = sorted(class_tiles_dirs.keys())
+    if verbose:
+        print(f"\n[TopoFD-Sep-Dirs] Classes: {classes}")
+        for cls, p in class_tiles_dirs.items():
+            print(f"  {cls}: {p}")
+
+    # ── Step 1: Segmentation ────────────────────────────────────────────────────
+    auto_segment = cfg.get("auto_segment", True)
+    force_resegment = cfg.get("force_resegment", False)
+    device = cfg.get("device") or ("cuda" if torch.cuda.is_available() else "cpu")
+
+    for cls in classes:
+        tiles_dir = class_tiles_dirs[cls]
+        masks_subdir = masks_root / cls
+
+        if not force_resegment and masks_subdir.exists() and any(masks_subdir.glob("*.zip")):
+            n_existing = sum(1 for _ in masks_subdir.glob("*.zip"))
+            if verbose:
+                print(
+                    f"[TopoFD-Sep-Dirs] {cls}: existing masks found "
+                    f"({n_existing} ZIPs) — skipping segmentation"
+                )
+            continue
+
+        if auto_segment:
+            _run_segmentation_dir(cfg, tiles_dir, masks_subdir, device=device, verbose=verbose)
+        else:
+            if verbose:
+                print(f"[TopoFD-Sep-Dirs] auto_segment=False — expecting masks in {masks_subdir}")
+
+    # ── Step 2: Fit per-class distributions ────────────────────────────────────
+    max_tiles_by_class: Dict[str, Optional[int]] = cfg.get("max_tiles_by_class", {})
+    tda_kw = dict(
+        use_alpha=cfg.get("use_alpha_complex", True),
+        n_landscape_bins=cfg.get("n_landscape_bins", 100),
+        n_landscape_layers=cfg.get("n_landscape_layers", 1),
+        min_cells=cfg.get("min_cells_per_image", 3),
+    )
+
+    distributions: Dict[str, ClassDistribution] = {}
+    class_vectors: Dict[str, Dict[int, np.ndarray]] = {}
+    n_samples: Dict[str, int] = {}
+
+    for cls in classes:
+        masks_subdir = masks_root / cls
+        max_tiles = max_tiles_by_class.get(cls)
+        cap_str = str(max_tiles) if max_tiles is not None else "all"
+        if verbose:
+            print(f"  [{cls}] Streaming masks (≤{cap_str} tiles) from {masks_subdir}…")
+
+        vecs = _collect_landscape_vectors(
+            _iter_all_masks_from_dir(masks_subdir, max_tiles=max_tiles, seed=42),
+            **tda_kw,
+        )
+        class_vectors[cls] = vecs
+        dist = _fit_gaussian_from_vectors(vecs, class_name=cls)
+        distributions[cls] = dist
+        n_cls = dist.n_samples.get(0, 0)
+        n_samples[cls] = n_cls
+        if verbose:
+            print(f"  [{cls}] {n_cls} masks processed")
+        if n_cls < 10:
+            logger.warning(
+                "%s: only %d masks — covariance estimation may be unreliable",
+                cls, n_cls,
+            )
+
+    # ── Step 3: Pairwise TFD ───────────────────────────────────────────────────
+    if verbose:
+        print("\n[TopoFD-Sep-Dirs] Computing pairwise TFD…")
+
+    pairwise_tfd: Dict[Tuple[str, str], float] = {}
+    pairwise_per_channel: Dict[Tuple[str, str], Dict[int, float]] = {}
+    for cls_a, cls_b in itertools.combinations(sorted(classes), 2):
+        da, db = distributions[cls_a], distributions[cls_b]
+        per_ch: Dict[int, float] = {}
+        for ch in range(da.n_channels):
+            na, nb = da.n_samples.get(ch, 0), db.n_samples.get(ch, 0)
+            if na < 2 or nb < 2:
+                per_ch[ch] = float("nan")
+                continue
+            per_ch[ch] = _calculate_frechet_distance(
+                da.mean[ch], da.cov[ch], db.mean[ch], db.cov[ch],
+            )
+        valid = [v for v in per_ch.values() if np.isfinite(v)]
+        avg = float(np.mean(valid)) if valid else float("nan")
+        pair = (cls_a, cls_b)
+        pairwise_tfd[pair] = avg
+        pairwise_per_channel[pair] = per_ch
+        if verbose:
+            print(f"  TFD({cls_a}, {cls_b}) = {avg:.4f}")
+
+    # ── Step 4: Noise floor ────────────────────────────────────────────────────
+    noise_floor: Optional[Dict[str, float]] = None
+    if cfg.get("compute_noise_floor", True):
+        rng = np.random.default_rng(42)
+        noise_floor = {}
+        if verbose:
+            print("\n[TopoFD-Sep-Dirs] Computing intra-class noise floor…")
+
+        for cls in sorted(classes):
+            vecs = class_vectors[cls]
+            if not vecs:
+                noise_floor[cls] = float("nan")
+                continue
+            n = next(iter(vecs.values())).shape[0]
+            if n < 4:
+                logger.warning("%s: only %d tiles — skipping noise floor", cls, n)
+                noise_floor[cls] = float("nan")
+                continue
+
+            split_fds: List[float] = []
+            for _ in range(cfg.get("n_noise_floor_splits", 5)):
+                idx = np.arange(n)
+                rng.shuffle(idx)
+                half = n // 2
+                vecs_a = {ch: v[idx[:half]] for ch, v in vecs.items()}
+                vecs_b = {ch: v[idx[half:]] for ch, v in vecs.items()}
+                da_nf = _fit_gaussian_from_vectors(vecs_a)
+                db_nf = _fit_gaussian_from_vectors(vecs_b)
+                per_ch_nf: Dict[int, float] = {}
+                for ch in range(da_nf.n_channels):
+                    if da_nf.n_samples.get(ch, 0) < 2 or db_nf.n_samples.get(ch, 0) < 2:
+                        per_ch_nf[ch] = float("nan")
+                        continue
+                    per_ch_nf[ch] = _calculate_frechet_distance(
+                        da_nf.mean[ch], da_nf.cov[ch], db_nf.mean[ch], db_nf.cov[ch],
+                    )
+                valid_nf = [v for v in per_ch_nf.values() if np.isfinite(v)]
+                if valid_nf:
+                    split_fds.append(float(np.mean(valid_nf)))
+
+            noise_floor[cls] = float(np.mean(split_fds)) if split_fds else float("nan")
+            if verbose:
+                nf_str = f"{noise_floor[cls]:.4f}" if np.isfinite(noise_floor[cls]) else "—"
+                print(f"  Noise floor ({cls}) = {nf_str}")
+
+    result = TFDSeparabilityResult(
+        class_names=sorted(classes),
+        pairwise_tfd=pairwise_tfd,
+        pairwise_per_channel=pairwise_per_channel,
+        noise_floor=noise_floor,
+        n_samples=n_samples,
+    )
+
+    result_path = output_dir / "tfd_separability_results.json"
+    with open(result_path, "w") as f:
+        json.dump(result.to_dict(), f, indent=2)
+    if verbose:
+        print(f"\n[OK] Results saved to {result_path}")
+
+    if cfg.get("save_heatmap", True):
+        try:
+            _save_heatmap(result, output_dir, figsize=cfg.get("figsize"), verbose=verbose)
+        except Exception as exc:
+            logger.warning("Could not save heatmap: %s", exc)
+
+    if verbose:
+        _print_summary(result)
