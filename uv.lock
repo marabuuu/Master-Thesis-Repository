@@ -1933,7 +1933,7 @@ requires-dist = [
     { name = "lifelines", specifier = ">=0.30.3" },
     { name = "lpips", specifier = ">=0.1.4" },
     { name = "matplotlib", specifier = "==3.10.1" },
-    { name = "mopadi", git = "https://github.com/marabuuu/mopadi.git?rev=11ccaca94abf95d6fbecdd185b6ef8b7c47ff78d" },
+    { name = "mopadi", directory = "../mopadi" },
     { name = "numpy", specifier = "==2.2.5" },
     { name = "opencv-python", specifier = "==4.11.0.86" },
     { name = "openslide-python", specifier = ">=1.4.3" },
@@ -2027,7 +2027,7 @@ wheels = [
 [[package]]
 name = "mopadi"
 version = "0.2.0"
-source = { git = "https://github.com/marabuuu/mopadi.git?rev=11ccaca94abf95d6fbecdd185b6ef8b7c47ff78d#11ccaca94abf95d6fbecdd185b6ef8b7c47ff78d" }
+source = { directory = "../mopadi" }
 dependencies = [
     { name = "cmcrameri" },
     { name = "conch" },
@@ -2055,6 +2055,36 @@ dependencies = [
     { name = "transformers" },
     { name = "wanshi" },
     { name = "webdataset" },
+]
+
+[package.metadata]
+requires-dist = [
+    { name = "cmcrameri", specifier = "==1.9" },
+    { name = "conch", git = "https://github.com/Mahmoodlab/CONCH.git?rev=141cc09c7d4ff33d8eda562bd75169b457f71a62" },
+    { name = "h5py", specifier = "==3.13.0" },
+    { name = "huggingface-hub", extras = ["cli"], specifier = "==0.30.2" },
+    { name = "lpips", specifier = "==0.1.4" },
+    { name = "matplotlib", specifier = "==3.10.1" },
+    { name = "numpy", specifier = "==2.2.5" },
+    { name = "opencv-python", specifier = "==4.11.0.86" },
+    { name = "pandas", specifier = "==2.2.3" },
+    { name = "pillow", specifier = "==11.2.1" },
+    { name = "python-dotenv", specifier = "==1.1.0" },
+    { name = "pytorch-fid", specifier = "==0.3.0" },
+    { name = "pytorch-lightning", specifier = "==2.5.1.post0" },
+    { name = "scikit-image", specifier = "==0.25.2" },
+    { name = "scikit-learn", specifier = "==1.6.1" },
+    { name = "scipy", specifier = "==1.15.2" },
+    { name = "seaborn", specifier = "==0.13.2" },
+    { name = "tensorboard", specifier = "==2.19.0" },
+    { name = "timm", specifier = "==1.0.14" },
+    { name = "torch", specifier = "==2.7.0" },
+    { name = "torchmetrics", specifier = "==1.7.1" },
+    { name = "torchvision", specifier = "==0.22.0" },
+    { name = "tqdm", specifier = "==4.67.1" },
+    { name = "transformers", specifier = "==4.48.1" },
+    { name = "wanshi", git = "https://github.com/lazigu/wanshi-utils.git?rev=dev_laura" },
+    { name = "webdataset", specifier = ">=1.0.2" },
 ]
 
 [[package]]

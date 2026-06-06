@@ -87,6 +87,27 @@ def _stratified_subset_indices(
     return sorted(selected[:limit])
 
 
+def _build_subtype_mean_feats(
+    genomic_cache: dict,
+    subtype_map: dict,
+    normalize: bool,
+) -> dict:
+    """Mean-pool genomic features per subtype; optionally L2-normalise."""
+    from collections import defaultdict
+    buckets: dict = defaultdict(list)
+    for pid, feat in genomic_cache.items():
+        subtype = subtype_map.get(pid, "unknown")
+        if subtype != "unknown":
+            buckets[subtype].append(feat)
+    result = {}
+    for subtype, feats in buckets.items():
+        mean = torch.stack(feats).mean(0)
+        if normalize:
+            mean = F.normalize(mean, p=2, dim=-1)
+        result[subtype] = mean
+    return result
+
+
 class CfgBackboneLitModel(LitModel):
     """
     Standard CFG training on MoPaDi backbone with genomic style conditioning.
@@ -236,6 +257,14 @@ class CfgBackboneLitModel(LitModel):
         if self.global_rank == 0:
             log.info("Subtype-balanced sampler: %s", dict(sorted(counts.items())))
 
+        if self.conf.conditioning_type == "real":
+            self._subtype_mean_feats = _build_subtype_mean_feats(
+                self.train_data._genomic_cache,
+                self.train_data._subtype_map,
+                normalize=self.conf.normalize_feats,
+            )
+            log.info("Subtype mean feats for sep metric: %s", sorted(self._subtype_mean_feats))
+
     def train_dataloader(self):
         import torch.utils.data as tud
 
@@ -370,6 +399,14 @@ class CfgBackboneLitModel(LitModel):
                     eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
                     eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
                     self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
+                elif self.conf.conditioning_type == "real" and hasattr(self, "_subtype_mean_feats"):
+                    sf = self._subtype_mean_feats
+                    if "Basal" in sf and "LumA" in sf:
+                        e_basal = sf["Basal"].to(self.device).unsqueeze(0).expand(bm, -1)
+                        e_luma  = sf["LumA"].to(self.device).unsqueeze(0).expand(bm, -1)
+                        eps_basal = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_basal).pred
+                        eps_luma  = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_luma).pred
+                        self.logger.experiment.add_scalar("cond/basal_luma_sep", (eps_basal - eps_luma).pow(2).mean().item(), self.num_samples)
 
         _si_interval = max(
             self.conf.reconstruct_every_samples,
