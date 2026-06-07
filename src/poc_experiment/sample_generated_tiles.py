@@ -83,7 +83,14 @@ def _resolve_checkpoint(run_dir: Path, explicit_ckpt: str | None = None) -> Path
     if explicit_ckpt:
         ckpt = Path(explicit_ckpt)
         if not ckpt.is_absolute():
-            ckpt = run_dir / ckpt
+            direct = run_dir / ckpt
+            under_autoenc = run_dir / "autoenc" / ckpt
+            if direct.exists():
+                ckpt = direct
+            elif under_autoenc.exists():
+                ckpt = under_autoenc
+            else:
+                raise FileNotFoundError(f"checkpoint not found: {direct} or {under_autoenc}")
         if not ckpt.exists():
             raise FileNotFoundError(f"checkpoint not found: {ckpt}")
         return ckpt

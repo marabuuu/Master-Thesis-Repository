@@ -64,15 +64,84 @@ def _compute_fid(path_a: Path, path_b: Path, device: str, batch_size: int = 64) 
     )
 
 
+def _plot_fid_matrix(matrix: np.ndarray, rows: list[str], cols: list[str], out_path: Path) -> None:
+    from cmcrameri import cm as crameri_cm
+
+    fig, ax = plt.subplots(figsize=(max(5, len(cols) * 2.5), max(4, len(rows) * 2.0)))
+    im = ax.imshow(matrix, cmap=crameri_cm.oslo)
+    plt.colorbar(im, ax=ax, label="FID")
+
+    ax.set_xticks(range(len(cols)))
+    ax.set_yticks(range(len(rows)))
+    ax.set_xticklabels([c.replace("gen_", "gen\n") for c in cols], fontsize=11)
+    ax.set_yticklabels([r.replace("real_", "real\n") for r in rows], fontsize=11)
+    ax.set_xlabel("Generated", fontsize=12)
+    ax.set_ylabel("Real", fontsize=12)
+
+    valid = matrix[~np.isnan(matrix)]
+    vmin, vmax = valid.min(), valid.max()
+    for i in range(len(rows)):
+        for j in range(len(cols)):
+            v = matrix[i, j]
+            if not np.isnan(v):
+                norm_val = (v - vmin) / (vmax - vmin) if vmax > vmin else 0.5
+                # oslo: dark at low values, near-white at high → white text on dark, black on light
+                text_color = "white" if norm_val < 0.5 else "black"
+                ax.text(j, i, f"{v:.1f}", ha="center", va="center",
+                        fontsize=11, fontweight="normal", color=text_color)
+
+    plt.tight_layout()
+    plt.savefig(out_path, dpi=300, bbox_inches="tight")
+    plt.close()
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FID matrix via pytorch_fid")
-    parser.add_argument("--eval-dir", type=Path, required=True,
+    parser.add_argument("--eval-dir", type=Path, default=None,
                         help="Root dir containing real/ and generated/ subdirs of zips")
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--batch-size", type=int, default=64)
+    parser.add_argument("--plot-only", action="store_true",
+                        help="Skip FID computation; re-plot from existing fid_matrix_official.json")
+    parser.add_argument("--json", type=Path, default=None,
+                        help="Plot directly from any FID/FD results JSON (auto-detects format)")
     args = parser.parse_args()
 
+    # --json: plot from an arbitrary results file, regardless of key naming
+    if args.json:
+        json_path = args.json.resolve()
+        if not json_path.exists():
+            raise FileNotFoundError(f"No JSON found at {json_path}")
+        results = json.loads(json_path.read_text())
+        fid_map = results.get("fid_matrix") or results.get("fd_matrix")
+        rows = results["rows"]
+        cols = results["cols"]
+        matrix = np.array([[fid_map.get(f"{r}_vs_{c}", float("nan"))
+                             for c in cols] for r in rows])
+        out_png = json_path.with_name("fid_matrix_official.png")
+        _plot_fid_matrix(matrix, rows, cols, out_png)
+        print(f"Saved: {out_png}")
+        return
+
+    if args.eval_dir is None:
+        raise ValueError("--eval-dir is required unless --json is given")
+
     eval_dir = args.eval_dir.resolve()
+
+    if args.plot_only:
+        json_path = eval_dir / "fid_matrix_official.json"
+        if not json_path.exists():
+            raise FileNotFoundError(f"No JSON found at {json_path}")
+        results = json.loads(json_path.read_text())
+        fid_matrix = results["fid_matrix"]
+        rows, cols = results["rows"], results["cols"]
+        matrix = np.array([[fid_matrix.get(f"{r}_vs_{c}", float("nan"))
+                             for c in cols] for r in rows])
+        out_png = eval_dir / "fid_matrix_official.png"
+        _plot_fid_matrix(matrix, rows, cols, out_png)
+        print(f"Saved: {out_png}")
+        return
+
     real_root = eval_dir / "real"
     gen_root  = eval_dir / "generated"
 
@@ -138,30 +207,8 @@ def main() -> None:
     matrix = np.array([[fid_matrix.get(f"{r}_vs_{c}", float("nan"))
                          for c in cols] for r in rows])
 
-    fig, ax = plt.subplots(figsize=(max(4, len(cols) * 1.8), max(3, len(rows) * 1.5)))
-    im = ax.imshow(matrix, cmap="magma")
-    plt.colorbar(im, ax=ax, label="FID")
-
-    ax.set_xticks(range(len(cols)))
-    ax.set_yticks(range(len(rows)))
-    ax.set_xticklabels([c.replace("gen_", "gen\n") for c in cols], fontsize=10)
-    ax.set_yticklabels([r.replace("real_", "real\n") for r in rows], fontsize=10)
-    ax.set_xlabel("Generated")
-    ax.set_ylabel("Real")
-    ax.set_title("FID matrix (pytorch_fid / InceptionV3)")
-
-    for i in range(len(rows)):
-        for j in range(len(cols)):
-            v = matrix[i, j]
-            if not np.isnan(v):
-                ax.text(j, i, f"{v:.1f}", ha="center", va="center",
-                        fontsize=11, fontweight="bold",
-                        color="white" if v > matrix[~np.isnan(matrix)].max() * 0.6 else "black")
-
-    plt.tight_layout()
     out_png = eval_dir / "fid_matrix_official.png"
-    plt.savefig(out_png, dpi=150, bbox_inches="tight")
-    plt.close()
+    _plot_fid_matrix(matrix, rows, cols, out_png)
     print(f"Saved: {out_png}")
 
 

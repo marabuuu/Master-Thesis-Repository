@@ -883,7 +883,7 @@ poc_128_zero_30M:
   patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
 
   max_tiles_by_subtype:
-    TCGA-BRCA: 300
+    TCGA-BRCA: 204  # balanced: matches LIHC total (~163k tiles each)
     TCGA-LIHC: null
 
   backbone_ckpt_path: ""
@@ -922,9 +922,9 @@ poc_128_zero_30M:
   num_workers: 8
   gpus: [0, 1, 2, 3]
 
-  output_dir: ./experiments/20260605_poc_128_zero_30M
-  base_dir: ./experiments/20260605_poc_128_zero_30M
-  logdir: ./experiments/20260605_poc_128_zero_30M/gda
+  output_dir: ./experiments/20260607_poc_128_zero_30M
+  base_dir: ./experiments/20260607_poc_128_zero_30M
+  logdir: ./experiments/20260607_poc_128_zero_30M/gda
 
 poc_128_noise_30M:
   training_mode: cfg_backbone
@@ -937,7 +937,7 @@ poc_128_noise_30M:
   patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
 
   max_tiles_by_subtype:
-    TCGA-BRCA: 300
+    TCGA-BRCA: 204  # balanced: matches LIHC total (~163k tiles each)
     TCGA-LIHC: null
 
   backbone_ckpt_path: ""
@@ -976,14 +976,14 @@ poc_128_noise_30M:
   num_workers: 8
   gpus: [0, 1, 2, 3]
 
-  output_dir: ./experiments/20260605_poc_128_noise_30M
-  base_dir: ./experiments/20260605_poc_128_noise_30M
-  logdir: ./experiments/20260605_poc_128_noise_30M/gda
+  output_dir: ./experiments/20260607_poc_128_noise_30M
+  base_dir: ./experiments/20260607_poc_128_noise_30M
+  logdir: ./experiments/20260607_poc_128_noise_30M/gda
 
 poc_128_rna_30M:
   training_mode: cfg_backbone
   conditioning_type: real
-  normalize_feats: false
+  normalize_feats: true
 
   # ── Data ─────────────────────────────────────────────────────────────────
   zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
@@ -991,7 +991,7 @@ poc_128_rna_30M:
   patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
 
   max_tiles_by_subtype:
-    TCGA-BRCA: 300
+    TCGA-BRCA: 204  # balanced: matches LIHC total (~163k tiles each)
     TCGA-LIHC: null
 
   backbone_ckpt_path: ""
@@ -1030,9 +1030,9 @@ poc_128_rna_30M:
   num_workers: 8
   gpus: [0, 1, 2, 3]
 
-  output_dir: ./experiments/20260605_poc_128_rna_30M
-  base_dir: ./experiments/20260605_poc_128_rna_30M
-  logdir: ./experiments/20260605_poc_128_rna_30M/gda
+  output_dir: ./experiments/20260607_poc_128_rna_norm_30M
+  base_dir: ./experiments/20260607_poc_128_rna_norm_30M
+  logdir: ./experiments/20260607_poc_128_rna_norm_30M/gda
 
 poc_128_zero:
   training_mode: cfg_backbone

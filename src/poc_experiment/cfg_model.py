@@ -383,25 +383,35 @@ class CfgBackboneLitModel(LitModel):
                 eps_n = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=zeros).pred
                 self.logger.experiment.add_scalar("cond/signal", (eps_c - eps_n).pow(2).mean().item(), self.num_samples)
 
-                # PoC metric: do BRCA and LIHC get different noise predictions?
-                # Should grow monotonically if the model learns to distinguish cohorts.
-                if self.conf.conditioning_type == "one_hot":
-                    if not hasattr(self, "_diag_codes"):
-                        codes = _make_orthogonal_binary_codes(self.conf.feat_dim, normalize=self.conf.normalize_feats)
-                        self._diag_codes = {k: v.to(self.device) for k, v in codes.items()}
-                    e_brca = self._diag_codes["TCGA-BRCA"].unsqueeze(0).expand(bm, -1)
-                    e_lihc = self._diag_codes["TCGA-LIHC"].unsqueeze(0).expand(bm, -1)
-                    eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
-                    eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
-                    self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
-                elif self.conf.conditioning_type == "class_embed":
-                    e_brca, e_lihc = self._class_embed_pair(bm)
-                    eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
-                    eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
-                    self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
+                # Universal probe: fixed orthogonal codes for BRCA and LIHC.
+                # Logged for ALL conditioning types so runs are directly comparable.
+                # zero/noise → stays ~0 (no cohort signal); RNA/one_hot → should grow.
+                if not hasattr(self, "_diag_codes"):
+                    codes = _make_orthogonal_binary_codes(self.conf.feat_dim, normalize=True)
+                    self._diag_codes = {k: v.to(self.device) for k, v in codes.items()}
+                e_brca = self._diag_codes["TCGA-BRCA"].unsqueeze(0).expand(bm, -1)
+                e_lihc = self._diag_codes["TCGA-LIHC"].unsqueeze(0).expand(bm, -1)
+                eps_brca = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca).pred
+                eps_lihc = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc).pred
+                self.logger.experiment.add_scalar("cond/brca_lihc_sep", (eps_brca - eps_lihc).pow(2).mean().item(), self.num_samples)
+
+                # class_embed: probe via the learned embedding vectors instead
+                if self.conf.conditioning_type == "class_embed":
+                    e_brca_emb, e_lihc_emb = self._class_embed_pair(bm)
+                    eps_brca_emb = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca_emb).pred
+                    eps_lihc_emb = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc_emb).pred
+                    self.logger.experiment.add_scalar("cond/brca_lihc_sep_embed", (eps_brca_emb - eps_lihc_emb).pow(2).mean().item(), self.num_samples)
+
+                # real: additionally probe with mean RNA features per cohort
                 elif self.conf.conditioning_type == "real" and hasattr(self, "_subtype_mean_feats"):
                     sf = self._subtype_mean_feats
-                    if "Basal" in sf and "LumA" in sf:
+                    if "TCGA-BRCA" in sf and "TCGA-LIHC" in sf:
+                        e_brca_rna = sf["TCGA-BRCA"].to(self.device).unsqueeze(0).expand(bm, -1)
+                        e_lihc_rna = sf["TCGA-LIHC"].to(self.device).unsqueeze(0).expand(bm, -1)
+                        eps_brca_rna = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_brca_rna).pred
+                        eps_lihc_rna = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc_rna).pred
+                        self.logger.experiment.add_scalar("cond/brca_lihc_sep_rna", (eps_brca_rna - eps_lihc_rna).pow(2).mean().item(), self.num_samples)
+                    elif "Basal" in sf and "LumA" in sf:
                         e_basal = sf["Basal"].to(self.device).unsqueeze(0).expand(bm, -1)
                         e_luma  = sf["LumA"].to(self.device).unsqueeze(0).expand(bm, -1)
                         eps_basal = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_basal).pred
