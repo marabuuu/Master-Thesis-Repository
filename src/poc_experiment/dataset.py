@@ -116,6 +116,42 @@ def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict
     }
 
 
+def _make_orthogonal_codes(
+    class_names: list,
+    feat_dim: int,
+    normalize: bool = True,
+) -> Dict[str, torch.Tensor]:
+    """Return one orthogonal binary code per class, generalised to N classes.
+
+    Positions are assigned round-robin: class i owns positions i, i+N, i+2N, ...
+    All pairs are exactly orthogonal (no shared positions).  With normalize=False
+    the raw norm is ~sqrt(feat_dim / N), giving a signal strength similar to the
+    2-class alternating codes.
+    """
+    n = len(class_names)
+    if n < 2:
+        raise ValueError(f"Need at least 2 class names, got {n}")
+    if feat_dim < n:
+        raise ValueError(f"feat_dim ({feat_dim}) must be >= number of classes ({n})")
+
+    codes = {}
+    for i, name in enumerate(class_names):
+        v = torch.zeros(feat_dim, dtype=torch.float32)
+        v[i::n] = 1.0
+        if normalize:
+            v = F.normalize(v, p=2, dim=-1)
+        codes[name] = v
+
+    c0, c1 = codes[class_names[0]], codes[class_names[1]]
+    log.info(
+        "Orthogonal codes: %d classes %s, feat_dim=%d, normalize=%s, "
+        "dot(0,1)=%.4f, norm0=%.3f",
+        n, class_names, feat_dim, normalize,
+        torch.dot(c0, c1).item(), float(c0.norm().item()),
+    )
+    return codes
+
+
 class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     """Pairs ZIP-archived tile images with patient-level genomic conditioning vectors.
 
@@ -218,10 +254,13 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
                 log.info("After removing patients with no H5: %d tiles remain", len(self.tile_paths))
         else:
             self._genomic_cache = {}
-            self._orthogonal_codes = (
-                _make_orthogonal_binary_codes(feat_dim, normalize=normalize_feats)
-                if conditioning_type == "one_hot" else None
-            )
+            if conditioning_type == "one_hot":
+                unique_subtypes = sorted(set(self._subtype_map.values()))
+                self._orthogonal_codes = _make_orthogonal_codes(
+                    unique_subtypes, feat_dim, normalize=normalize_feats
+                )
+            else:
+                self._orthogonal_codes = None
             log.info("Synthetic conditioning ('%s'): skipping H5 loading", conditioning_type)
 
         log.info(

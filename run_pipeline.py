@@ -291,6 +291,18 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'brca_pam50_cfg_v2_smoketest' section in config.yaml")
         run_cfg_training(config["brca_pam50_cfg_v2_smoketest"], verbose=verbose)
 
+    elif stage == "brca_pam50_cfg_v2_1hot":
+        from src.poc_experiment.run_cfg_training import run_cfg_training
+        if "brca_pam50_cfg_v2_1hot" not in config:
+            raise ValueError("No 'brca_pam50_cfg_v2_1hot' section in config.yaml")
+        run_cfg_training(config["brca_pam50_cfg_v2_1hot"], verbose=verbose)
+
+    elif stage == "brca_pam50_cfg_v2_1hot_smoketest":
+        from src.poc_experiment.run_cfg_training import run_cfg_training
+        if "brca_pam50_cfg_v2_1hot_smoketest" not in config:
+            raise ValueError("No 'brca_pam50_cfg_v2_1hot_smoketest' section in config.yaml")
+        run_cfg_training(config["brca_pam50_cfg_v2_1hot_smoketest"], verbose=verbose)
+
     elif stage == "poc_brca_lihc_cfg_v2":
         from src.poc_experiment.run_cfg_training import run_cfg_training
         if "poc_brca_lihc_cfg_v2" not in config:
@@ -368,7 +380,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_generated", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_generated", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
