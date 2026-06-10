@@ -192,12 +192,10 @@ def plot_tumor_stage(
         )
 
     ax.set_xlabel("Number of patients", fontsize=11)
-    ax.set_title("AJCC Pathologic Tumor Stage by PAM50 Subtype", fontsize=13, fontweight="bold")
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
     ax.invert_yaxis()
-    ax.legend(title="PAM50 Subtype", fontsize=9, title_fontsize=10, frameon=False)
+    ax.legend(title="PAM50 Subtype", fontsize=9, title_fontsize=10, frameon=False,
+              bbox_to_anchor=(1.02, 1), loc="upper left")
 
     fig.tight_layout()
     save_figure(fig, output_dir / "tumor_stage_distribution.png", dpi=dpi)
@@ -286,7 +284,6 @@ def plot_menopause_status(
         )
 
     ax.set_xlabel("Number of patients", fontsize=11)
-    ax.set_title("Menopause Status by PAM50 Subtype", fontsize=13, fontweight="bold")
     ax.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
     ax.spines["top"].set_visible(False)
     ax.spines["right"].set_visible(False)
@@ -344,7 +341,7 @@ def plot_subtype_distribution(
     wedges = pie_result[0]
     autotexts = pie_result[2] if len(pie_result) > 2 else []
     for at in autotexts:
-        at.set_fontsize(10)
+        at.set_fontsize(14)
         at.set_fontweight("bold")
         at.set_color("white")
 
@@ -360,7 +357,6 @@ def plot_subtype_distribution(
         ncol=min(len(counts), 3),
         frameon=False,
     )
-    ax.set_title("PAM50 Subtype Distribution", fontsize=13, fontweight="bold", pad=20)
 
     fig.tight_layout()
     save_figure(fig, output_dir / "pam50_subtype_distribution.png", dpi=dpi)
@@ -440,32 +436,6 @@ def plot_kaplan_meier_by_subtype(
             ci_alpha=0.12,
         )
 
-    # Pairwise log-rank p-values (all pairs, summarised below plot)
-    if len(subtypes) >= 2:
-        pairs = []
-        for i, s1 in enumerate(subtypes):
-            for s2 in subtypes[i + 1:]:
-                mask1 = km_df[subtype_col] == s1
-                mask2 = km_df[subtype_col] == s2
-                t1 = km_df.loc[mask1, "os_years"]
-                e1 = km_df.loc[mask1, os_event_col]
-                t2 = km_df.loc[mask2, "os_years"]
-                e2 = km_df.loc[mask2, os_event_col]
-                with warnings.catch_warnings():
-                    warnings.simplefilter("ignore")
-                    result = logrank_test(t1, t2, event_observed_A=e1, event_observed_B=e2)
-                pval = result.p_value
-                sig = "***" if pval < 0.001 else ("**" if pval < 0.01 else ("*" if pval < 0.05 else "ns"))
-                pairs.append(f"{s1} vs {s2}: p={pval:.4f} {sig}")
-
-        pval_text = "Log-rank tests:\n" + "\n".join(pairs)
-        ax.text(
-            0.98, 0.02, pval_text,
-            transform=ax.transAxes,
-            fontsize=8, va="bottom", ha="right",
-            bbox=dict(boxstyle="round,pad=0.4", facecolor="white", alpha=0.8, edgecolor="#cccccc"),
-        )
-
     # Patient counts in legend
     handles, labels = ax.get_legend_handles_labels()
     new_labels = []
@@ -473,15 +443,13 @@ def plot_kaplan_meier_by_subtype(
         n = (km_df[subtype_col] == lbl).sum()
         new_labels.append(f"{lbl}  (n={n:,})")
     ax.legend(handles, new_labels, title="PAM50 Subtype", fontsize=9,
-              title_fontsize=10, frameon=True, framealpha=0.9)
+              title_fontsize=10, frameon=False,
+              bbox_to_anchor=(1.02, 1), loc="upper left")
 
     ax.set_xlabel("Time (years)", fontsize=11)
     ax.set_ylabel("Overall Survival Probability", fontsize=11)
-    ax.set_title("Overall Survival by PAM50 Subtype (Kaplan-Meier)", fontsize=13, fontweight="bold")
     ax.set_ylim(0, 1.05)
     ax.set_xlim(left=0)
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
 
     fig.tight_layout()
@@ -556,7 +524,7 @@ def plot_combined_overview(
         at.set_fontsize(TICK_FS)
         at.set_fontweight("bold")
         at.set_color("white")
-    ax_pie.set_title("PAM50 Subtype Distribution", fontsize=TITLE_FS, fontweight="bold", pad=12)
+    # no title
 
     # ══ Panel B: Kaplan-Meier (no log-rank annotations) ══════════════════════
     if HAS_LIFELINES and os_time_col in df.columns and os_event_col in df.columns:
@@ -589,12 +557,9 @@ def plot_combined_overview(
 
     ax_km.set_xlabel("Time (years)", fontsize=LABEL_FS)
     ax_km.set_ylabel("Overall Survival Probability", fontsize=LABEL_FS)
-    ax_km.set_title("Overall Survival (Kaplan-Meier)", fontsize=TITLE_FS, fontweight="bold")
     ax_km.set_ylim(0, 1.05)
     ax_km.set_xlim(left=0)
     ax_km.tick_params(labelsize=TICK_FS)
-    ax_km.spines["top"].set_visible(False)
-    ax_km.spines["right"].set_visible(False)
     ax_km.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
     if ax_km.get_legend():
         ax_km.get_legend().remove()
@@ -650,11 +615,8 @@ def plot_combined_overview(
                       transform=ax_stage.transAxes, fontsize=LABEL_FS, color="gray")
 
     ax_stage.set_xlabel("Number of patients", fontsize=LABEL_FS)
-    ax_stage.set_title("AJCC Tumor Stage by PAM50 Subtype", fontsize=TITLE_FS, fontweight="bold")
     ax_stage.tick_params(labelsize=TICK_FS)
     ax_stage.xaxis.set_major_locator(mticker.MaxNLocator(integer=True))
-    ax_stage.spines["top"].set_visible(False)
-    ax_stage.spines["right"].set_visible(False)
     ax_stage.invert_yaxis()
 
     # ── Single shared legend below all panels ──────────────────────────────

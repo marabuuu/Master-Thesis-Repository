@@ -260,6 +260,7 @@ def plot_projection(
     title: str = "2-D projection",
     axis_labels: Tuple[str, str] = ("Dim 1", "Dim 2"),
     cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     markers: Optional[Dict[str, str]] = None,
     figsize: Tuple[float, float] = (8, 6),
     point_size: int = 80,
@@ -297,7 +298,8 @@ def plot_projection(
     _check_seaborn()
     setup_style()
 
-    palette = build_label_palette(hue_labels, cmap_name)
+    if palette is None:
+        palette = build_label_palette(hue_labels, cmap_name)
 
     tmp = pd.DataFrame(
         {"x": coords[:, 0], "y": coords[:, 1], "hue": hue_labels}
@@ -322,7 +324,8 @@ def plot_projection(
     )
     ax.set_xlabel(axis_labels[0])
     ax.set_ylabel(axis_labels[1])
-    ax.set_title(title)
+    if title:
+        ax.set_title(title)
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left")
     fig.tight_layout()
 
@@ -334,8 +337,9 @@ def plot_umap(
     X: np.ndarray,
     hue_labels: np.ndarray,
     style_labels: Optional[np.ndarray] = None,
-    title: str = "UMAP of VAE embeddings",
+    title: str = "",
     cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     markers: Optional[Dict[str, str]] = None,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -356,6 +360,7 @@ def plot_umap(
         title=title,
         axis_labels=("UMAP1", "UMAP2"),
         cmap_name=cmap_name,
+        palette=palette,
         markers=markers,
         save_path=save_path,
         show=show,
@@ -368,8 +373,9 @@ def plot_tsne(
     X: np.ndarray,
     hue_labels: np.ndarray,
     style_labels: Optional[np.ndarray] = None,
-    title: str = "t-SNE of VAE embeddings",
+    title: str = "",
     cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     markers: Optional[Dict[str, str]] = None,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -390,6 +396,7 @@ def plot_tsne(
         title=title,
         axis_labels=("tSNE1", "tSNE2"),
         cmap_name=cmap_name,
+        palette=palette,
         markers=markers,
         save_path=save_path,
         show=show,
@@ -404,6 +411,7 @@ def plot_pca(
     style_labels: Optional[np.ndarray] = None,
     title: Optional[str] = None,
     cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     markers: Optional[Dict[str, str]] = None,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -417,9 +425,8 @@ def plot_pca(
     (X_pca, pca_object, fig)
     """
     X_pca, pca = compute_pca(X, **(pca_kw or {}))
-    var = pca.explained_variance_ratio_.sum()
     if title is None:
-        title = f"PCA (explained variance: {var:.2%})"
+        title = ""
     fig = plot_projection(
         X_pca,
         hue_labels,
@@ -427,6 +434,7 @@ def plot_pca(
         title=title,
         axis_labels=("PC1", "PC2"),
         cmap_name=cmap_name,
+        palette=palette,
         markers=markers,
         save_path=save_path,
         show=show,
@@ -506,6 +514,7 @@ def plot_cosine_distance_clustermap(
     n_samples: int = 200,
     cmap_name: str = HEATMAP_CMAP,
     cat_cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     figsize: Tuple[float, float] = (10, 10),
     random_state: int = 42,
     save_path: Optional[Union[str, Path]] = None,
@@ -542,29 +551,31 @@ def plot_cosine_distance_clustermap(
     
     # Handle label color bars if labels are provided
     row_colors = None
+    _pal = palette
     if labels is not None:
         sub_labels = labels[idx]
-        palette = build_label_palette(sub_labels, cat_cmap_name)
-        row_colors = pd.Series(sub_labels).map(palette).values
+        if _pal is None:
+            _pal = build_label_palette(sub_labels, cat_cmap_name)
+        row_colors = pd.Series(sub_labels).map(_pal).values
 
-    g = sns.clustermap(
-        dist_mat,
-        cmap=cmap,
-        figsize=figsize,
-        row_colors=row_colors,
-        col_colors=row_colors,
-        xticklabels=False,
-        yticklabels=False,
-    )
-    
-    # Add a custom legend for the subtypes if labels were provided
-    if labels is not None:
-        from matplotlib.patches import Patch
-        handles = [Patch(facecolor=c, edgecolor='w', label=l) for l, c in palette.items()]
-        # Add legend to the upper left corner of the figure
-        g.fig.legend(handles=handles, title="Subtypes", loc="upper left", bbox_to_anchor=(0.02, 0.98))
-        
-    g.fig.suptitle(f"Cosine distance matrix ({len(idx)} random samples)", y=1.02)
+    import warnings
+    with warnings.catch_warnings():
+        warnings.simplefilter("ignore")
+        g = sns.clustermap(
+            dist_mat,
+            cmap=cmap,
+            figsize=figsize,
+            row_colors=row_colors,
+            col_colors=row_colors,
+            xticklabels=False,
+            yticklabels=False,
+            dendrogram_ratio=0.01,
+            cbar_pos=(1.02, 0.1, 0.03, 0.5),
+        )
+
+    g.ax_row_dendrogram.set_visible(False)
+    g.ax_col_dendrogram.set_visible(False)
+
     show_or_save(g.fig, save_path=save_path, show=show, close=True)
     return g.fig
 
@@ -604,7 +615,8 @@ def plot_silhouette_per_group(
     group_col_name: str = "Subtype",
     metric: str = "euclidean",
     cmap_name: str = CATEGORICAL_CMAP,
-    figsize: Tuple[float, float] = (8, 4),
+    palette: Optional[Dict[str, str]] = None,
+    figsize: Tuple[float, float] = (8, 5),
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
 ) -> Figure:
@@ -633,7 +645,7 @@ def plot_silhouette_per_group(
     labels = np.asarray(labels)
     sil_vals = silhouette_samples(X, labels, metric=metric)
 
-    palette = build_label_palette(labels, cmap_name)
+    _pal = palette if palette is not None else build_label_palette(labels, cmap_name)
     tmp = pd.DataFrame({group_col_name: labels, "silhouette": sil_vals})
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -641,12 +653,13 @@ def plot_silhouette_per_group(
         data=tmp,
         x=group_col_name,
         y="silhouette",
-        palette=palette,
+        palette=_pal,
         ax=ax,
     )
-    ax.set_title(f"Silhouette scores per {group_col_name}")
-    ax.set_ylabel("Silhouette coefficient")
-    ax.set_ylim(-1, 1)  # Fixed scale for consistent perception across all plots
+    ax.set_ylabel("Silhouette coefficient", fontsize=13)
+    ax.set_xlabel("", fontsize=13)
+    ax.tick_params(axis="x", labelsize=13)
+    ax.set_ylim(-1, 1)
     fig.tight_layout()
 
     show_or_save(fig, save_path=save_path, show=show)
@@ -667,6 +680,7 @@ def plot_dendrogram(
     color_threshold_ratio: float = 0.7,
     figsize: Tuple[float, float] = (10, 6),
     random_state: int = 42,
+    palette: Optional[Dict[str, str]] = None,
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
 ) -> Figure:
@@ -701,20 +715,42 @@ def plot_dendrogram(
     dist_vec = pdist(X_sub, metric=metric)
     Z = hierarchy.linkage(dist_vec, method=method)
 
+    # Build per-node cohort map for palette-driven branch coloring
+    if palette is not None:
+        n_leaves = len(labels_sub)
+        node_cohort: Dict[int, str] = {i: str(labels_sub[i]) for i in range(n_leaves)}
+        for i, row in enumerate(Z):
+            left, right = int(row[0]), int(row[1])
+            lc, rc = node_cohort.get(left), node_cohort.get(right)
+            node_cohort[n_leaves + i] = lc if lc == rc else "mixed"
+
+        def _link_color_func(k: int) -> str:
+            return palette.get(node_cohort.get(k, "mixed"), "#888888")
+
     fig, ax = plt.subplots(figsize=figsize)
-    hierarchy.dendrogram(
+    d = hierarchy.dendrogram(
         Z,
         labels=labels_sub,
         leaf_rotation=90,
-        leaf_font_size=8,
-        color_threshold=color_threshold_ratio * float(Z[:, 2].max()),
+        leaf_font_size=0 if palette is not None else 8,
+        color_threshold=0 if palette is not None else color_threshold_ratio * float(Z[:, 2].max()),
+        link_color_func=_link_color_func if palette is not None else None,
         ax=ax,
     )
-    ax.set_title(
-        f"{method.title()} hierarchical clustering ({metric}) – "
-        f"{len(idx)} random samples"
-    )
-    ax.set_ylabel("Linkage distance")
+
+    # Color the x-tick labels by cohort when palette is provided
+    if palette is not None:
+        leaves = d["leaves"]
+        for tick, leaf_idx in zip(ax.get_xticklabels(), leaves):
+            tick.set_color(palette.get(str(labels_sub[leaf_idx]), "black"))
+        # Legend
+        from matplotlib.patches import Patch
+        handles = [Patch(facecolor=palette[l], label=l)
+                   for l in sorted(set(str(lb) for lb in labels_sub)) if l in palette]
+        ax.legend(handles=handles, loc="upper right", frameon=False, fontsize=11)
+
+    ax.set_ylabel("Linkage distance", fontsize=12)
+    ax.tick_params(axis="y", labelsize=11)
     fig.tight_layout()
 
     show_or_save(fig, save_path=save_path, show=show)

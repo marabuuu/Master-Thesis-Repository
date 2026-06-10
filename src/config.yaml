@@ -113,15 +113,18 @@ poc_breast_vs_liver_visualize_latents:
   latent_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
   csv_path: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
   patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  output_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/latent_plots
+  output_dir: ../experiments/20260524_poc_breast_vs_liver_genomic_features/latent_plots_clean
   patient_col: Patient_ID
   label_col: cohort
+  palette_override:
+    TCGA-BRCA: "#FDAE61"   # amber — matches virchow2_umap_cohort
+    TCGA-LIHC: "#762A83"   # violet
 
 visualize_latents:
   latent_dir: ./experiments/20260528_genomic_features/genomic_h5
   csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
-  output_dir: ./experiments/20260528_genomic_features/latent_plots
+  output_dir: ../experiments/20260528_genomic_features/latent_plots_clean
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
 
@@ -1548,7 +1551,7 @@ virchow2_umap_cohort:
     - /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3   # BRCA (same as virchow2_umap)
     - /mnt/bulk-neptune/laura/mopadiv2/features/new/virchow2/TCGA-LIHC/virchow2-02627079                                   # ← fill in your LIHC path here
   patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  mode: patient                        # "patient" (1 pt per patient) or "tile" (1 pt per tile)
+  mode: tile                           # "patient" (1 pt per patient) or "tile" (1 pt per tile)
   output_dir: ./experiments/virchow2_umap_cohort
   max_tiles_per_patient: 50           # consistent with virchow2_umap (PAM50)
   n_neighbors: 15
@@ -1556,6 +1559,9 @@ virchow2_umap_cohort:
   metric: cosine
   seed: 42
   cmap_categorical: romaO
+  palette_override:                    # colorblind-safe (ColorBrewer PuOr): light amber=BRCA, dark violet=LIHC
+    TCGA-BRCA: "#FDAE61"
+    TCGA-LIHC: "#762A83"
   figsize:
   - 10
   - 8

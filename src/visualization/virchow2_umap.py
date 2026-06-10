@@ -345,11 +345,8 @@ def plot_umap_scatter(
         ax=ax,
     )
 
-    ax.set_title(title, fontsize=13, fontweight="bold")
-    ax.set_xticks([])
-    ax.set_yticks([])
-    ax.spines["top"].set_visible(False)
-    ax.spines["right"].set_visible(False)
+    ax.grid(True, linestyle="-", linewidth=0.5, color="0.88", zorder=0)
+    ax.set_axisbelow(True)
     ax.legend(bbox_to_anchor=(1.05, 1), loc="upper left", frameon=False,
               fontsize=9, title_fontsize=10)
 
@@ -373,7 +370,7 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     if not HAS_SNS:
         raise ImportError("seaborn is required.  pip install seaborn")
 
-    setup_style()
+    setup_style(extra_rc={"axes.labelsize": 13, "xtick.labelsize": 12, "ytick.labelsize": 12})
 
     # Support a single dir (features_dir) or a list (features_dirs).
     _dirs_cfg = cfg.get("features_dirs") or ([cfg["features_dir"]] if "features_dir" in cfg else None)
@@ -553,8 +550,12 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     if verbose:
         print(f"[Virchow2UMAP] Saved coordinates → {coords_path.name}")
 
-    # ── Palette — same build as dataset_statistics and visualize_latents ──────
-    palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
+    # ── Palette — explicit override wins; otherwise auto-build from colormap ──
+    palette_override: Optional[Dict[str, str]] = cfg.get("palette_override")
+    if palette_override:
+        palette = {k: str(v) for k, v in palette_override.items()}
+    else:
+        palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_umap_scatter(

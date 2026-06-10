@@ -138,7 +138,14 @@ def load_latents_from_dir(latent_dir: str, patient_splits: Optional[Dict[str, st
 
 
 def run_visualizations(config: dict, verbose: bool = True):
-    setup_style()
+    # Palette override: if supplied in config, use it for all plots
+    palette_override: Optional[Dict[str, str]] = config.get("palette_override")
+    if palette_override is not None:
+        palette_override = {str(k): str(v) for k, v in palette_override.items()}
+
+    setup_style(extra_rc={"font.size": 12, "axes.labelsize": 13,
+                           "xtick.labelsize": 12, "ytick.labelsize": 12,
+                           "legend.fontsize": 11, "legend.title_fontsize": 12})
 
     latent_dir = config["latent_dir"]
     clinical_csv = config["csv_path"]
@@ -219,17 +226,20 @@ def run_visualizations(config: dict, verbose: bool = True):
 
     # 5. UMAP
     if verbose: print("[Latents] Computing UMAP...")
-    X_umap, _ = plot_umap(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "UMAP.png")
+    X_umap, _ = plot_umap(X, y_subtype, style_labels=y_split, markers=markers,
+                           palette=palette_override, save_path=out_dir / "UMAP.png")
     df_all["UMAP1"] = X_umap[:, 0]
     df_all["UMAP2"] = X_umap[:, 1]
 
     # 6. t-SNE
     if verbose: print("[Latents] Computing t-SNE...")
-    X_tsne, _ = plot_tsne(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "tSNE.png")
-    
+    X_tsne, _ = plot_tsne(X, y_subtype, style_labels=y_split, markers=markers,
+                           palette=palette_override, save_path=out_dir / "tSNE.png")
+
     # 8. PCA
     if verbose: print("[Latents] Computing PCA...")
-    X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "PCA.png")
+    X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers,
+                            palette=palette_override, save_path=out_dir / "PCA.png")
 
     # 8.b PCA variance scree plot
     if verbose: print("[Latents] PCA variance scree plot...")
@@ -244,7 +254,7 @@ def run_visualizations(config: dict, verbose: bool = True):
     _unique_subtypes = sorted(set(y_subtype))
     _subtype_markers = {s: _marker_shapes[i % len(_marker_shapes)] for i, s in enumerate(_unique_subtypes)}
     try:
-        plot_umap(X, y_split, title="UMAP — coloured by data split", style_labels=y_subtype,
+        plot_umap(X, y_split, style_labels=y_subtype,
                   markers=_subtype_markers,
                   save_path=out_dir / "UMAP_split.png", show=False)
     except Exception as e:
@@ -253,9 +263,10 @@ def run_visualizations(config: dict, verbose: bool = True):
     # 9. Cosine Distance Clustermap
     if verbose: print("[Latents] Plotting Cosine Clustermap...")
     n_sample = min(200, len(X))
-    # Pass labels so we can see the subtype along the edges
-    plot_cosine_distance_clustermap(X, labels=y_subtype, n_samples=n_sample, save_path=out_dir / "cosine_distance_matrix_clustermap.png")
-    
+    plot_cosine_distance_clustermap(X, labels=y_subtype, n_samples=n_sample,
+                                    palette=palette_override,
+                                    save_path=out_dir / "cosine_distance_matrix_clustermap.png")
+
     # 10. Silhouette
     if verbose: print("[Latents] Computing Silhouette scores...")
     try:
@@ -265,7 +276,9 @@ def run_visualizations(config: dict, verbose: bool = True):
             print(f"  Silhouette (raw 512-D, cosine):    {sil_raw:.3f}")
             print(f"  Silhouette (UMAP 2-D, euclidean):  {sil_umap:.3f}")
 
-        plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col, metric="euclidean", save_path=out_dir / "silhouette_per_subtype_umap.png")
+        plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col,
+                                  metric="euclidean", palette=palette_override,
+                                  save_path=out_dir / "silhouette_per_subtype_umap.png")
     except Exception as e:
         print(f"  ⚠️ Silhouette failed: {e}")
 
@@ -282,7 +295,8 @@ def run_visualizations(config: dict, verbose: bool = True):
     if verbose: print("[Latents] Plotting Dendrogram...")
     try:
         n_sample_dendro = min(150, len(X))
-        plot_dendrogram(X, y_subtype, n_samples=n_sample_dendro, metric="cosine", method="ward", save_path=out_dir / "ward_dendrogram.png")
+        plot_dendrogram(X, y_subtype, n_samples=n_sample_dendro, metric="cosine", method="ward",
+                        palette=palette_override, save_path=out_dir / "ward_dendrogram.png")
     except Exception as e:
         print(f"  ⚠️ Dendrogram failed: {e}")
 

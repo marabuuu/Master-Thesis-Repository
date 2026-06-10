@@ -1584,6 +1584,287 @@ def plot_poc_ablation(
 
 
 # ===================================================================
+#  Paper-style per-run figures  (two standalone PNGs)
+# ===================================================================
+
+_PAPER_RC: Dict[str, Any] = {
+    "font.family": "sans-serif",
+    "font.size": 11,
+    "axes.labelsize": 11,
+    "xtick.labelsize": 10,
+    "ytick.labelsize": 10,
+    "legend.fontsize": 10,
+    "legend.framealpha": 0.85,
+    "legend.edgecolor": "0.75",
+    "axes.linewidth": 0.8,
+    "xtick.major.width": 0.7,
+    "ytick.major.width": 0.7,
+    "xtick.direction": "out",
+    "ytick.direction": "out",
+    "savefig.dpi": 300,
+    "savefig.bbox": "tight",
+}
+
+
+def _paper_style() -> None:
+    import matplotlib.pyplot as _plt
+    _plt.rcParams.update(_PAPER_RC)
+
+
+def _strip_spines(ax: Any) -> None:
+    ax.spines["top"].set_visible(False)
+    ax.spines["right"].set_visible(False)
+    ax.grid(True, linestyle="--", linewidth=0.4, alpha=0.45, color="0.65")
+    ax.set_axisbelow(True)
+
+
+def _add_panel_label(ax: Any, label: str) -> None:
+    ax.text(
+        0.03, 0.97, label,
+        transform=ax.transAxes,
+        fontsize=10, fontweight="bold",
+        va="top", ha="left",
+    )
+
+
+def _batlow_colors(positions: List[float]) -> List[str]:
+    try:
+        from cmcrameri import cm as cmc
+        cmap = cmc.batlow
+    except (ImportError, AttributeError):
+        import matplotlib as _mpl
+        cmap = _mpl.colormaps["viridis"]
+    import matplotlib as _mpl
+    return [_mpl.colors.to_hex(cmap(p)) for p in positions]
+
+
+def _subsample_series(
+    steps: List[float],
+    values: List[float],
+    n: int,
+) -> Tuple[List[float], List[float]]:
+    """Uniform subsample to at most *n* points, preserving first and last."""
+    if len(steps) <= n:
+        return steps, values
+    idx = np.round(np.linspace(0, len(steps) - 1, n)).astype(int)
+    return [steps[i] for i in idx], [values[i] for i in idx]
+
+
+def plot_paper_losses(
+    run_dir: Union[str, Path],
+    out_path: Union[str, Path],
+    ylim_top: Optional[float] = None,
+) -> None:
+    """Single-panel paper figure: train loss (noisy + EMA) + val + val shuffled.
+
+    The raw training loss is shown as a thin, semi-transparent trace so the
+    step-to-step noise is visible.  A heavily EMA-smoothed overlay provides the
+    readable trend line.  No panel title — only axis labels and panel label (a).
+
+    Args:
+        ylim_top: If given, fix the y-axis upper limit to this value (useful for
+            comparing plots across runs on a shared scale).
+    """
+    import matplotlib.pyplot as _plt
+    import matplotlib.ticker as _ticker
+
+    _paper_style()
+
+    data = load_gda_tfevents(run_dir)
+
+    tr_steps, tr_vals   = data.get("loss/train", ([], []))
+    va_steps_raw, va_vals_raw = data.get("loss/val", ([], []))
+    vs_steps_raw, vs_vals_raw = data.get("loss/val_shuffled", ([], []))
+    va_steps, va_vals = _aggregate_by_step(va_steps_raw, va_vals_raw)
+    vs_steps, vs_vals = _aggregate_by_step(vs_steps_raw, vs_vals_raw)
+
+    if not tr_vals:
+        raise RuntimeError(f"loss/train not found in {run_dir}")
+
+    # Raw: subsample to ~2 500 pts → noise is visible but not overwhelming
+    tr_s_raw, tr_v_raw = _subsample_series(
+        [s / 1e6 for s in tr_steps], list(tr_vals), 2_500
+    )
+    # Smooth: EMA with α=0.005 (slow-tracking → very smooth trend)
+    tr_s_ema, tr_v_ema = _ema_series(
+        [s / 1e6 for s in tr_steps], list(tr_vals), alpha=0.005
+    )
+
+    c_train, c_val, c_shuf = _batlow_colors([0.15, 0.55, 0.80])
+
+    fig, ax = _plt.subplots(figsize=(5.2, 3.4))
+
+    # Noisy raw trace
+    ax.plot(tr_s_raw, tr_v_raw, lw=0.4, alpha=0.20, color=c_train, rasterized=True)
+    # Smooth overlay
+    ax.plot(tr_s_ema, tr_v_ema, lw=1.8, alpha=0.95, color=c_train, label="Train loss")
+
+    if va_vals:
+        ax.plot(
+            [s / 1e6 for s in va_steps], va_vals,
+            lw=1.6, color=c_val, label="Val loss",
+        )
+
+    ax.set_xlabel("Samples (×10⁶)")
+    ax.set_ylabel("MSE loss")
+    ax.legend(loc="upper right")
+    _strip_spines(ax)
+    _add_panel_label(ax, "(a)")
+
+    # Focus on converged region (skip the opening loss spike)
+    if ylim_top is not None:
+        ax.set_ylim(bottom=0, top=ylim_top)
+    elif tr_v_ema:
+        post_spike = [v for s, v in zip(tr_s_ema, tr_v_ema) if s > 0.5]
+        if post_spike:
+            ax.set_ylim(bottom=0, top=min(max(post_spike) * 2.5, 0.6))
+
+    fig.tight_layout()
+    fig.savefig(out_path)
+    _plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def plot_paper_conditioning(
+    run_dir: Union[str, Path],
+    out_path: Union[str, Path],
+    ylims: Optional[Dict[str, float]] = None,
+) -> None:
+    """Three-panel paper figure: conditioning signal, gap, and BRCA–LIHC separation.
+
+    Each panel shows the raw noisy trace (thin, low alpha) plus a smoothed overlay.
+    No panel titles — y-axis labels carry the metric names.
+
+    Args:
+        ylims: Optional dict with keys "signal", "gap", "sep" setting the y-axis
+            upper limit for each panel (useful for shared axes across runs).
+    """
+    import matplotlib.pyplot as _plt
+    import matplotlib.ticker as _ticker
+
+    _paper_style()
+
+    if ylims is None:
+        ylims = {}
+
+    data = load_gda_tfevents(run_dir)
+
+    sig_steps, sig_vals   = data.get("cond/signal", ([], []))
+    gap_steps_r, gap_v_r  = data.get("cond/gap", ([], []))
+    sep_steps, sep_vals   = data.get("cond/brca_lihc_sep", ([], []))
+    gap_steps, gap_vals   = _aggregate_by_step(gap_steps_r, gap_v_r)
+
+    c_sig, c_gap, c_sep = _batlow_colors([0.20, 0.55, 0.78])
+
+    fig, axes = _plt.subplots(1, 3, figsize=(10.5, 3.2))
+
+    panels = [
+        (axes[0], sig_steps, sig_vals, c_sig, "Conditioning signal", "signal"),
+        (
+            axes[1],
+            [float(s) for s in gap_steps],
+            gap_vals,
+            c_gap,
+            "Conditioning gap",
+            "gap",
+        ),
+        (axes[2], sep_steps, sep_vals, c_sep, "BRCA–LIHC separation", "sep"),
+    ]
+
+    for ax, steps, vals, color, ylabel, ylim_key in panels:
+        if not vals:
+            ax.text(0.5, 0.5, "no data", transform=ax.transAxes,
+                    ha="center", va="center", color="0.5", fontsize=9)
+            ax.set_xlabel("Samples (×10⁶)")
+            ax.set_ylabel(ylabel)
+            _strip_spines(ax)
+            ax.yaxis.set_major_formatter(
+                _ticker.ScalarFormatter(useMathText=True)
+            )
+            ax.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
+            continue
+
+        s_M = [s / 1e6 for s in steps]
+
+        # Raw noisy trace (subsampled to ~1 500 pts)
+        s_raw, v_raw = _subsample_series(s_M, list(vals), 1_500)
+        ax.plot(s_raw, v_raw, lw=0.4, alpha=0.20, color=color, rasterized=True)
+
+        # EMA smooth overlay
+        s_ema, v_ema = _ema_series(s_M, list(vals), alpha=0.05)
+        ax.plot(s_ema, v_ema, lw=1.8, alpha=0.95, color=color)
+
+        ax.set_xlabel("Samples (×10⁶)")
+        ax.set_ylabel(ylabel)
+        ax.yaxis.set_major_formatter(
+            _ticker.ScalarFormatter(useMathText=True)
+        )
+        ax.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
+        top = ylims.get(ylim_key)
+        # Only apply the shared ylim when the series has meaningful values on
+        # that scale (> 1 % of top). Otherwise let matplotlib auto-scale so
+        # near-zero runs (e.g. zeros conditioning) still show their flat line.
+        data_max = max(abs(v) for v in vals) if vals else 0.0
+        if top is not None and data_max >= 0.01 * top:
+            ax.set_ylim(bottom=0, top=top)
+        else:
+            ax.set_ylim(bottom=0)
+        _strip_spines(ax)
+
+    fig.tight_layout(w_pad=2.5)
+    fig.savefig(out_path)
+    _plt.close(fig)
+    print(f"Saved: {out_path}")
+
+
+def compute_shared_ylims(run_dirs: List[Union[str, Path]]) -> Dict[str, float]:
+    """Compute y-axis upper limits that span all supplied run directories.
+
+    Returns a dict with keys:
+        "loss_top"   — for plot_paper_losses  (ylim_top)
+        "signal"     — for plot_paper_conditioning  ylims["signal"]
+        "gap"        — for plot_paper_conditioning  ylims["gap"]
+        "sep"        — for plot_paper_conditioning  ylims["sep"]
+    """
+    margin = 1.2
+
+    loss_post_max = 0.0
+    sig_max = 0.0
+    gap_max = 0.0
+    sep_max = 0.0
+
+    for rd in run_dirs:
+        data = load_gda_tfevents(rd)
+
+        # Val loss — only look at the converged region (> 0.5 M samples)
+        va_s_r, va_v_r = data.get("loss/val", ([], []))
+        va_steps, va_vals = _aggregate_by_step(va_s_r, va_v_r)
+        post = [v for s, v in zip(va_steps, va_vals) if s > 5e5]
+        if post:
+            loss_post_max = max(loss_post_max, max(post))
+
+        sig_s, sig_v = data.get("cond/signal", ([], []))
+        if sig_v:
+            sig_max = max(sig_max, max(sig_v))
+
+        gap_s_r, gap_v_r = data.get("cond/gap", ([], []))
+        _, gap_v = _aggregate_by_step(gap_s_r, gap_v_r)
+        if gap_v:
+            gap_max = max(gap_max, max(gap_v))
+
+        sep_s, sep_v = data.get("cond/brca_lihc_sep", ([], []))
+        if sep_v:
+            sep_max = max(sep_max, max(sep_v))
+
+    return {
+        "loss_top": loss_post_max * 3.0 if loss_post_max > 0 else None,
+        "signal":   sig_max * margin if sig_max > 0 else None,
+        "gap":      gap_max * margin if gap_max > 0 else None,
+        "sep":      sep_max * margin if sep_max > 0 else None,
+    }
+
+
+# ===================================================================
 #  CLI entry-point
 # ===================================================================
 
@@ -1619,8 +1900,28 @@ if __name__ == "__main__":
         description="Plot training diagnostics from TFEvents."
     )
     parser.add_argument(
-        "--mode", choices=["cfg", "gda", "poc_ablation"], default="cfg",
-        help="'cfg' = CFG backbone run; 'gda' = GDA v13; 'poc_ablation' = 4-mode PoC comparison.",
+        "--mode", choices=["cfg", "gda", "poc_ablation", "per_run"], default="cfg",
+        help=(
+            "'cfg' = CFG backbone 4-panel; 'gda' = GDA v13 7-panel; "
+            "'poc_ablation' = 4-mode PoC grid; "
+            "'per_run' = two paper-quality PNGs for one run directory."
+        ),
+    )
+    # per_run mode
+    parser.add_argument(
+        "--run-dir", default=None,
+        help="[per_run] Single run directory. Use --run-dirs for multiple.",
+    )
+    parser.add_argument(
+        "--run-dirs", nargs="+", default=None,
+        help=(
+            "[per_run] One or more run directories. When more than one is given "
+            "the y-axis limits are shared across all plots so they are comparable."
+        ),
+    )
+    parser.add_argument(
+        "--out-dir", default=None,
+        help="[per_run] Output directory (default: same as each run dir).",
     )
     # CFG-mode args
     parser.add_argument(
@@ -1653,6 +1954,47 @@ if __name__ == "__main__":
     kwargs: dict = {}
     if args.title:
         kwargs["title"] = args.title
+
+    if args.mode == "per_run":
+        # Collect the list of run dirs: --run-dirs wins over --run-dir
+        if args.run_dirs:
+            run_dirs = [Path(d).resolve() for d in args.run_dirs]
+        elif args.run_dir:
+            run_dirs = [Path(args.run_dir).resolve()]
+        else:
+            parser.error("--run-dir or --run-dirs is required for per_run mode")
+
+        # Compute shared y-axis limits when comparing multiple runs
+        shared: Dict[str, Any] = {}
+        if len(run_dirs) > 1:
+            print(f"Computing shared y-limits across {len(run_dirs)} run(s)...")
+            shared = compute_shared_ylims(run_dirs)
+            fmt = lambda v: f"{v:.4g}" if v is not None else "None"
+            print(f"  loss_top={fmt(shared['loss_top'])}  "
+                  f"signal={fmt(shared['signal'])}  "
+                  f"gap={fmt(shared['gap'])}  "
+                  f"sep={fmt(shared['sep'])}")
+
+        shared_out_dir = Path(args.out_dir).resolve() if args.out_dir else None
+        use_prefix = shared_out_dir is not None and len(run_dirs) > 1
+
+        for run_dir in run_dirs:
+            out_dir = shared_out_dir if shared_out_dir else run_dir
+            out_dir.mkdir(parents=True, exist_ok=True)
+            # Use the experiment directory name (parent of /gda) for uniqueness
+            prefix = f"{run_dir.parent.name}_" if use_prefix else ""
+            print(f"per_run | run_dir={run_dir} | out_dir={out_dir} | prefix={prefix!r}")
+            plot_paper_losses(
+                run_dir,
+                out_dir / f"{prefix}training_losses.png",
+                ylim_top=shared.get("loss_top"),
+            )
+            plot_paper_conditioning(
+                run_dir,
+                out_dir / f"{prefix}conditioning_metrics.png",
+                ylims={k: shared[k] for k in ("signal", "gap", "sep") if shared.get(k)},
+            )
+        _sys.exit(0)
 
     if args.mode == "cfg":
         out_path = Path(args.out or _CFG_OUT)

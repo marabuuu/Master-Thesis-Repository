@@ -387,6 +387,7 @@ def generate_cohort_tiles(
     seed: int,
     skip_existing: bool = True,
     genomic_h5_dir: Optional[Path] = None,
+    normalize_feats: bool = False,
 ) -> None:
     """Generate and save per-patient ZIPs for one cohort.
 
@@ -394,6 +395,8 @@ def generate_cohort_tiles(
     If ``genomic_h5_dir`` is given, each patient's own H5 feature vector is
     used as conditioning instead of the shared ``cond_vec`` (needed for
     conditioning_type="real" RNA models).
+    ``normalize_feats`` must match the training config: when True, H5 features
+    are L2-normalized to unit norm before conditioning, matching _resolve_feats.
     """
     out_dir.mkdir(parents=True, exist_ok=True)
     n_patients = len(patient_ids)
@@ -415,6 +418,9 @@ def generate_cohort_tiles(
             if patient_cond is None:
                 logger.warning(f"  [{p_idx+1}/{n_patients}] {pid}: H5 not found, skipping")
                 continue
+            if normalize_feats:
+                import torch.nn.functional as _F
+                patient_cond = _F.normalize(patient_cond, p=2, dim=-1)
         else:
             patient_cond = cond_vec
 
@@ -660,6 +666,7 @@ def run(
                 seed=seed,
                 skip_existing=True,
                 genomic_h5_dir=genomic_h5_dir,
+                normalize_feats=normalize_feats,
             )
     else:
         logger.info("--skip-generate: skipping tile generation")

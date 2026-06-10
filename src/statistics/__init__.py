@@ -11,7 +11,10 @@ fid_score
     Compute FID between real and generated images.
 """
 
-from .fid_score import compute_fid
+try:
+    from .fid_score import compute_fid
+except ImportError:
+    pass
 from .training_curves import load_scalars, plot_training_stats
 
 __all__ = [
