@@ -1,46 +1,10 @@
-# python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz
+# src/config.yaml — active pipeline configuration
+# Run: python run_pipeline.py --config src/config.yaml --stage <name>
+# Archived/superseded configs: src/drafts/config_archived.yaml
 
-dataset_statistics:
-  clinical_csv: ../dataframes/brca_subtypes.csv
-  patient_col: bcr_patient_barcode
-  subtype_col: Majority_Subtype_mRNA
-  stage_col: ajcc_pathologic_tumor_stage
-  menopause_col: menopause_status
-  os_time_col: OS.time
-  os_event_col: OS
-  palette_override:
-    Normal: "#F4A7B9"   # soft pink — distinguishable from Basal (berry)
-  masks_dir: ./experiments/20260509_tfd_separability/masks
-  output_dir: ./experiments/20260504_dataset_statistics
-  plots:
-  - tumor_stage_distribution
-  - menopause_distribution
-  - subtype_distribution
-  - kaplan_meier_by_subtype
-  - combined_overview
-  cmap_categorical: romaO
-  cmap_sequential: batlow
-  figsize_distributions:
-  - 10
-  - 6
-  figsize_pie:
-  - 8
-  - 8
-  figsize_km:
-  - 10
-  - 7
-  figsize_combined:
-  - 14
-  - 10
-  dpi: 200
-  min_patients_km: 10
-  
-downscale_tiles:
-  input_dir: ../data/Liver-tumor-tiles-final
-  output_dir: ../data/Liver-tumor-tiles-128
-  target_size: 128
-  num_workers: 18
-  compression: stored    # stored = no outer zip compression (PNGs are already compressed internally)
+# ═════════════════════════
+# 1. DATA PREPROCESSING
+# ═════════════════════════
 
 preprocessing:
   zip_dir: ../data/TCGA
@@ -66,6 +30,17 @@ tar_to_tumor_zip:
   area_threshold: 0.6
   selection_mode: overlap
   annotation_buffer: 0.0
+
+downscale_tiles:
+  input_dir: ../data/Liver-tumor-tiles-final
+  output_dir: ../data/Liver-tumor-tiles-128
+  target_size: 128
+  num_workers: 18
+  compression: stored    # stored = no outer zip compression (PNGs are already compressed internally)
+
+# ═════════════════════════
+# 2. FEATURE EXTRACTION
+# ═════════════════════════
 
 build_genomic_features:
   csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
@@ -111,268 +86,6 @@ poc_breast_vs_liver_genomic_features:
     test: 0.10
     seed: 42
 
-poc_breast_vs_liver_visualize_latents:
-  latent_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  csv_path: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  output_dir: ../experiments/20260524_poc_breast_vs_liver_genomic_features/latent_plots_clean
-  patient_col: Patient_ID
-  label_col: cohort
-  palette_override:
-    TCGA-BRCA: "#FDAE61"   # amber — matches virchow2_umap_cohort
-    TCGA-LIHC: "#762A83"   # violet
-  label_rename:
-    TCGA-BRCA: Breast
-    TCGA-LIHC: Liver
-
-visualize_latents:
-  latent_dir: ./experiments/20260528_genomic_features/genomic_h5
-  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
-  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
-  output_dir: ../experiments/20260528_genomic_features/latent_plots_clean
-  patient_col: Patient_ID
-  label_col: Majority_Subtype_mRNA
-  palette_override:
-    Normal: "#F4A7B9"  # soft pink — visually distinct from Basal (berry)
-  hue_title: "PAM50 Subtype"
-  style_title: "Split"
-
-training_stats:
-  logdir: ./experiments/20260517_gda_v13
-  output_dir: ./experiments/20260517_gda_v13/training_stats
-  plots:
-  - loss_curves
-  - genomic_diagnostics
-  #- batch_trajectory
-  - train_val_comparison
-  #- early_stopping
-  - summary
-  figsize:
-  - 16
-  - 12
-  cmap_categorical: batlowS
-  cmap_sequential: batlow
-
-tfd_separability:
-  tiles_zip_dir: ../data/BRCA-tumor-tiles-final
-  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
-  patient_col: Patient_ID
-  subtype_col: Majority_Subtype_mRNA
-  #classes:
-  #- Basal
-  #- LumA
-
-  max_tiles_by_subtype:
-    LumA: 45
-    LumB: 120
-    Basal: 135
-    Her2: 300
-    Normal: null
-  masks_dir: ../experiments/20260509_tfd_separability/masks
-  auto_segment: true
-  force_resegment: false
-  num_classes: 32
-  weights_dataset: TCGA
-  device: null
-  batch_size: 4
-  grouping_json: null
-  use_alpha_complex: true
-  n_landscape_bins: 100
-  n_landscape_layers: 1
-  min_cells_per_image: 3
-  compute_noise_floor: true
-  n_noise_floor_splits: 5
-  output_dir: ../experiments/20260509_tfd_separability/results
-  save_heatmap: true
-  figsize: null
-
-# ── PoC: DeepCMorph segmentation on LIHC tiles (TCGA-BRCA vs TCGA-LIHC) ──────
-# Segments only LIHC patients (BRCA masks already at 20260509_tfd_separability).
-# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_poc
-tfd_separability_poc:
-  tiles_zip_dir: ../data/Liver-tumor-tiles-final
-  metadata_csv: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
-  patient_col: Patient_ID
-  subtype_col: cohort
-  classes:
-    - TCGA-LIHC
-  max_tiles_by_subtype:
-    TCGA-LIHC: null        # no cap — use all tiles per patient
-  masks_dir: ../experiments/20260529_tfd_separability_poc/lihc_masks
-  auto_segment: true
-  force_resegment: false
-  num_classes: 32
-  weights_dataset: TCGA
-  device: null
-  batch_size: 4
-  grouping_json: null
-  use_alpha_complex: true
-  n_landscape_bins: 100
-  n_landscape_layers: 1
-  min_cells_per_image: 3
-  compute_noise_floor: false  # single class — no pairwise TFD
-  output_dir: ../experiments/20260529_tfd_separability_poc/results
-  save_heatmap: false
-
-# ── TopoFD separability on generated tiles (cross-attention experiment) ────────
-# Segments generated Basal and LumA tiles, then computes pairwise TFD between
-# the two classes to measure whether the model has learned morphologically
-# distinct outputs for each subtype.
-# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_generated
-tfd_separability_generated:
-  class_tiles_dirs:
-    Basal: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/generated/Basal
-    LumA: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/generated/LumA
-  masks_dir: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/tfd_masks
-  output_dir: ../experiments/20260407_gene_token_cross_attention_training/fid_evaluation_5k/tfd_results
-  auto_segment: true
-  force_resegment: false
-  num_classes: 32
-  weights_dataset: TCGA
-  device: null
-  max_tiles_by_class: {}
-  use_alpha_complex: true
-  n_landscape_bins: 100
-  n_landscape_layers: 1
-  min_cells_per_image: 3
-  compute_noise_floor: true
-  n_noise_floor_splits: 5
-  save_heatmap: true
-
-tfd_separability_viz:
-  # ── Input ─────────────────────────────────────────────────────────────────
-  results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
-  tiles_dir: ../data/BRCA-tumor-tiles-final
-  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
-  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
-  patient_col: Patient_ID
-  subtype_col: Majority_Subtype_mRNA
-  classes: null
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/plots
-
-  # ── Plots to generate ─────────────────────────────────────────────────────
-  # Each plot that involves per-tile data also saves a sidecar JSON with
-  # patient-level Kruskal-Wallis + pairwise Mann-Whitney U (BH FDR) results.
-  plots:
-    #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
-    - cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
-    #- tile_mask_examples     # matched H&E tiles + classification masks (requires tiles_dir)
-    #- ternary_composition     # epithelium-immune-connective triangle plot
-    #- nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
-    #- cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
-    - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
-    - voronoi_distribution    # cell dispersion via Voronoi areas
-    #- knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
-    #- radar_contributions    # radar/spider chart with blended subtype colours
-
-  # ── Tile sampling ──────────────────────────────────────────────────────────
-  max_tiles_per_subtype: 2000   # cap for boxplots + ternary (fast pixel ops)
-  max_tiles_spatial: 150        # faster spatial pass: fewer tiles per subtype
-  ripley_n_bootstrap: 20        # reduce CSR simulations for Ripley L(r) envelopes
-  include_background: false
-  seed: 42
-
-  # ── Styling (Crameri scientific colour maps) ──────────────────────────────
-  cmap_categorical: romaO       # subtype colours (radar, ternary)
-  cmap_cell_types: batlow       # cell-type colours in boxplots + NN violins
-  cmap_heatmap: lajolla         # sequential colourmap for all heatmaps
-  figsize_radar: null           # null = auto (9x9 square)
-  figsize_heatmap: null         # null = auto
-  figsize_boxplot: null         # null = auto
-  figsize_ternary: null         # null = auto (9x8.5)
-  figsize_nn_violins: null      # null = auto (same layout as boxplots)
-  figsize_proximity: null       # null = auto (5 panels x 6x6 matrix)
-  dpi: 200
-
-# ── Cohort comparison: BRCA vs LIHC cell-type biology ─────────────────────────
-# One panel per cell type; each panel shows both cohorts side-by-side.
-# Statistical tests: Mann-Whitney U per cell type, global BH FDR; effect size
-# = rank-biserial r.  Annotations shown only when q<0.05 AND |r|≥0.11.
-# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz_poc
-tfd_separability_viz_poc:
-  cohorts:
-    TCGA-BRCA:
-      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
-    TCGA-LIHC:
-      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/lihc_masks
-  cohort_labels:
-    TCGA-BRCA: "Breast"
-    TCGA-LIHC: "Liver"
-  cohort_palette:
-    TCGA-BRCA: "#FDAE61"   # amber — matches latent-space UMAP
-    TCGA-LIHC: "#762A83"   # violet
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/cohort_plots
-  plots:
-    - cell_type_boxplots      # → cohort_cell_type_boxplots.png + stats JSON
-    - nn_distance_violins     # → cohort_nn_distance_violins.png + stats JSON
-    - ripley_L                # → cohort_ripley_L.png + stats JSON
-    - combined_panel          # → cohort_combined_panel.png (3-row × 6-col overview)
-  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
-  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
-  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
-  include_background: false
-  ripley_n_bootstrap: 20
-  dpi: 200
-  seed: 42
-
-# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz_subtype
-tfd_separability_viz_subtype:
-  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
-  metadata_csv: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
-  patient_col: Patient_ID
-  subtype_col: Majority_Subtype_mRNA
-  subtype_order:
-    - Normal
-    - LumA
-    - LumB
-    - Her2
-    - Basal
-  subtype_palette:
-    Normal: "#F4A7B9"   # soft pink override (romaO default too light)
-  cmap_categorical: romaO
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/subtype_plots
-  plots:
-    - cell_type_boxplots      # → subtype_cell_type_boxplots.png + stats JSON
-    - nn_distance_violins     # → subtype_nn_distance_violins.png + stats JSON
-    - ripley_L                # → subtype_ripley_L.png + stats JSON
-    - pairwise_r_matrix       # → subtype_pairwise_r_matrix.png (reads stats JSON, no mask loading)
-    - combined_panel          # → subtype_combined_panel.png (3-row × 6-col overview)
-  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
-  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
-  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
-  include_background: false
-  ripley_n_bootstrap: 20
-  dpi: 200
-  seed: 42
-
-segmentation:
-  reference_tiles_dir: ./experiments/20260316_joint_training/sampling_image_guided/original_samples
-  synthetic_tiles_dir: ./experiments/20260316_joint_training/sampling_image_guided/reconstructed_samples
-  reference_masks_dir: ./experiments/20260316_joint_training/segmentation/reference_masks
-  synthetic_masks_dir: ./experiments/20260316_joint_training/segmentation/synthetic_masks
-  num_classes: 32
-  weights_dataset: TCGA
-  device: null
-  batch_size: 4
-  num_workers: 4
-  input_format: zip
-  save_nuclei_seg: true
-  per_patient_dirs: true
-  max_tiles_per_zip: null
-  grouping_json: null
-  save_visualizations: true
-  num_visualization_samples: 1
-  output_dir: ./experiments/20260316_joint_training/segmentation/visualizations
-  topofd:
-    enabled: true
-    use_alpha_complex: true
-    n_landscape_bins: 100
-    n_landscape_layers: 1
-    min_cells_per_image: 3
-    output_dir: ./experiments/20260316_joint_training/segmentation/topofd_results
-    save_detailed_report: true
-    save_visualizations: false
-
 subtype_classifier:
   mode: evaluate
   features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
@@ -394,265 +107,13 @@ subtype_classifier:
   evaluate:
     model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
 
-# ── PoC: GDA v13 on BRCA vs LIHC (2026-05-24) ────────────────────────────────────────────
-# Proof-of-concept: binary breast vs liver discrimination.
-# Same architecture as v13 (BRCA PAM50) — zero training-code changes.
-#
-# Key differences from v13:
-#   zip_dir      → combined symlink dir (BRCA 512px + LIHC 256px tiles)
-#   do_resize    → true: upsizes LIHC tiles 256→512 at load time (BRCA unchanged)
-#   genomic_*    → PoC gene selection (cohort-discriminative, no PAM50 forcing)
-#   subtype_col  → 'cohort' (TCGA-BRCA / TCGA-LIHC); WeightedRandomSampler
-#                  auto-balances the ~7.8× BRCA/LIHC tile-count imbalance
-#   total_samples → 5M (binary task; 4× faster than 20M PAM50 run)
-#   contrastive_weight → 0.01 (SupCon still works with 2 classes)
-#
-# Hardware: 2×gpu48 on titan (503 GB RAM, 70 CPUs)
-#   batch_size: 8 → 4 per GPU  (same per-GPU footprint as DGX v13 at 4/GPU)
-#   accumulate_grad_batches: 4 → effective global batch = 32 (unchanged)
-#   ~2× slower than 4-GPU DGX run; ~2–3 days for 5M samples
-brca_pam50_cfg:
-  # ── CFG backbone: PAM50 subtype conditioning on TCGA-BRCA ─────────────────
-  # Same architecture as poc_breast_vs_liver_cfg.
-  # 5 PAM50 subtypes: LumA (506), LumB (195), Basal (168), Her2 (74), Normal (38)
-  # Runs on Titan: 2× gpu48 (RTX 6000 Ada, 48 GiB each).
-  training_mode: cfg_backbone
+# ═════════════════════════════════════════════════════════
+# 3. TRAINING — PoC: BRCA vs LIHC binary discrimination
+# ═════════════════════════════════════════════════════════
 
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ../data/BRCA-tumor-tiles-final
-  genomic_feature_dir: ./experiments/20260528_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
-  max_tiles_by_subtype:
 
-  # ── Backbone UNet ─────────────────────────────────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: true
+# ── 512×512 main run (DGX 4×A100, CFG backbone) ──────────────────────────
 
-  # ── CFG ───────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.20
-
-  # ── Optimisation ──────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 8          # 4 per GPU on 2× Titan gpu48 (RTX 6000 Ada = 48 GiB, not 70 GiB)
-  accumulate_grad_batches: 4   # effective global batch = 32
-  total_samples: 200000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  backbone_ckpt_path: ""   # train from scratch
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 50000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 50000
-  sample_size: 8
-  seed: 42
-  num_workers: 16
-  gpus: [0, 1]
-  output_dir: ./experiments/20260529_brca_pam50_cfg_v1
-  base_dir: ./experiments/20260529_brca_pam50_cfg_v1
-  logdir: ./experiments/20260529_brca_pam50_cfg_v1/gda
-
-poc_breast_vs_liver_cfg:
-  # ── CFG backbone: genomic features feed directly into backbone style MLP ──
-  # The backbone IS the conditioned denoiser; no separate adapter.
-  # CFG dropout replaces features with zeros on cfg_dropout% of batches.
-  # Health metric: cond/signal = E[‖backbone(cond) − backbone(null)‖²] must grow.
-  # Inference: ε_guided = ε_null + scale * (ε_cond − ε_null)
-  training_mode: cfg_backbone
-
-  # ── Data ────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
-  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  max_tiles_by_subtype:
-
-  # ── Backbone UNet ────────────────────────────────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  # Gradient checkpointing disabled: single forward pass + 80GB A100 has
-  # enough headroom. Checkpointing saves ~40% memory but costs ~30% compute.
-  net_beatgans_gradient_checkpoint: false
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.20   # 20% null batches — standard CFG training ratio
-
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 16               # 4 per GPU on 4×A100
-  accumulate_grad_batches: 2   # effective global batch = 32
-  total_samples: 200000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # Train from random init — no warm start.
-  # A backbone pre-trained without conditioning has no gradient incentive to
-  # start using it; conditioning and denoising must co-develop from step 1.
-  backbone_ckpt_path: ""
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 50000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 50000
-  sample_size: 8
-  seed: 42
-  num_workers: 24
-  gpus: [0, 1, 2, 3]
-  output_dir: ./experiments/20260529_poc_brca_lihc_cfg_v1
-  base_dir: ./experiments/20260529_poc_brca_lihc_cfg_v1
-  logdir: ./experiments/20260529_poc_brca_lihc_cfg_v1/gda
-
-poc_breast_vs_liver_cfg_brca_init:
-  # ── CFG backbone rescue: initialize from a BRCA MoPaDi checkpoint ──
-  # Same conditioning path as poc_breast_vs_liver_cfg, but backbone weights
-  # are warm-started from a pretrained BRCA diffusion checkpoint.
-  # This is additive: it does not modify the from-scratch run above.
-  training_mode: cfg_backbone
-
-  # ── Data ────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
-  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  max_tiles_by_subtype:
-
-  # ── Backbone UNet ────────────────────────────────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.20
-
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 8               # 4 per GPU on 2×48 GB Titan
-  accumulate_grad_batches: 4  # effective global batch = 32
-  total_samples: 2000000      # fast rescue run; increase later if needed
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # Warm-start from the BRCA-only backbone checkpoint.
-  backbone_ckpt_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260115_different_models_difficult_to_disentangle/TCGA-BRCA/splitting_mopadi_checkpoint/diffusion_only.ckpt
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 50000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 50000
-  sample_size: 8
-  seed: 42
-  num_workers: 24
-  gpus: [0, 1]
-  output_dir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init
-  base_dir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init
-  logdir: ./experiments/20260530_poc_brca_lihc_cfg_brca_init/gda
-
-# ── PoC v2: CFG backbone on Titan, 2×gpu48 (RTX 6000 Ada 48 GiB), ~24h run ──────────────────
-# Simpler than GDA: backbone receives genomic features directly with CFG dropout.
-# Uses CfgBackboneLitModel (no adapter), warm-started from cfg_v1 last.ckpt backbone weights.
-# BRCA capped at 300 tiles/patient → ~365K train tiles → manageable epoch size.
-poc_brca_lihc_cfg_v2:
-  training_mode: cfg_backbone
-
-  # ── Data (bulk-saturn NFS) ────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
-  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  # Cap BRCA at 300 tiles/patient (BRCA zips can have 5K–10K tiles; LIHC already small).
-  # With 1101 BRCA train patients × 300 tiles + ~290 LIHC train patients × ~120 tiles ≈ 365K train tiles.
-  # One epoch ≈ 365K / 8 = 45,600 steps. 2M samples = ~5.5 epochs.
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  # ── Warm-start: cfg_v1 backbone weights ──────────────────────────────────
-  # CfgBackboneLitModel._load_backbone_weights loads only backbone weights and
-  # resets style MLP + FiLM layers so they learn from real genomic inputs.
-  # Do NOT pass this as ckpt_path to Lightning — use backbone_ckpt_path only.
-  backbone_ckpt_path: ./experiments/20260529_poc_brca_lihc_cfg_v1/gda/autoenc/last.ckpt
-
-  # ── Architecture (same as v1 for comparison) ─────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: true
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.20
-
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 8                # 4 per GPU × 2 gpu48 (RTX 6000 Ada 48 GiB)
-  accumulate_grad_batches: 4   # effective global batch = 32
-  total_samples: 2000000       # 2M — ~24h on 2×gpu48 at ~3 it/s; enough to confirm cond/signal
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 50000
-  sample_size: 8
-  seed: 42
-  num_workers: 16              # 16 per GPU process (35 cpus/task); overlaps NFS seeks on large zips
-  gpus: [0, 1]
-
-  # ── Output ───────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260531_poc_brca_lihc_cfg_v2
-  base_dir: ./experiments/20260531_poc_brca_lihc_cfg_v2
-  logdir: ./experiments/20260531_poc_brca_lihc_cfg_v2/gda
-
-# ── PoC v2 DGX: same run as above but on DGX 4×A100 80GB ─────────────────────
-# Identical conditioning setup — parallel run for faster validation of cond/signal.
-# No gradient checkpointing (A100 80GB has headroom at batch=4/GPU).
 poc_brca_lihc_cfg_v2_dgx:
   training_mode: cfg_backbone
 
@@ -709,132 +170,13 @@ poc_brca_lihc_cfg_v2_dgx:
   base_dir: ./experiments/20260601_poc_brca_lihc_cfg_v2_dgx
   logdir: ./experiments/20260601_poc_brca_lihc_cfg_v2_dgx/gda
 
-# ══════════════════════════════════════════════════════════════════════════════
-# 128×128 POC conditioning ablations
+# ── 128×128 conditioning ablations (30 M samples each) ─────────────────────
 #
-# Four experiments sharing the same architecture and data (128px BRCA+LIHC
-# tiles), differing only in what the 512-dim conditioning vector contains:
-#
-#   poc_128_1hot  — two orthogonal binary codes (BRCA→0101..., LIHC→1010...)  ← run first
-#   poc_128_zero  — all-zeros (unconditional baseline, cond/signal must stay 0)
-#   poc_128_noise — fresh unit-sphere random vector per sample (random baseline)
-#   poc_128_rna   — real log1p+scaled RNA-seq (same as v2 but at 128px)
-#
-# Architecture: 4-level UNet (net_ch=64, mult=[1,2,4,8]) giving a 16×16
-# bottleneck — same proportional depth as the 512px 6-level runs but ~3× fewer
-# params and much faster iteration.  All from scratch (no backbone_ckpt_path).
-# ══════════════════════════════════════════════════════════════════════════════
-
-poc_128_1hot:
-  training_mode: cfg_backbone
-  conditioning_type: one_hot
-
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
-  genomic_feature_dir: null            # not used for one_hot
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  backbone_ckpt_path: ""               # train from scratch — clean FiLM init
-
-  # ── Architecture ─────────────────────────────────────────────────────────
-  img_size: 128
-  net_ch: 64
-  net_ch_mult: [1, 2, 4, 8]           # 4 levels: 128→64→32→16 (16×16 bottleneck)
-  net_attn: [16]                       # attention at bottleneck
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.20
-
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 2.0e-4
-  batch_size: 32                       # 8/GPU × 4 A100s
-  accum_batches: 1
-  total_samples: 5000000             # 5M — enough to confirm whether cond/signal emerges
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 25000
-  sample_size: 8
-  seed: 42
-  num_workers: 8
-  gpus: [0, 1, 2, 3]
-
-  # ── Output ───────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260603_poc_128_orthogonal
-  base_dir: ./experiments/20260603_poc_128_orthogonal
-  logdir: ./experiments/20260603_poc_128_orthogonal/gda
-
-poc_128_1hot_nonorm:
-  training_mode: cfg_backbone
-  conditioning_type: one_hot
-  normalize_feats: false    # codes keep natural magnitude (norm≈16) — tests whether unit-norm drowns the signal
-
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
-  genomic_feature_dir: null
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  backbone_ckpt_path: ""
-
-  # ── Architecture ─────────────────────────────────────────────────────────
-  img_size: 128
-  net_ch: 64
-  net_ch_mult: [1, 2, 4, 8]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  cfg_dropout: 0.15
-
-  backbone_lr: 2.0e-4
-  batch_size: 32
-  accum_batches: 1
-  total_samples: 5000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 25000
-  sample_size: 8
-  seed: 42
-  num_workers: 8
-  gpus: [0, 1, 2, 3]
-
-  output_dir: ./experiments/20260605_poc_128_orthogonal_nonorm
-  base_dir: ./experiments/20260605_poc_128_orthogonal_nonorm
-  logdir: ./experiments/20260605_poc_128_orthogonal_nonorm/gda
+#   poc_128_1hot_nonorm_30M  — orthogonal binary codes, no normalisation
+#   poc_128_class_embed_30M  — learned class embedding (BRCA=0, LIHC=1)
+#   poc_128_zero_30M         — all-zeros (unconditional baseline)
+#   poc_128_noise_30M        — unit-sphere random vector (random baseline)
+#   poc_128_rna_30M          — real log1p+scaled RNA-seq
 
 poc_128_1hot_nonorm_30M:
   training_mode: cfg_backbone
@@ -1107,383 +449,10 @@ poc_128_rna_30M:
   base_dir: ./experiments/20260607_poc_128_rna_norm_30M
   logdir: ./experiments/20260607_poc_128_rna_norm_30M/gda
 
-poc_128_zero:
-  training_mode: cfg_backbone
-  conditioning_type: zeros
+# ═══════════════════════════════════════════════════════════
+# 4. TRAINING — BRCA PAM50 subtype conditioning (512×512)
+# ═══════════════════════════════════════════════════════════
 
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
-  genomic_feature_dir: null
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  backbone_ckpt_path: ""
-
-  # ── Architecture ─────────────────────────────────────────────────────────
-  img_size: 128
-  net_ch: 64
-  net_ch_mult: [1, 2, 4, 8]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  cfg_dropout: 0.20
-
-  backbone_lr: 2.0e-4
-  batch_size: 32
-  accum_batches: 1
-  total_samples: 5000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 2
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 25000
-  sample_size: 8
-  seed: 42
-  num_workers: 8
-  gpus: [0, 1, 2, 3]
-
-  output_dir: ./experiments/20260603_poc_128_zero
-  base_dir: ./experiments/20260603_poc_128_zero
-  logdir: ./experiments/20260603_poc_128_zero/gda
-
-poc_128_noise:
-  training_mode: cfg_backbone
-  conditioning_type: noise
-
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
-  genomic_feature_dir: null
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  backbone_ckpt_path: ""
-
-  # ── Architecture ─────────────────────────────────────────────────────────
-  img_size: 128
-  net_ch: 64
-  net_ch_mult: [1, 2, 4, 8]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  cfg_dropout: 0.20
-
-  backbone_lr: 2.0e-4
-  batch_size: 32
-  accum_batches: 1
-  total_samples: 5000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 2
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 25000
-  sample_size: 8
-  seed: 42
-  num_workers: 8
-  gpus: [0, 1, 2, 3]
-
-  output_dir: ./experiments/20260603_poc_128_noise
-  base_dir: ./experiments/20260603_poc_128_noise
-  logdir: ./experiments/20260603_poc_128_noise/gda
-
-poc_128_rna:
-  training_mode: cfg_backbone
-  conditioning_type: real
-
-  # ── Data ─────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
-  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-
-  max_tiles_by_subtype:
-    TCGA-BRCA: 300
-    TCGA-LIHC: null
-
-  backbone_ckpt_path: ""
-
-  # ── Architecture ─────────────────────────────────────────────────────────
-  img_size: 128
-  net_ch: 64
-  net_ch_mult: [1, 2, 4, 8]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: false
-
-  cfg_dropout: 0.20
-
-  backbone_lr: 2.0e-4
-  batch_size: 32
-  accum_batches: 1
-  total_samples: 5000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 100000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 25000
-  sample_size: 8
-  seed: 42
-  num_workers: 8
-  gpus: [0, 1, 2, 3]
-
-  output_dir: ./experiments/20260603_poc_128_rna
-  base_dir: ./experiments/20260603_poc_128_rna
-  logdir: ./experiments/20260603_poc_128_rna/gda
-
-poc_breast_vs_liver_gda:
-  # ── Data ────────────────────────────────────────────────────────────────
-  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles
-  genomic_feature_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
-  max_tiles_by_subtype: null           # WeightedRandomSampler handles balance
-
-  # ── Image pre-processing ─────────────────────────────────────────────────
-  # Both BRCA and LIHC tiles are natively 512×512 in the zip archives.
-  # do_resize=false: no Resize transform added (tiles are already the right size).
-  # do_normalize stays true: maps [0,255] → [-1,1] for diffusion training.
-  img_size: 512
-  do_resize: false
-  do_normalize: true
-
-  # ── Backbone UNet architecture (identical to v13) ─────────────────────
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: true
-
-  # ── Adapter architecture (identical to v13) ──────────────────────────
-  adapter_base_ch: 64
-  adapter_n_tokens: 8
-  adapter_token_dim: 256
-  adapter_t_dim: 256
-  adapter_n_heads: 4
-
-  # ── CFG ──────────────────────────────────────────────────────────────
-  cfg_dropout: 0.30
-
-  # ── Joint training — no frozen backbone ──────────────────────────────
-  # Backbone trains on its own MSE loss (unconditional denoising).
-  # Adapter trains on the residual with backbone stop-grad (see model.py).
-  # null_token fixed at zeros — null conditioning = zero-key cross-attention.
-  #
-  # Backbone from v11 step-8k (backbone has seen ~2.5M samples total from v10+v11,
-  # val_loss≈0.032 — already reconstructs tissue well at t=750). Adapter reinit.
-  freeze_backbone: false
-  backbone_ckpt_path: ./experiments/20260529_poc_brca_lihc_gda_v11/gda/autoenc/last.ckpt
-  reinit_adapter: true
-  delta_encouragement_weight: 0.05
-
-  # Bootstrap loss: breaks encoder-collapse deadlock by giving the genomic encoder
-  # a direct gradient path independent of the cross-attention.
-  # MSE(recon_head(h_prenorm), feats) — forces patient-specific token directions.
-  # Weight 1.0: equal to denoising MSE to ensure encoder diversifies early.
-  genomic_recon_weight: 1.0
-
-  # ── Optimisation ─────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  adapter_lr: 3.0e-4
-  batch_size: 16                     # 4 per GPU on 4×A100 (DGX)
-  accumulate_grad_batches: 2         # effective global batch = 32
-  total_samples: 200000000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # ── Logging / checkpointing ──────────────────────────────────────────
-  val_every_steps: 2000
-  limit_val_batches: 100
-  save_every_samples: 50000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  steps_per_epoch: 5000
-  reconstruct_every_samples: 200000
-  sample_size: 8
-  seed: 42
-  num_workers: 24
-  gpus: [0, 1, 2, 3]
-
-  # ── Output — v12: genomic reconstruction loss + all fixes 2026-05-29 ─────
-  # Key changes vs v11:
-  #   genomic_recon_weight=1.0  — breaks encoder-collapse deadlock
-  #   t_vis=750 in sample grid  — proper backbone generation test (5% signal)
-  #   _log_ddim_samples errors now visible in SLURM log
-  #   loss/backbone + loss/adapter logged separately
-  #   cond/null_magnitude logged
-  output_dir: ./experiments/20260529_poc_brca_lihc_gda_v12
-  base_dir: ./experiments/20260529_poc_brca_lihc_gda_v12
-  logdir: ./experiments/20260529_poc_brca_lihc_gda_v12/gda
-
-# ── v13: Genomic Diffusion Adapter — joint from-scratch training (2026-05-17) ──────────────
-# Architecture: full MoPaDi backbone UNet + lightweight adapter UNet (~6M params).
-#   Backbone always receives cond=zeros → learns unconditional denoising.
-#   Adapter receives (x_t, t, g_tokens) → learns genomic correction Δε.
-#   ε_pred = ε_backbone + Δε_adapter.  Loss: MSE(ε_pred, noise).
-#
-# Key advantage over v11/v12:
-#   The backbone NEVER sees patient genomic features, so it cannot suppress
-#   the adapter (v11 failure) and the adapter is the sole conditioning pathway
-#   so it cannot be passively ignored (v12 failure).
-#
-# No pretrained checkpoint — both components initialise from random weights.
-# Fully reproducible.
-#
-# Health metric: cond/guidance_delta = E[‖Δε_own − Δε_null‖²]
-#   Must grow during training. If flat → adapter is not learning conditioning.
-#   Independent of backbone (backbone cannot cause this to collapse).
-#
-# Inference CFG:
-#   ε_guided = ε_backbone(x_t, t, 0) + scale * (Δε_own − Δε_null)
-genomic_adapter_training:
-  # ── Data ────────────────────────────────────────────────────────────────
-  zip_dir: ../data/BRCA-tumor-tiles-final
-  genomic_feature_dir: ./experiments/20260424_genomic_counterfactual_loss_72h/genomic_h5
-  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
-  max_tiles_by_subtype:  # null = no cap; subtype balance handled by WeightedRandomSampler
-
-  # ── Backbone UNet architecture (same as v11/v12 for comparability) ───────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  # Gradient checkpointing: safe to enable in GDA (single-forward, no dual-pass conflict)
-  net_beatgans_gradient_checkpoint: true
-
-  # ── Adapter architecture ─────────────────────────────────────────────────
-  adapter_base_ch: 64          # encoder levels: 64 → 128 → 256 channels
-  adapter_n_tokens: 8          # genomic token sequence length
-  adapter_token_dim: 256       # cross-attention token dimension
-  adapter_t_dim: 256           # sinusoidal timestep embedding dim
-  adapter_n_heads: 4           # attention heads in adapter cross-attention
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  # 15 % null dropout: enough for CFG at inference while giving the adapter
-  # ~85 % of batches with real genomic tokens during early training.
-  cfg_dropout: 0.15
-
-  # ── Optimisation — two separate LRs ─────────────────────────────────────
-  backbone_lr: 1.0e-4          # AdamW LR for backbone UNet
-  adapter_lr:  3.0e-4          # AdamW LR for adapter + genomic encoder (higher: learns faster)
-
-  # ── Loss design (v15 — frozen backbone) ─────────────────────────────────
-  # freeze_backbone: backbone is loaded from v13 epoch-13 checkpoint and fully
-  #   frozen. Only adapter + genomic encoder + null_token receive gradients.
-  #   Eliminates backbone–adapter competition (root cause of v14 re-collapse).
-  # delta_encouragement_weight: 10× stronger than v14 (1e-2 vs 1e-3) to push
-  #   guidance_delta growth against the now-stable backbone.
-  freeze_backbone: true
-  split_backbone_adapter_loss: false   # irrelevant with frozen backbone
-  delta_encouragement_weight: 1.0e-2
-  batch_size: 16               # global batch / 4 GPUs = 4 per GPU
-  accumulate_grad_batches: 2   # effective global batch = 32
-  total_samples: 20000000      # 20M → ~625k adapter gradient steps at eff. batch 32
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # ── Logging / checkpointing ──────────────────────────────────────────────
-  val_every_steps: 5000
-  limit_val_batches: 100
-  save_every_samples: 200000
-  save_top_k: 3
-  monitor_metric: loss/val_ckpt
-  steps_per_epoch: 5000
-  reconstruct_every_samples: 200000
-  sample_size: 8
-  seed: 42
-  num_workers: 24
-  gpus: [0, 1, 2, 3]
-
-  # ── Output ───────────────────────────────────────────────────────────────
-  # v15: frozen backbone from v13 epoch-13 (225k steps, healthy weights).
-  #   Adapter trains on pure residual; backbone never changes.
-  output_dir: ./experiments/20260526_gda_v15
-  base_dir: ./experiments/20260526_gda_v15
-  resume_from: ./experiments/20260517_gda_v13/gda/autoenc/epoch=13-step=225000-ema-reset.ckpt
-
-virchow2_umap:
-  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
-  csv_path: ../dataframes/brca_subtypes.csv
-  patient_col: bcr_patient_barcode
-  subtype_col: Majority_Subtype_mRNA
-  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
-  subtypes: null                    # null = all subtypes; list to restrict (e.g. [Basal, LumA])
-  mode: tile                        # "patient" (mean-pooled, 1 pt/patient) or "tile" (1 pt/tile)
-  output_dir: ./experiments/20260522_virchow2_umap/all_subtypes_by_tiles_umap
-  max_tiles_per_patient: 50         # tiles per patient; keep low in tile mode for speed
-  n_neighbors: 15
-  min_dist: 0.1
-  metric: cosine
-  seed: 42
-  cmap_categorical: romaO           # same palette as dataset_statistics + genomic UMAP
-  palette_override:
-    Normal: "#F4A7B9"               # soft pink — consistent with dataset_statistics
-  figsize:
-  - 10
-  - 8
-  dpi: 200
-  point_size: 80
-  alpha: 0.8
-
-# ── BRCA PAM50 CFG v2 (DGX, 4×A100 80GB) ────────────────────────────────────
-# CFG backbone on TCGA-BRCA, all 5 PAM50 subtypes.
-# Uses poc_experiment run_cfg_training (not the old brca_pam50_cfg GDA path).
-# From-scratch training — no warm start.
-#
-# Per-patient tile counts (sampled medians):
-#   Basal  168 pts  ~2500/pt → cap at 300 to prevent per-patient dominance
-#   Her2    74 pts  ~1500/pt → cap at 300
-#   Normal  38 pts  ~1100/pt → uncapped (too few patients to waste any)
-#   LumA   506 pts   ~366/pt → uncapped (already low tile count)
-#   LumB   195 pts   ~259/pt → uncapped (even lower)
-# WeightedRandomSampler balances batch representation across all 5 subtypes.
 brca_pam50_cfg_v2:
   training_mode: cfg_backbone
   conditioning_type: real
@@ -1553,77 +522,6 @@ brca_pam50_cfg_v2:
   base_dir: ./experiments/20260605_brca_pam50_cfg_v2
   logdir: ./experiments/20260605_brca_pam50_cfg_v2/gda
 
-# ── Smoke test: single interactive GPU, validates data loading + forward pass ─
-# srun --pty -p capella-interactive -N 1 --ntasks=1 --cpus-per-task=2 --gres=gpu:1 --time=1:00:00 bash
-# cd $REPO && export PYTHONPATH=/data/cat/ws/mala059b-rna2wsi/mopadi/src:${PYTHONPATH:-}
-# .venv/bin/python run_pipeline.py --config src/config.yaml --stage brca_pam50_cfg_v2_smoketest
-brca_pam50_cfg_v2_smoketest:
-  training_mode: cfg_backbone
-  conditioning_type: real
-
-  # ── Data (identical to v2) ────────────────────────────────────────────────
-  zip_dir: ../data/BRCA-tumor-tiles-final
-  genomic_feature_dir: ./experiments/20260528_genomic_features/genomic_h5
-  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
-  max_tiles_by_subtype:
-    LumA: 45
-    LumB: 120
-    Basal: 135
-    Her2: 300
-    Normal: null
-  backbone_ckpt_path: ""
-  val_swap_basal_luma: true
-  do_resize: false
-
-  # ── Architecture (identical to v2) ───────────────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: true   # saves ~40% VRAM on small interactive GPUs
-
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.15
-
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 2                # small enough for ~11 GB interactive GPU
-  accumulate_grad_batches: 2
-  total_samples: 2000          # ~1000 steps: enough to hit val + checkpoint
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
-
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 100
-  limit_val_batches: 5
-  save_every_samples: 500
-  save_top_k: 1
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 1000
-  sample_size: 4
-  seed: 42
-  num_workers: 2               # matches --cpus-per-task=2
-  gpus: [0]
-
-  # ── Output ───────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260606_brca_pam50_cfg_v2_smoketest
-  base_dir: ./experiments/20260606_brca_pam50_cfg_v2_smoketest
-  logdir: ./experiments/20260606_brca_pam50_cfg_v2_smoketest/gda
-
-# ══════════════════════════════════════════════════════════════════════════════
-# brca_pam50_cfg_v2_1hot — identical to brca_pam50_cfg_v2 but replaces real
-# PAM50 genomic vectors with 5-class orthogonal binary codes (one per subtype,
-# assigned round-robin across feat_dim positions, no L2 normalisation).
-# Comparison baseline: does real genomic geometry matter, or is a pure label
-# (LumA/LumB/Basal/Her2/Normal equidistant in conditioning space) sufficient?
-# ══════════════════════════════════════════════════════════════════════════════
 brca_pam50_cfg_v2_1hot:
   training_mode: cfg_backbone
   conditioning_type: one_hot
@@ -1687,11 +585,6 @@ brca_pam50_cfg_v2_1hot:
   base_dir: ./experiments/20260610_brca_pam50_cfg_v2_1hot
   logdir: ./experiments/20260610_brca_pam50_cfg_v2_1hot/gda
 
-# ══════════════════════════════════════════════════════════════════════════════
-# brca_pam50_cfg_v2_1hot_256 — same as brca_pam50_cfg_v2_1hot but trained on
-# 256×256 pixel tiles (BRCA-tumor-tiles-256) so it is directly comparable to
-# brca_pam50_cfg_v2_256 (real RNA-seq, 256px).
-# ══════════════════════════════════════════════════════════════════════════════
 brca_pam50_cfg_v2_1hot_256:
   training_mode: cfg_backbone
   conditioning_type: one_hot
@@ -1755,70 +648,272 @@ brca_pam50_cfg_v2_1hot_256:
   base_dir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256
   logdir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256/gda
 
-# ── Smoke test for brca_pam50_cfg_v2_1hot ────────────────────────────────────
-# srun --pty -p capella-interactive -N 1 --ntasks=1 --cpus-per-task=2 --gres=gpu:1 --time=1:00:00 bash
-# cd $REPO && export PYTHONPATH=/data/cat/ws/mala059b-rna2wsi/mopadi/src:${PYTHONPATH:-}
-# .venv/bin/python run_pipeline.py --config src/config.yaml --stage brca_pam50_cfg_v2_1hot_smoketest
-brca_pam50_cfg_v2_1hot_smoketest:
-  training_mode: cfg_backbone
-  conditioning_type: one_hot
-  normalize_feats: false
+# ═════════════════
+# 5. EVALUATION
+# ═════════════════
 
-  # ── Data (identical to 1hot) ─────────────────────────────────────────────
-  zip_dir: ../data/BRCA-tumor-tiles-final
-  genomic_feature_dir: null
-  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+tfd_separability:
+  tiles_zip_dir: ../data/BRCA-tumor-tiles-final
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  #classes:
+  #- Basal
+  #- LumA
+
   max_tiles_by_subtype:
     LumA: 45
     LumB: 120
     Basal: 135
     Her2: 300
     Normal: null
-  backbone_ckpt_path: ""
-  val_swap_basal_luma: true
-  do_resize: false
+  masks_dir: ../experiments/20260509_tfd_separability/masks
+  auto_segment: true
+  force_resegment: false
+  num_classes: 32
+  weights_dataset: TCGA
+  device: null
+  batch_size: 4
+  grouping_json: null
+  use_alpha_complex: true
+  n_landscape_bins: 100
+  n_landscape_layers: 1
+  min_cells_per_image: 3
+  compute_noise_floor: true
+  n_noise_floor_splits: 5
+  output_dir: ../experiments/20260509_tfd_separability/results
+  save_heatmap: true
+  figsize: null
 
-  # ── Architecture (identical to 1hot) ────────────────────────────────────
-  img_size: 512
-  net_ch: 128
-  net_ch_mult: [1, 1, 2, 2, 4, 4]
-  net_attn: [16]
-  net_num_res_blocks: 2
-  style_ch: 512
-  feat_dim: 512
-  T: 1000
-  T_eval: 20
-  net_beatgans_gradient_checkpoint: true   # saves ~40% VRAM on small interactive GPUs
+tfd_separability_poc:
+  tiles_zip_dir: ../data/Liver-tumor-tiles-final
+  metadata_csv: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
+  patient_col: Patient_ID
+  subtype_col: cohort
+  classes:
+    - TCGA-LIHC
+  max_tiles_by_subtype:
+    TCGA-LIHC: null        # no cap — use all tiles per patient
+  masks_dir: ../experiments/20260529_tfd_separability_poc/lihc_masks
+  auto_segment: true
+  force_resegment: false
+  num_classes: 32
+  weights_dataset: TCGA
+  device: null
+  batch_size: 4
+  grouping_json: null
+  use_alpha_complex: true
+  n_landscape_bins: 100
+  n_landscape_layers: 1
+  min_cells_per_image: 3
+  compute_noise_floor: false  # single class — no pairwise TFD
+  output_dir: ../experiments/20260529_tfd_separability_poc/results
+  save_heatmap: false
 
-  # ── CFG ──────────────────────────────────────────────────────────────────
-  cfg_dropout: 0.15
+tfd_separability_viz:
+  # ── Input ─────────────────────────────────────────────────────────────────
+  results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
+  tiles_dir: ../data/BRCA-tumor-tiles-final
+  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  classes: null
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/plots
 
-  # ── Optimisation ─────────────────────────────────────────────────────────
-  backbone_lr: 1.0e-4
-  batch_size: 2
-  accumulate_grad_batches: 2
-  total_samples: 2000
-  ema_decay: 0.9999
-  grad_clip: 1.0
-  fp16: false
-  bf16: true
+  # ── Plots to generate ─────────────────────────────────────────────────────
+  # Each plot that involves per-tile data also saves a sidecar JSON with
+  # patient-level Kruskal-Wallis + pairwise Mann-Whitney U (BH FDR) results.
+  plots:
+    #- channel_contributions   # per-channel TFD heatmaps (absolute + relative)
+    - cell_type_boxplots      # pixel-fraction boxplots → tfd_cell_type_composition_stats.json
+    #- tile_mask_examples     # matched H&E tiles + classification masks (requires tiles_dir)
+    #- ternary_composition     # epithelium-immune-connective triangle plot
+    #- nn_distance_violins     # intra-type NN distance violins → tfd_nn_distance_stats.json
+    #- cross_type_proximity    # cross-cell-type NN distance heatmaps → tfd_cross_type_proximity_stats.json
+    - ripley_L_by_subtype     # scale-dependent clustering (L-function curves)
+    - voronoi_distribution    # cell dispersion via Voronoi areas
+    #- knn_metrics             # kNN connectivity & clustering coefficient → tfd_topology_stats.json
+    #- radar_contributions    # radar/spider chart with blended subtype colours
 
-  # ── Logging / checkpointing ───────────────────────────────────────────────
-  val_every_steps: 100
-  limit_val_batches: 5
-  save_every_samples: 500
-  save_top_k: 1
-  monitor_metric: loss/val_ckpt
-  reconstruct_every_samples: 1000
-  sample_size: 4
+  # ── Tile sampling ──────────────────────────────────────────────────────────
+  max_tiles_per_subtype: 2000   # cap for boxplots + ternary (fast pixel ops)
+  max_tiles_spatial: 150        # faster spatial pass: fewer tiles per subtype
+  ripley_n_bootstrap: 20        # reduce CSR simulations for Ripley L(r) envelopes
+  include_background: false
   seed: 42
-  num_workers: 2
-  gpus: [0]
 
-  # ── Output ───────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260610_brca_pam50_cfg_v2_1hot_smoketest
-  base_dir: ./experiments/20260610_brca_pam50_cfg_v2_1hot_smoketest
-  logdir: ./experiments/20260610_brca_pam50_cfg_v2_1hot_smoketest/gda
+  # ── Styling (Crameri scientific colour maps) ──────────────────────────────
+  cmap_categorical: romaO       # subtype colours (radar, ternary)
+  cmap_cell_types: batlow       # cell-type colours in boxplots + NN violins
+  cmap_heatmap: lajolla         # sequential colourmap for all heatmaps
+  figsize_radar: null           # null = auto (9x9 square)
+  figsize_heatmap: null         # null = auto
+  figsize_boxplot: null         # null = auto
+  figsize_ternary: null         # null = auto (9x8.5)
+  figsize_nn_violins: null      # null = auto (same layout as boxplots)
+  figsize_proximity: null       # null = auto (5 panels x 6x6 matrix)
+  dpi: 200
+
+tfd_separability_viz_poc:
+  cohorts:
+    TCGA-BRCA:
+      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+    TCGA-LIHC:
+      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/lihc_masks
+  cohort_labels:
+    TCGA-BRCA: "Breast"
+    TCGA-LIHC: "Liver"
+  cohort_palette:
+    TCGA-BRCA: "#FDAE61"   # amber — matches latent-space UMAP
+    TCGA-LIHC: "#762A83"   # violet
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/cohort_plots
+  plots:
+    - cell_type_boxplots      # → cohort_cell_type_boxplots.png + stats JSON
+    - nn_distance_violins     # → cohort_nn_distance_violins.png + stats JSON
+    - ripley_L                # → cohort_ripley_L.png + stats JSON
+    - combined_panel          # → cohort_combined_panel.png (3-row × 6-col overview)
+  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
+  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
+  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
+  include_background: false
+  ripley_n_bootstrap: 20
+  dpi: 200
+  seed: 42
+
+tfd_separability_viz_subtype:
+  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+  metadata_csv: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  subtype_order:
+    - Normal
+    - LumA
+    - LumB
+    - Her2
+    - Basal
+  subtype_palette:
+    Normal: "#F4A7B9"   # soft pink override (romaO default too light)
+  cmap_categorical: romaO
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/subtype_plots
+  plots:
+    - cell_type_boxplots      # → subtype_cell_type_boxplots.png + stats JSON
+    - nn_distance_violins     # → subtype_nn_distance_violins.png + stats JSON
+    - ripley_L                # → subtype_ripley_L.png + stats JSON
+    - pairwise_r_matrix       # → subtype_pairwise_r_matrix.png (reads stats JSON, no mask loading)
+    - combined_panel          # → subtype_combined_panel.png (3-row × 6-col overview)
+  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
+  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
+  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
+  include_background: false
+  ripley_n_bootstrap: 20
+  dpi: 200
+  seed: 42
+
+# ═════════════════════════════════
+# 6. VISUALIZATION & STATISTICS
+# ═════════════════════════════════
+
+dataset_statistics:
+  clinical_csv: ../dataframes/brca_subtypes.csv
+  patient_col: bcr_patient_barcode
+  subtype_col: Majority_Subtype_mRNA
+  stage_col: ajcc_pathologic_tumor_stage
+  menopause_col: menopause_status
+  os_time_col: OS.time
+  os_event_col: OS
+  palette_override:
+    Normal: "#F4A7B9"   # soft pink — distinguishable from Basal (berry)
+  masks_dir: ./experiments/20260509_tfd_separability/masks
+  output_dir: ./experiments/20260504_dataset_statistics
+  plots:
+  - tumor_stage_distribution
+  - menopause_distribution
+  - subtype_distribution
+  - kaplan_meier_by_subtype
+  - combined_overview
+  cmap_categorical: romaO
+  cmap_sequential: batlow
+  figsize_distributions:
+  - 10
+  - 6
+  figsize_pie:
+  - 8
+  - 8
+  figsize_km:
+  - 10
+  - 7
+  figsize_combined:
+  - 14
+  - 10
+  dpi: 200
+  min_patients_km: 10
+
+training_stats:
+  logdir: ./experiments/20260517_gda_v13
+  output_dir: ./experiments/20260517_gda_v13/training_stats
+  plots:
+  - loss_curves
+  - genomic_diagnostics
+  #- batch_trajectory
+  - train_val_comparison
+  #- early_stopping
+  - summary
+  figsize:
+  - 16
+  - 12
+  cmap_categorical: batlowS
+  cmap_sequential: batlow
+
+visualize_latents:
+  latent_dir: ./experiments/20260528_genomic_features/genomic_h5
+  csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+  output_dir: ../experiments/20260528_genomic_features/latent_plots_clean
+  patient_col: Patient_ID
+  label_col: Majority_Subtype_mRNA
+  palette_override:
+    Normal: "#F4A7B9"  # soft pink — visually distinct from Basal (berry)
+  hue_title: "PAM50 Subtype"
+  style_title: "Split"
+
+poc_breast_vs_liver_visualize_latents:
+  latent_dir: ./experiments/20260524_poc_breast_vs_liver_genomic_features/genomic_h5
+  csv_path: ../dataframes/tcga_RNASeq_BRCA_LIHC.csv
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+  output_dir: ../experiments/20260524_poc_breast_vs_liver_genomic_features/latent_plots_clean
+  patient_col: Patient_ID
+  label_col: cohort
+  palette_override:
+    TCGA-BRCA: "#FDAE61"   # amber — matches virchow2_umap_cohort
+    TCGA-LIHC: "#762A83"   # violet
+  label_rename:
+    TCGA-BRCA: Breast
+    TCGA-LIHC: Liver
+
+virchow2_umap:
+  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  csv_path: ../dataframes/brca_subtypes.csv
+  patient_col: bcr_patient_barcode
+  subtype_col: Majority_Subtype_mRNA
+  patient_splits_path: ./experiments/20260424_genomic_counterfactual_loss_72h/patient_splits.json
+  subtypes: null                    # null = all subtypes; list to restrict (e.g. [Basal, LumA])
+  mode: tile                        # "patient" (mean-pooled, 1 pt/patient) or "tile" (1 pt/tile)
+  output_dir: ./experiments/20260522_virchow2_umap/all_subtypes_by_tiles_umap
+  max_tiles_per_patient: 50         # tiles per patient; keep low in tile mode for speed
+  n_neighbors: 15
+  min_dist: 0.1
+  metric: cosine
+  seed: 42
+  cmap_categorical: romaO           # same palette as dataset_statistics + genomic UMAP
+  palette_override:
+    Normal: "#F4A7B9"               # soft pink — consistent with dataset_statistics
+  figsize:
+  - 10
+  - 8
+  dpi: 200
+  point_size: 80
+  alpha: 0.8
 
 virchow2_umap_cohort:
   label_source: splits                 # read TCGA-BRCA / TCGA-LIHC labels from patient_splits.json
@@ -1843,3 +938,4 @@ virchow2_umap_cohort:
   dpi: 200
   point_size: 80
   alpha: 0.8
+
