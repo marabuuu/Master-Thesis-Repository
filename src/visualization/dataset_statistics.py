@@ -21,7 +21,7 @@ Usage (CLI via run_pipeline.py)
 
 Usage (programmatic)
 ---------------------
-    from src.statistics.dataset_statistics import run_dataset_statistics
+    from src.visualization.dataset_statistics import run_dataset_statistics
     run_dataset_statistics(config["dataset_statistics"])
 """
 

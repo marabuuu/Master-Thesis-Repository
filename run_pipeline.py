@@ -166,7 +166,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
     
     elif stage == "dataset_statistics":
-        from src.statistics.dataset_statistics import run_dataset_statistics
+        from src.visualization.dataset_statistics import run_dataset_statistics
         if "dataset_statistics" not in config:
             raise ValueError("No 'dataset_statistics' section in config.yaml")
         run_dataset_statistics(config["dataset_statistics"], verbose=verbose)

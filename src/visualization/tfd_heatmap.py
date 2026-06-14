@@ -12,7 +12,7 @@ Output: tfd_separability_heatmap_v2.png  (next to the existing heatmap)
 
 Usage
 -----
-    python -m src.evaluation.regenerate_tfd_heatmap
+    python -m src.visualization.tfd_heatmap
 """
 from __future__ import annotations
 

@@ -12,7 +12,7 @@ Output: tfd_channel_contributions_absolute_v2.png  (next to the existing plot)
 
 Usage
 -----
-    python -m src.evaluation.regenerate_tfd_channel_contributions
+    python -m src.visualization.tfd_channel_contributions
 """
 from __future__ import annotations
 

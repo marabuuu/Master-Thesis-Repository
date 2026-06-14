@@ -15,8 +15,8 @@ gradient signal.
 
 Usage:
     cd Master-Thesis-Repository
-    python -m src.statistics.inspect_conditioning --config src/config.yaml
-    python -m src.statistics.inspect_conditioning --ckpt /path/to/checkpoint.ckpt
+    python -m src.visualization.inspect_conditioning --config src/config.yaml
+    python -m src.visualization.inspect_conditioning --ckpt /path/to/checkpoint.ckpt
 """
 
 import argparse

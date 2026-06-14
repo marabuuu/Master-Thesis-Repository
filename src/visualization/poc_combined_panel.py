@@ -5,7 +5,7 @@ Left block:  Breast Cancer Cohort  (3 TCGA-BRCA tiles)
 Right block: Liver Cancer Cohort   (3 TCGA-LIHC tiles)
 
 Usage (from Master-Thesis-Repository/ with venv active):
-    python -m src.poc_experiment.make_combined_panel
+    python -m src.visualization.poc_combined_panel
 """
 
 from __future__ import annotations

@@ -17,7 +17,7 @@ After generation and real-tile collection the FID matrix is computed:
     <output-dir>/fid_matrix_official.png   ← real×generated heatmap
 
 Usage:
-    python -m src.poc_experiment.sample_bulk_tiles \\
+    python -m src.reconstruction.poc_sample_bulk \\
         --run-dir     experiments/20260607_brca_pam50_cfg_v2_256/gda \\
         --splits      experiments/20260528_genomic_features/patient_splits.json \\
         --genomic-dir experiments/20260528_genomic_features/genomic_h5 \\
@@ -40,7 +40,7 @@ from typing import List
 
 import torch
 
-from .fid_evaluation import (
+from src.evaluation.poc_fid import (
     _load_config,
     _resolve_best_checkpoint,
     load_model,

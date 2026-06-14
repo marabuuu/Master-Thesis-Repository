@@ -9,8 +9,8 @@ C  Cosine-distance clustermap of genomic features
 D  Per-cohort silhouette scores (cosine metric, 512-D features)
 
 Run from Master-Thesis-Repository/ with the venv active:
-    python -m src.poc_experiment.conditioning_panel
-    python -m src.poc_experiment.conditioning_panel --output path/to/panel.pdf
+    python -m src.visualization.poc_conditioning_panel
+    python -m src.visualization.poc_conditioning_panel --output path/to/panel.pdf
 """
 from __future__ import annotations
 

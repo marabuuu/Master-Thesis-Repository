@@ -15,7 +15,7 @@ Usage
 -----
 Run from Master-Thesis-Repository/ with the venv active:
 
-    python -m src.poc_experiment.make_panel \\
+    python -m src.visualization.poc_panel \\
         --run-dir experiments/20260607_poc_128_rna_norm_30M/gda \\
         --out experiments/20260607_poc_128_rna_norm_30M/panel.png
 
@@ -65,7 +65,7 @@ def _build_cond_vecs(
     RNA runs:     mean test-patient feature vector per cohort (L2-normalised).
     """
     import torch.nn.functional as F
-    from .fid_evaluation import build_conditioning_vectors, load_test_patients
+    from src.evaluation.poc_fid import build_conditioning_vectors, load_test_patients
 
     conditioning_type: str = getattr(conf, "conditioning_type", "one_hot")
     normalize_feats: bool = getattr(conf, "normalize_feats", True)
@@ -158,7 +158,7 @@ def make_panel(
     device: Optional[torch.device] = None,
     checkpoint: Optional[str] = None,
 ) -> None:
-    from .fid_evaluation import _load_config, _resolve_best_checkpoint, load_model, generate_batch
+    from src.evaluation.poc_fid import _load_config, _resolve_best_checkpoint, load_model, generate_batch
 
     if device is None:
         device = torch.device("cuda" if torch.cuda.is_available() else "cpu")

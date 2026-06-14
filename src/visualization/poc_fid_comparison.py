@@ -3,7 +3,7 @@
 Rows (top to bottom): zero / noise / orthogonal / genomic conditioning.
 
 Usage (from Master-Thesis-Repository/ with venv active):
-    python -m src.poc_experiment.fid_panel_comparison
+    python -m src.visualization.poc_fid_comparison
 """
 
 from __future__ import annotations

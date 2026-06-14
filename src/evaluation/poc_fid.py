@@ -27,7 +27,7 @@ Real tiles are sampled from the source zip directory and saved under:
 Usage
 -----
 # Full run (5000 tiles per cohort, batched on GPU):
-python -m src.poc_experiment.fid_evaluation \\
+python -m src.evaluation.poc_fid \\
     --run-dir experiments/20260603_poc_128_orthogonal/gda \\
     --checkpoint experiments/20260603_poc_128_orthogonal/gda/autoenc/epoch=8-step=109375.ckpt \\
     --patient-splits experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json \\
@@ -39,7 +39,7 @@ python -m src.poc_experiment.fid_evaluation \\
     --steps 20
 
 # Quick smoke-test:
-python -m src.poc_experiment.fid_evaluation \\
+python -m src.evaluation.poc_fid \\
     --run-dir experiments/20260603_poc_128_orthogonal/gda \\
     --patient-splits experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json \\
     --tiles-dir ../data/PoC-BRCA-LIHC-tumor-tiles-128 \\
@@ -123,7 +123,7 @@ def _load_config(run_dir: Path):
         import yaml
     except ImportError as e:
         raise RuntimeError("PyYAML required") from e
-    from .config import GDAConfig
+    from src.poc_experiment.config import GDAConfig
     from mopadi.configs.choices import ModelName
 
     hparams_path = run_dir / "hparams.yaml"
@@ -175,7 +175,7 @@ def _resolve_best_checkpoint(run_dir: Path, explicit: Optional[str]) -> Path:
 
 
 def load_model(conf, ckpt_path: Path, device: torch.device):
-    from .cfg_model import CfgBackboneLitModel
+    from src.poc_experiment.cfg_model import CfgBackboneLitModel
 
     ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = ckpt.get("state_dict", ckpt)

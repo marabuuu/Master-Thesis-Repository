@@ -5,7 +5,7 @@ Produces paired unconditional/CFG-guided images for two fixed one-hot vectors
 `sample_generated_tiles.py` to resolve checkpoints and load the trained model.
 
 Example:
-    python -m src.poc_experiment.sample_onehot_pairs \
+    python -m src.reconstruction.poc_sample_onehot \
         --run-dir experiments/20260603_poc_128_1hot/gda \
         --checkpoint best.ckpt --out-dir /tmp/onehot_test --n-per-class 5
 """
@@ -18,8 +18,7 @@ from typing import Any
 
 import torch
 
-# import helpers from existing sampling script
-from src.poc_experiment.sample_generated_tiles import (
+from src.reconstruction.poc_sample_tiles import (
     _build_config,
     _resolve_checkpoint,
     _load_model,

@@ -5,7 +5,7 @@ For each selected patient, writes a side-by-side pair:
 - conditioned output using the real patient genomic vector
 
 Usage:
-    python -m src.poc_experiment.sample_generated_tiles \\
+    python -m src.reconstruction.poc_sample_tiles \\
         --run-dir experiments/20260601_poc_brca_lihc_cfg_v2_dgx/gda \\
         --subtypes BRCA LIHC --n-per-subtype 2
 """
@@ -25,8 +25,8 @@ try:
 except Exception as exc:
     raise RuntimeError("PyYAML is required to read hparams.yaml") from exc
 
-from .config import GDAConfig
-from .dataset import (
+from src.poc_experiment.config import GDAConfig
+from src.poc_experiment.dataset import (
     ZipTilesWithGenomicFeatures,
     patient_id_from_tile_path,
     _build_genomic_cache,
@@ -141,7 +141,7 @@ def _build_config(run_dir: Path) -> GDAConfig:
 
 def _load_model(conf: GDAConfig, ckpt_path: Path):
     import torch
-    from .cfg_model import CfgBackboneLitModel
+    from src.poc_experiment.cfg_model import CfgBackboneLitModel
 
     payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     state_dict = payload.get("state_dict", payload)
@@ -295,7 +295,7 @@ def main() -> None:
     else:
         # Synthetic conditioning: build the same fixed vectors the dataset would return.
         import torch
-        from .dataset import _ONEHOT_COHORT_INDEX
+        from src.poc_experiment.dataset import _ONEHOT_COHORT_INDEX
         genomic_cache = {}
         for pid in candidates:
             subtype = subtype_map.get(pid, "unknown")
