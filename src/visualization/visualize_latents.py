@@ -143,6 +143,11 @@ def run_visualizations(config: dict, verbose: bool = True):
     if palette_override is not None:
         palette_override = {str(k): str(v) for k, v in palette_override.items()}
 
+    # Optional label rename: e.g. {"TCGA-BRCA": "Breast Cancer Cohort"}
+    label_rename: Optional[Dict[str, str]] = config.get("label_rename")
+    if label_rename is not None:
+        label_rename = {str(k): str(v) for k, v in label_rename.items()}
+
     setup_style(extra_rc={"font.size": 12, "axes.labelsize": 13,
                            "xtick.labelsize": 12, "ytick.labelsize": 12,
                            "legend.fontsize": 11, "legend.title_fontsize": 12})
@@ -224,22 +229,29 @@ def run_visualizations(config: dict, verbose: bool = True):
     plot_stacked_bar(df_all, group_col=label_col, stack_col="split", title="Split composition", save_path=out_dir / "distribution_splits.png")
     plot_mosaic(df_all, columns=[label_col, "split"], title="Mosaic", save_path=out_dir / "mosaic_splits.png")
 
+    _hue_title = config.get("hue_title", "Cohort")
+    _style_title = config.get("style_title", "Split")
+    _proj_kw = dict(hue_title=_hue_title, style_title=_style_title, label_rename=label_rename)
+
     # 5. UMAP
     if verbose: print("[Latents] Computing UMAP...")
     X_umap, _ = plot_umap(X, y_subtype, style_labels=y_split, markers=markers,
-                           palette=palette_override, save_path=out_dir / "UMAP.png")
+                           palette=palette_override, save_path=out_dir / "UMAP.png",
+                           **_proj_kw)
     df_all["UMAP1"] = X_umap[:, 0]
     df_all["UMAP2"] = X_umap[:, 1]
 
     # 6. t-SNE
     if verbose: print("[Latents] Computing t-SNE...")
     X_tsne, _ = plot_tsne(X, y_subtype, style_labels=y_split, markers=markers,
-                           palette=palette_override, save_path=out_dir / "tSNE.png")
+                           palette=palette_override, save_path=out_dir / "tSNE.png",
+                           **_proj_kw)
 
     # 8. PCA
     if verbose: print("[Latents] Computing PCA...")
     X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers,
-                            palette=palette_override, save_path=out_dir / "PCA.png")
+                            palette=palette_override, save_path=out_dir / "PCA.png",
+                            **_proj_kw)
 
     # 8.b PCA variance scree plot
     if verbose: print("[Latents] PCA variance scree plot...")
@@ -256,6 +268,7 @@ def run_visualizations(config: dict, verbose: bool = True):
     try:
         plot_umap(X, y_split, style_labels=y_subtype,
                   markers=_subtype_markers,
+                  hue_title=_style_title, style_title=_hue_title, label_rename=label_rename,
                   save_path=out_dir / "UMAP_split.png", show=False)
     except Exception as e:
         print(f"  ⚠️ UMAP split plot failed: {e}")
@@ -278,6 +291,7 @@ def run_visualizations(config: dict, verbose: bool = True):
 
         plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col,
                                   metric="euclidean", palette=palette_override,
+                                  label_rename=label_rename,
                                   save_path=out_dir / "silhouette_per_subtype_umap.png")
     except Exception as e:
         print(f"  ⚠️ Silhouette failed: {e}")

@@ -95,6 +95,81 @@ def _plot_fid_matrix(matrix: np.ndarray, rows: list[str], cols: list[str], out_p
     plt.close()
 
 
+def run(eval_dir: Path, device: str | None = None, batch_size: int = 64) -> dict:
+    """Compute the real×generated FID matrix for *eval_dir* and save results.
+
+    Expects ``eval_dir/real/<Subtype>/`` and ``eval_dir/generated/<Subtype>/``
+    containing per-patient zip files.  Writes ``fid_matrix_official.json`` and
+    ``fid_matrix_official.png`` into *eval_dir* and returns the results dict.
+    """
+    eval_dir = eval_dir.resolve()
+    real_root = eval_dir / "real"
+    gen_root  = eval_dir / "generated"
+
+    if not real_root.exists() or not gen_root.exists():
+        raise FileNotFoundError(f"Expected real/ and generated/ inside {eval_dir}")
+
+    subtypes = sorted(d.name for d in real_root.iterdir() if d.is_dir())
+    print(f"Subtypes found: {subtypes}")
+
+    device = device or ("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Device: {device}")
+
+    with tempfile.TemporaryDirectory(prefix="fid_matrix_") as tmp:
+        tmp_path = Path(tmp)
+
+        tile_counts: dict[str, int] = {}
+        group_dirs: dict[str, Path] = {}
+        for split, root in [("real", real_root), ("gen", gen_root)]:
+            for subtype in subtypes:
+                key = f"{split}_{subtype}"
+                src = root / subtype
+                if not src.exists():
+                    print(f"  [warn] missing: {src}")
+                    continue
+                dst = tmp_path / key
+                dst.mkdir()
+                print(f"Extracting {key} ...", flush=True)
+                n = _extract_zips_to_dir(src, dst)
+                print(f"  → {n} tiles")
+                tile_counts[key] = n
+                group_dirs[key] = dst
+
+        fid_matrix: dict[str, float] = {}
+        rows = [f"real_{s}" for s in subtypes]
+        cols = [f"gen_{s}"  for s in subtypes]
+
+        for row in rows:
+            for col in cols:
+                if row not in group_dirs or col not in group_dirs:
+                    print(f"Skipping {row} vs {col} (missing data)")
+                    continue
+                key = f"{row}_vs_{col}"
+                print(f"Computing FID: {row} vs {col} ...", flush=True)
+                fid = _compute_fid(group_dirs[row], group_dirs[col], device, batch_size)
+                fid_matrix[key] = fid
+                print(f"  → FID = {fid:.2f}")
+
+    results = {
+        "fid_matrix": fid_matrix,
+        "tile_counts": tile_counts,
+        "subtypes": subtypes,
+        "rows": rows,
+        "cols": cols,
+    }
+    out_json = eval_dir / "fid_matrix_official.json"
+    out_json.write_text(json.dumps(results, indent=2))
+    print(f"\nSaved: {out_json}")
+
+    matrix = np.array([[fid_matrix.get(f"{r}_vs_{c}", float("nan"))
+                         for c in cols] for r in rows])
+    out_png = eval_dir / "fid_matrix_official.png"
+    _plot_fid_matrix(matrix, rows, cols, out_png)
+    print(f"Saved: {out_png}")
+
+    return results
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="FID matrix via pytorch_fid")
     parser.add_argument("--eval-dir", type=Path, default=None,

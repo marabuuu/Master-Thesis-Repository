@@ -2006,6 +2006,1690 @@ def plot_cross_type_proximity_heatmaps(
 
 
 # ===================================================================
+# § 5  Cohort-level comparison (e.g. TCGA-BRCA vs TCGA-LIHC)
+#
+# Layout: one panel per cell type.  Each panel shows two groups
+# (one per cohort) so all six panels together give a complete
+# picture of how tissue composition and spatial organisation differ
+# between the two cohorts.
+#
+# Statistical framework
+# ---------------------
+# Unit of observation = one patient (median across that patient's
+# tiles).  Mann-Whitney U per cell type; global Benjamini-Hochberg
+# FDR across all cell types simultaneously.  Annotations shown only
+# when BH q < 0.05 AND |rank-biserial r| ≥ 0.11 (small-effect
+# threshold per Cohen's conventions).
+# ===================================================================
+
+# ── data collection helpers ──────────────────────────────────────────────────
+
+def _collect_fractions_by_cohort(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    max_per_patient: Optional[int],
+    seed: int = 42,
+) -> Dict[str, Dict[str, np.ndarray]]:
+    """Return ``{cohort: {pid: (n_tiles, n_channels)}}`` tissue-fraction arrays."""
+    return {
+        cohort: _collect_tissue_fractions_by_patient(
+            masks_dir=cohort_masks[cohort],
+            patient_ids=cohort_pids.get(cohort, []),
+            max_per_patient=max_per_patient,
+            seed=seed,
+        )
+        for cohort in cohort_masks
+    }
+
+
+def _collect_spatial_stats_by_cohort(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    non_bg_channels: List[int],
+    max_per_patient: Optional[int],
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, Dict[str, Dict]]:
+    """Return ``{cohort: {pid: {nn_intra, nn_cross}}}`` NN-distance dicts."""
+    result: Dict[str, Dict[str, Dict]] = {}
+    for cohort, masks_dir in cohort_masks.items():
+        pids = cohort_pids.get(cohort, [])
+        if verbose:
+            print(f"  [{cohort}] NN stats for {len(pids)} patients…")
+        result[cohort] = _collect_spatial_stats_by_patient(
+            masks_dir=masks_dir,
+            patient_ids=pids,
+            non_bg_channels=non_bg_channels,
+            max_per_patient=max_per_patient,
+            seed=seed,
+        )
+    return result
+
+
+def _collect_ripley_per_celltype_for_cohorts(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    non_bg_channels: List[int],
+    max_per_patient: Optional[int],
+    n_bootstrap: int = 20,
+    seed: int = 42,
+    verbose: bool = True,
+) -> Dict[str, Dict[int, Dict[str, List[Dict]]]]:
+    """Collect per-cell-type Ripley L metrics for each cohort.
+
+    Returns ``{cohort: {channel_idx: {pid: [tile_metrics]}}}``.
+    Each tile_metrics dict has ``ripley_radii``, ``ripley_L``,
+    ``ripley_L_lower``, ``ripley_L_upper`` arrays.
+    """
+    rng = np.random.default_rng(seed)
+    result: Dict[str, Dict[int, Dict[str, List[Dict]]]] = {}
+
+    for cohort, masks_dir in cohort_masks.items():
+        pids = cohort_pids.get(cohort, [])
+        if verbose:
+            print(f"  [{cohort}] Ripley per cell type ({len(pids)} patients)…")
+        cohort_data: Dict[int, Dict[str, List]] = {ch: {} for ch in non_bg_channels}
+
+        for pid in pids:
+            zip_path = masks_dir / f"{pid}.zip"
+            if not zip_path.exists():
+                continue
+            pid_tiles_by_ch: Dict[int, List] = {ch: [] for ch in non_bg_channels}
+            try:
+                with zipfile.ZipFile(zip_path, "r") as zf:
+                    tile_names = [n for n in zf.namelist() if n.endswith("_cls.npy")]
+                    if max_per_patient and len(tile_names) > max_per_patient:
+                        chosen = rng.choice(len(tile_names), max_per_patient, replace=False)
+                        tile_names = [tile_names[i] for i in chosen]
+
+                    for name in tile_names:
+                        try:
+                            with zf.open(name) as f:
+                                mask = np.load(BytesIO(f.read()))
+                            if mask.ndim == 2:
+                                continue
+                            if mask.ndim == 3 and mask.shape[0] >= mask.shape[1]:
+                                mask = np.transpose(mask, (2, 0, 1))
+                            if mask.ndim != 3:
+                                continue
+                            pixel_classes = np.argmax(mask, axis=0)  # (H, W)
+                            H, W = pixel_classes.shape
+
+                            for ch in non_bg_channels:
+                                binary = (pixel_classes == ch).astype(float)
+                                m = compute_spatial_metrics_per_tile(
+                                    binary,
+                                    channel_idx=ch,
+                                    bounding_box=(W, H),
+                                    n_bootstrap=n_bootstrap,
+                                )
+                                if m["ripley_L"].size > 0:
+                                    pid_tiles_by_ch[ch].append(m)
+                        except Exception:
+                            logger.debug("Ripley celltype failed: %s in %s", name, zip_path)
+            except Exception:
+                logger.debug("Cannot open %s", zip_path)
+
+            for ch in non_bg_channels:
+                if pid_tiles_by_ch[ch]:
+                    cohort_data[ch][pid] = pid_tiles_by_ch[ch]
+
+        result[cohort] = cohort_data
+        if verbose:
+            for ch in non_bg_channels:
+                print(f"    {CHANNEL_NAMES[ch]}: {len(cohort_data[ch])} patients")
+
+    return result
+
+
+# ── shared stats helper ──────────────────────────────────────────────────────
+
+def _run_cohort_stats(
+    cohort_data_by_ch: Dict[int, Dict[str, np.ndarray]],
+) -> Dict[str, Dict]:
+    """MW U per channel, global BH across all channels.
+
+    ``cohort_data_by_ch`` maps ``channel_index → {cohort_name: per-patient-values}``.
+    Returns ``{channel_name: stats_dict}`` with globally-corrected ``kruskal_q``
+    and ``pairwise_q``.
+    """
+    stats_results: Dict[str, Dict] = {}
+    for ch, patient_vals in cohort_data_by_ch.items():
+        ch_name = CHANNEL_NAMES[ch]
+        stats_results[ch_name] = run_subtype_tests(patient_vals, metric_name=ch_name)
+    _globally_correct_stats(stats_results)
+    return stats_results
+
+
+def _annotate_two_group_bracket(
+    ax,
+    x_a: float,
+    x_b: float,
+    stats_result: Optional[Dict],
+    cohort_a: str,
+    cohort_b: str,
+    y_top: float,
+    y_span: float,
+    r_threshold: float = 0.11,
+) -> float:
+    """Draw a significance bracket + rank-biserial r between two groups.
+
+    Returns the y-headroom consumed above ``y_top`` (0 if not drawn).
+    The pair is looked up in both orderings so caller needn't worry about order.
+    """
+    if stats_result is None or not stats_result.get("pairwise_q"):
+        return 0.0
+    pairwise_q = stats_result.get("pairwise_q", {})
+    pairwise_r = stats_result.get("pairwise_r", {})
+    key     = f"{cohort_a}_vs_{cohort_b}"
+    alt_key = f"{cohort_b}_vs_{cohort_a}"
+    q     = pairwise_q.get(key, pairwise_q.get(alt_key, 1.0))
+    r_val = pairwise_r.get(key, pairwise_r.get(alt_key, 0.0))
+
+    if q >= 0.05 or abs(r_val) < r_threshold:
+        return 0.0
+
+    star = "***" if q < 0.001 else ("**" if q < 0.01 else "*")
+    bar_y = y_top + 0.05 * y_span
+    cap   = 0.01 * y_span
+    ax.plot(
+        [x_a, x_a, x_b, x_b],
+        [bar_y - cap, bar_y, bar_y, bar_y - cap],
+        color="#333333", lw=0.7, clip_on=False,
+    )
+    ax.text(
+        (x_a + x_b) / 2, bar_y + 0.01 * y_span,
+        f"{star}  r={r_val:+.2f}",
+        ha="center", va="bottom", fontsize=6.5, color="#333333", clip_on=False,
+    )
+    return 0.20 * y_span
+
+
+# ── cell-type composition boxplots ───────────────────────────────────────────
+
+def plot_cell_type_boxplots_by_cohort(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    cohort_labels: Dict[str, str],
+    cohort_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    max_tiles_per_patient: int = 50,
+    include_background: bool = False,
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; two boxplots per panel (one per cohort).
+
+    Each data point is one patient's median tile fraction for that cell type.
+    Significance bracket annotated when BH q < 0.05 and |r| ≥ 0.11.
+    Sidecar ``cohort_cell_type_composition_stats.json`` saved alongside the PNG.
+    """
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cohort_names = list(cohort_masks.keys())
+    display_labels = [cohort_labels.get(c, c) for c in cohort_names]
+    pal = {cohort_labels.get(c, c): cohort_palette.get(c, "#888888") for c in cohort_names}
+
+    ch_start = 0 if include_background else 1
+    channels = [(ch, name) for ch, name in CHANNEL_NAMES.items() if ch >= ch_start]
+    ch_indices = [ch for ch, _ in channels]
+
+    if verbose:
+        print(f"  Collecting tissue fractions for {len(cohort_names)} cohorts…")
+    fracs_by_cohort = _collect_fractions_by_cohort(
+        cohort_masks, cohort_pids, max_tiles_per_patient, seed=seed,
+    )
+    for cname, pid_data in fracs_by_cohort.items():
+        if verbose:
+            total = sum(len(v) for v in pid_data.values())
+            print(f"  [{cname}] {len(pid_data)} patients, {total} tiles")
+
+    # Patient-level medians for statistics (one value per patient per channel)
+    cohort_data_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in ch_indices}
+    for cohort in cohort_names:
+        pid_to_tiles = fracs_by_cohort[cohort]
+        for ch in ch_indices:
+            cohort_data_by_ch[ch][cohort] = np.array([
+                float(np.nanmedian(tiles[:, ch]))
+                for tiles in pid_to_tiles.values()
+                if ch < tiles.shape[1]
+            ])
+    stats_results = _run_cohort_stats(cohort_data_by_ch)
+
+    # Patient-level long-form DataFrame for seaborn (one row per patient per channel)
+    records: List[Dict] = []
+    for cohort in cohort_names:
+        label = cohort_labels.get(cohort, cohort)
+        pid_medians = _patient_medians(fracs_by_cohort[cohort])
+        for pid_med in pid_medians.values():
+            for ch in ch_indices:
+                if ch < len(pid_med):
+                    records.append({
+                        "Cohort":     label,
+                        "Cell Type":  CHANNEL_NAMES[ch],
+                        "Fraction":   float(pid_med[ch]),
+                    })
+    if not records:
+        logger.error("No tissue fraction data — aborting cohort boxplot.")
+        return
+    df = pd.DataFrame(records)
+
+    n_ch = len(ch_indices)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=False, squeeze=False)
+
+    for col_idx, (ch, ch_name) in enumerate(channels):
+        ax = axes[0][col_idx]
+        subset = df[df["Cell Type"] == ch_name]
+
+        sns.boxplot(
+            data=subset, x="Cohort", y="Fraction",
+            order=display_labels, palette=pal,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Cohort", y="Fraction",
+            order=display_labels, color="#333333",
+            alpha=0.35, size=2.2, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "")
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+
+    # Significance brackets — per-panel y-limits since sharey=False
+    for col_idx, (ch, ch_name) in enumerate(channels):
+        ax = axes[0][col_idx]
+        y_min_ax, y_max_ax = ax.get_ylim()
+        y_span_ax = y_max_ax - y_min_ax
+        h = _annotate_two_group_bracket(
+            ax=ax, x_a=0, x_b=1,
+            stats_result=stats_results.get(ch_name),
+            cohort_a=cohort_names[0], cohort_b=cohort_names[1],
+            y_top=y_max_ax, y_span=y_span_ax,
+        )
+        if h > 0:
+            ax.set_ylim(top=y_max_ax + h + 0.04 * y_span_ax)
+
+    fig.suptitle("Cell-Type Nuclei Composition: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "One point = one patient (median tile fraction). "
+        "Bracket: BH q < 0.05 and |rank-biserial r| ≥ 0.11 (small-effect threshold). "
+        "Global BH correction across all cell types.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / "cohort_cell_type_boxplots.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / "cohort_cell_type_composition_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved stats → {output_dir / 'cohort_cell_type_composition_stats.json'}")
+
+
+# ── intra-type NN distance violins ───────────────────────────────────────────
+
+def plot_nn_distance_violins_by_cohort(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    cohort_labels: Dict[str, str],
+    cohort_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    non_bg_channels: Optional[List[int]] = None,
+    max_tiles_per_patient: int = 20,
+    log_scale: bool = True,
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; two violin plots per panel (one per cohort).
+
+    Y-axis = per-patient median of tile-level mean intra-type NN distance (px).
+    Significance shown in the top-right corner of each panel when BH q < 0.05
+    and |r| ≥ 0.11.  Log scale is used by default; bracket annotations are
+    replaced by a text badge to avoid log-scale coordinate issues.
+    """
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if non_bg_channels is None:
+        non_bg_channels = list(range(1, 7))
+
+    cohort_names = list(cohort_masks.keys())
+    display_labels = [cohort_labels.get(c, c) for c in cohort_names]
+    pal = {cohort_labels.get(c, c): cohort_palette.get(c, "#888888") for c in cohort_names}
+    ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
+
+    if verbose:
+        print(f"  Collecting NN stats for {len(cohort_names)} cohorts…")
+    spatial_by_cohort = _collect_spatial_stats_by_cohort(
+        cohort_masks, cohort_pids, non_bg_channels,
+        max_per_patient=max_tiles_per_patient, seed=seed, verbose=verbose,
+    )
+
+    records: List[Dict] = []
+    cohort_data_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+
+    for cohort in cohort_names:
+        label = cohort_labels.get(cohort, cohort)
+        pid_stats = spatial_by_cohort[cohort]
+        for i, ch in enumerate(non_bg_channels):
+            pat_meds = np.array([
+                float(np.nanmedian(pid_stats[pid]["nn_intra"][:, i]))
+                for pid in pid_stats
+                if np.any(np.isfinite(pid_stats[pid]["nn_intra"][:, i]))
+            ])
+            valid = pat_meds[np.isfinite(pat_meds)]
+            cohort_data_by_ch[ch][cohort] = valid
+            for v in valid:
+                records.append({"Cohort": label, "Cell Type": CHANNEL_NAMES[ch],
+                                "NN Distance (px)": float(v)})
+
+    if not records:
+        logger.error("No NN distance data — aborting cohort violin plot.")
+        return
+    df = pd.DataFrame(records)
+    stats_results = _run_cohort_stats(cohort_data_by_ch)
+
+    n_ch = len(non_bg_channels)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=True, squeeze=False)
+
+    for col_idx, (ch, ch_name) in enumerate(zip(non_bg_channels, ch_labels)):
+        ax = axes[0][col_idx]
+        subset = df[df["Cell Type"] == ch_name]
+        if subset.empty:
+            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="grey")
+            continue
+
+        sns.boxplot(
+            data=subset, x="Cohort", y="NN Distance (px)",
+            order=display_labels, palette=pal,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Cohort", y="NN Distance (px)",
+            order=display_labels, color="#333333",
+            alpha=0.35, size=2.2, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "")
+        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+        if log_scale:
+            ax.set_yscale("log")
+        if col_idx > 0:
+            ax.tick_params(axis="y", labelleft=False)
+
+        # Text-badge significance annotation (works for both linear and log scale)
+        sr = stats_results.get(ch_name, {})
+        pq = sr.get("pairwise_q", {})
+        pr = sr.get("pairwise_r", {})
+        k1 = f"{cohort_names[0]}_vs_{cohort_names[1]}"
+        k2 = f"{cohort_names[1]}_vs_{cohort_names[0]}"
+        q     = pq.get(k1, pq.get(k2, 1.0))
+        r_val = pr.get(k1, pr.get(k2, 0.0))
+        if q < 0.05 and abs(r_val) >= 0.11:
+            star = "***" if q < 0.001 else ("**" if q < 0.01 else "*")
+            ax.text(0.97, 0.97, f"{star}  r={r_val:+.2f}",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7, color="#333333",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+
+    fig.suptitle("Intra-Cell-Type NN Distance: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "One point = one patient; per-patient medians of tile-level mean NN distance. "
+        "Log scale.  Badge: BH q < 0.05 and |rank-biserial r| ≥ 0.11.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / "cohort_nn_distance_violins.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / "cohort_nn_distance_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved stats → {output_dir / 'cohort_nn_distance_stats.json'}")
+
+
+# ── Ripley L(r) by cohort ────────────────────────────────────────────────────
+
+def plot_ripley_L_by_cohort(
+    cohort_masks: Dict[str, Path],
+    cohort_pids: Dict[str, List[str]],
+    cohort_labels: Dict[str, str],
+    cohort_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    non_bg_channels: Optional[List[int]] = None,
+    max_tiles_per_patient: int = 10,
+    n_bootstrap: int = 20,
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; overlaid mean L(r)−r curves per cohort.
+
+    Shaded band = 2.5–97.5 percentile across patients.  CSR baseline
+    (L(r)−r = 0) shown as a dashed grey line.  Significance in the
+    top-right corner derived from a MW U test on per-patient AUC, with
+    global BH correction across all cell types.
+    """
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if non_bg_channels is None:
+        non_bg_channels = list(range(1, 7))
+
+    cohort_names = list(cohort_masks.keys())
+    display_labels = [cohort_labels.get(c, c) for c in cohort_names]
+    pal = {cohort_labels.get(c, c): cohort_palette.get(c, "#888888") for c in cohort_names}
+
+    if verbose:
+        print(f"  Collecting per-cell-type Ripley L for {len(cohort_names)} cohorts…")
+    ripley_data = _collect_ripley_per_celltype_for_cohorts(
+        cohort_masks=cohort_masks,
+        cohort_pids=cohort_pids,
+        non_bg_channels=non_bg_channels,
+        max_per_patient=max_tiles_per_patient,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        verbose=verbose,
+    )
+
+    # Per-patient AUC of L(r)−r for significance test
+    auc_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+    for cohort in cohort_names:
+        for ch in non_bg_channels:
+            pat_aucs: List[float] = []
+            for pid, tiles in ripley_data[cohort][ch].items():
+                curves  = [t["ripley_L"]    for t in tiles if t["ripley_L"].size > 0]
+                radii_l = [t["ripley_radii"] for t in tiles if t["ripley_L"].size > 0]
+                if not curves:
+                    continue
+                radii_ref = radii_l[0]
+                mean_L = np.mean(curves, axis=0)
+                if len(mean_L) == len(radii_ref) and len(mean_L) > 1:
+                    auc = float(np.trapz(mean_L - radii_ref, radii_ref))
+                    if np.isfinite(auc):
+                        pat_aucs.append(auc)
+            auc_by_ch[ch][cohort] = np.array(pat_aucs)
+    stats_results = _run_cohort_stats(auc_by_ch)
+
+    # Build long-form DataFrame from per-patient AUC values
+    records_auc: List[Dict] = []
+    for ch in non_bg_channels:
+        for cohort, aucs in auc_by_ch[ch].items():
+            label = cohort_labels.get(cohort, cohort)
+            for v in aucs:
+                records_auc.append({
+                    "Cohort": label,
+                    "Cell Type": CHANNEL_NAMES[ch],
+                    "AUC": float(v),
+                })
+    df_auc = pd.DataFrame(records_auc)
+
+    n_ch = len(non_bg_channels)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=False, squeeze=False)
+
+    for col_idx, ch in enumerate(non_bg_channels):
+        ax = axes[0][col_idx]
+        ch_name = CHANNEL_NAMES[ch]
+        subset = df_auc[df_auc["Cell Type"] == ch_name]
+
+        if subset.empty:
+            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="grey")
+            continue
+
+        sns.boxplot(
+            data=subset, x="Cohort", y="AUC",
+            order=display_labels, palette=pal,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Cohort", y="AUC",
+            order=display_labels, color="#333333",
+            alpha=0.35, size=2.2, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("AUC of L(r) − r" if col_idx == 0 else "")
+        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+
+        # Significance bracket
+        y_min_ax, y_max_ax = ax.get_ylim()
+        y_span_ax = y_max_ax - y_min_ax
+        h = _annotate_two_group_bracket(
+            ax=ax, x_a=0, x_b=1,
+            stats_result=stats_results.get(ch_name),
+            cohort_a=cohort_names[0], cohort_b=cohort_names[1],
+            y_top=y_max_ax, y_span=y_span_ax,
+        )
+        if h > 0:
+            ax.set_ylim(top=y_max_ax + h + 0.04 * y_span_ax)
+
+    fig.suptitle("Ripley Spatial Regularity by Cell Type: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "One point = one patient. Y-axis: AUC of L(r)−r integrated over radii; "
+        "more negative = cells more regularly spaced than random (spatial inhibition). "
+        "Bracket: BH q < 0.05 and |rank-biserial r| ≥ 0.11.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / "cohort_ripley_L.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / "cohort_ripley_L_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Saved stats → {output_dir / 'cohort_ripley_L_stats.json'}")
+
+
+# ===================================================================
+# § 6  PAM50 subtype comparison — per-cell-type layout
+#
+# Same three plots as § 5 but for N PAM50 subtypes (Normal, LumA,
+# LumB, Her2, Basal) sharing one masks_dir.  Patient→subtype mapping
+# comes from the metadata CSV.
+#
+# Statistics: Kruskal-Wallis omnibus (global BH, Family 1) gates
+# pairwise Mann-Whitney (global BH, Family 2).  Annotations shown
+# only when BOTH q < 0.05 AND the relevant effect size ≥ threshold.
+# ===================================================================
+
+def _annotate_pairwise_brackets(
+    ax,
+    group_order: List[str],
+    stats_result: Optional[Dict],
+    y_top: float,
+    y_span: float,
+    r_threshold: float = 0.11,
+    max_brackets: int = 6,
+) -> float:
+    """Draw significance brackets for the top-|r| significant pairs.
+
+    ``group_order`` gives the x-axis category order so that x-positions
+    (0, 1, 2, …) are inferred from list index.  Returns extra y-headroom
+    consumed above ``y_top`` (0 when nothing is drawn).
+    """
+    if stats_result is None:
+        return 0.0
+    pairwise_q = stats_result.get("pairwise_q", {})
+    pairwise_r = stats_result.get("pairwise_r", {})
+    x_pos = {g: i for i, g in enumerate(group_order)}
+
+    sig: List[tuple] = []
+    for key, q in pairwise_q.items():
+        r_val = pairwise_r.get(key, 0.0)
+        if q >= 0.05 or abs(r_val) < r_threshold:
+            continue
+        # parse pair key: "A_vs_B" — split on first _vs_ occurrence
+        idx = key.find("_vs_")
+        if idx == -1:
+            continue
+        g1, g2 = key[:idx], key[idx + 4:]
+        if g1 not in x_pos or g2 not in x_pos:
+            continue
+        sig.append((g1, g2, q, r_val))
+
+    if not sig:
+        return 0.0
+
+    # Keep only top-|r| pairs to avoid clutter
+    sig.sort(key=lambda t: -abs(t[3]))
+    sig = sig[:max_brackets]
+
+    bracket_step = 0.08 * y_span
+    headroom = 0.0
+    for rank, (g1, g2, q, r_val) in enumerate(sig):
+        x1, x2 = x_pos[g1], x_pos[g2]
+        x_left, x_right = min(x1, x2), max(x1, x2)
+        bar_y = y_top + 0.04 * y_span + rank * bracket_step
+        cap   = 0.008 * y_span
+        star  = "***" if q < 0.001 else ("**" if q < 0.01 else "*")
+
+        ax.plot(
+            [x_left, x_left, x_right, x_right],
+            [bar_y - cap, bar_y, bar_y, bar_y - cap],
+            color="#333333", lw=0.55, clip_on=False,
+        )
+        ax.text(
+            (x_left + x_right) / 2, bar_y + 0.003 * y_span,
+            f"{star} r={r_val:+.2f}",
+            ha="center", va="bottom", fontsize=5.5, color="#333333", clip_on=False,
+        )
+        headroom = bar_y + bracket_step - y_top
+
+    return headroom
+
+
+def _build_subtype_group_dicts(
+    masks_dir: Path,
+    metadata_csv: Union[str, Path],
+    patient_col: str,
+    subtype_col: str,
+    subtype_order: List[str],
+) -> Tuple[Dict[str, Path], Dict[str, List[str]]]:
+    """Read CSV and build {subtype: masks_dir} and {subtype: [pids]} dicts."""
+    df = pd.read_csv(metadata_csv)
+    df["_pid"] = df[patient_col].apply(_extract_patient_id)
+    p2s = dict(zip(df["_pid"], df[subtype_col]))
+    available = sorted(df[subtype_col].dropna().unique().tolist())
+    subtypes = [s for s in subtype_order if s in available]
+    subtypes += [s for s in available if s not in subtype_order]
+
+    group_masks = {s: masks_dir for s in subtypes}
+    group_pids:  Dict[str, List[str]] = {s: [] for s in subtypes}
+    for pid, st in p2s.items():
+        if st in group_pids:
+            group_pids[st].append(pid)
+    return group_masks, group_pids
+
+
+def plot_cell_type_boxplots_per_celltype(
+    group_masks: Dict[str, Path],
+    group_pids: Dict[str, List[str]],
+    group_order: List[str],
+    group_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    max_tiles_per_patient: int = 50,
+    include_background: bool = False,
+    out_stem: str = "subtype_cell_type_boxplots",
+    title: str = "Cell-Type Nuclei Composition per PAM50 Subtype",
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; groups on x-axis.  Pairwise brackets for top pairs."""
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ch_start = 0 if include_background else 1
+    channels = [(ch, name) for ch, name in CHANNEL_NAMES.items() if ch >= ch_start]
+    ch_indices = [ch for ch, _ in channels]
+
+    if verbose:
+        print(f"  Collecting tissue fractions ({len(group_order)} groups)…")
+    fracs_by_group = _collect_fractions_by_cohort(
+        group_masks, group_pids, max_tiles_per_patient, seed=seed,
+    )
+    for gname, pid_data in fracs_by_group.items():
+        if verbose:
+            total = sum(len(v) for v in pid_data.values())
+            print(f"  [{gname}] {len(pid_data)} patients, {total} tiles")
+
+    # Patient-level medians per channel per group
+    cohort_data_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in ch_indices}
+    for group in group_order:
+        pid_to_tiles = fracs_by_group.get(group, {})
+        for ch in ch_indices:
+            cohort_data_by_ch[ch][group] = np.array([
+                float(np.nanmedian(tiles[:, ch]))
+                for tiles in pid_to_tiles.values()
+                if ch < tiles.shape[1]
+            ])
+    stats_results = _run_cohort_stats(cohort_data_by_ch)
+
+    # Long-form DataFrame (patient medians — one row per patient per cell type)
+    records: List[Dict] = []
+    for group in group_order:
+        pid_medians = _patient_medians(fracs_by_group.get(group, {}))
+        for pid_med in pid_medians.values():
+            for ch in ch_indices:
+                if ch < len(pid_med):
+                    records.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch],
+                                    "Fraction": float(pid_med[ch])})
+    if not records:
+        logger.error("No tissue fraction data — aborting.")
+        return
+    df = pd.DataFrame(records)
+
+    n_ch = len(ch_indices)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 5.0), sharey=False, squeeze=False)
+
+    for col_idx, (ch, ch_name) in enumerate(channels):
+        ax = axes[0][col_idx]
+        subset = df[df["Cell Type"] == ch_name]
+        sns.boxplot(
+            data=subset, x="Group", y="Fraction",
+            order=group_order, palette=group_palette,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Group", y="Fraction",
+            order=group_order, color="#333333",
+            alpha=0.30, size=1.8, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "")
+        ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
+        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+
+        # KW omnibus badge — pairwise brackets too cluttered for 5 groups
+        sr   = stats_results.get(ch_name, {})
+        kw_q = sr.get("kruskal_q", 1.0)
+        eta  = sr.get("eta_sq", 0.0)
+        if kw_q < 0.05 and eta >= 0.01:
+            star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
+            ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7, color="#333333",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+
+    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "One point = one patient (median tile fraction).  "
+        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.  "
+        "See subtype_pairwise_r_matrix.png for pairwise effect sizes.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / f"{out_stem}.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / f"{out_stem}_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Stats → {output_dir / (out_stem + '_stats.json')}")
+
+
+def plot_nn_distance_violins_per_celltype(
+    group_masks: Dict[str, Path],
+    group_pids: Dict[str, List[str]],
+    group_order: List[str],
+    group_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    non_bg_channels: Optional[List[int]] = None,
+    max_tiles_per_patient: int = 20,
+    log_scale: bool = True,
+    out_stem: str = "subtype_nn_distance_violins",
+    title: str = "Intra-Cell-Type NN Distance per PAM50 Subtype",
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; groups on x-axis.  Log-scale violin plots."""
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if non_bg_channels is None:
+        non_bg_channels = list(range(1, 7))
+    ch_labels = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
+
+    if verbose:
+        print(f"  Collecting NN stats ({len(group_order)} groups)…")
+    spatial_by_group = _collect_spatial_stats_by_cohort(
+        group_masks, group_pids, non_bg_channels,
+        max_per_patient=max_tiles_per_patient, seed=seed, verbose=verbose,
+    )
+
+    records: List[Dict] = []
+    cohort_data_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+    for group in group_order:
+        pid_stats = spatial_by_group.get(group, {})
+        for i, ch in enumerate(non_bg_channels):
+            pat_meds = np.array([
+                float(np.nanmedian(pid_stats[pid]["nn_intra"][:, i]))
+                for pid in pid_stats
+                if np.any(np.isfinite(pid_stats[pid]["nn_intra"][:, i]))
+            ])
+            valid = pat_meds[np.isfinite(pat_meds)]
+            cohort_data_by_ch[ch][group] = valid
+            for v in valid:
+                records.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch],
+                                "NN Distance (px)": float(v)})
+
+    if not records:
+        logger.error("No NN distance data — aborting.")
+        return
+    df = pd.DataFrame(records)
+    stats_results = _run_cohort_stats(cohort_data_by_ch)
+
+    n_ch = len(non_bg_channels)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 5.0), sharey=True, squeeze=False)
+
+    for col_idx, (ch, ch_name) in enumerate(zip(non_bg_channels, ch_labels)):
+        ax = axes[0][col_idx]
+        subset = df[df["Cell Type"] == ch_name]
+        if subset.empty:
+            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="grey")
+            continue
+        sns.boxplot(
+            data=subset, x="Group", y="NN Distance (px)",
+            order=group_order, palette=group_palette,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Group", y="NN Distance (px)",
+            order=group_order, color="#333333",
+            alpha=0.30, size=1.8, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "")
+        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+        if log_scale:
+            ax.set_yscale("log")
+        if col_idx > 0:
+            ax.tick_params(axis="y", labelleft=False)
+
+        # KW omnibus badge (pairwise brackets too cluttered for 5 groups on log scale)
+        sr   = stats_results.get(ch_name, {})
+        kw_q = sr.get("kruskal_q", 1.0)
+        eta  = sr.get("eta_sq", 0.0)
+        if kw_q < 0.05 and eta >= 0.01:
+            star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
+            ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7, color="#333333",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+
+    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "Per-patient medians of tile-level mean intra-type NN distance.  Log scale.  "
+        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.  See JSON for pairwise r.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / f"{out_stem}.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / f"{out_stem}_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Stats → {output_dir / (out_stem + '_stats.json')}")
+
+
+def plot_ripley_L_per_celltype(
+    group_masks: Dict[str, Path],
+    group_pids: Dict[str, List[str]],
+    group_order: List[str],
+    group_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    non_bg_channels: Optional[List[int]] = None,
+    max_tiles_per_patient: int = 10,
+    n_bootstrap: int = 20,
+    out_stem: str = "subtype_ripley_L",
+    title: str = "Ripley L(r) − r by Cell Type per PAM50 Subtype",
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """One panel per cell type; overlaid mean L(r)−r curves per group.
+
+    KW omnibus significance on per-patient AUC shown in top-right corner.
+    """
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if non_bg_channels is None:
+        non_bg_channels = list(range(1, 7))
+
+    if verbose:
+        print(f"  Collecting per-cell-type Ripley L ({len(group_order)} groups)…")
+    ripley_data = _collect_ripley_per_celltype_for_cohorts(
+        cohort_masks=group_masks,
+        cohort_pids=group_pids,
+        non_bg_channels=non_bg_channels,
+        max_per_patient=max_tiles_per_patient,
+        n_bootstrap=n_bootstrap,
+        seed=seed,
+        verbose=verbose,
+    )
+
+    # Per-patient AUC for stats
+    auc_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+    for group in group_order:
+        for ch in non_bg_channels:
+            pat_aucs: List[float] = []
+            for pid, tiles in ripley_data.get(group, {}).get(ch, {}).items():
+                curves  = [t["ripley_L"]    for t in tiles if t["ripley_L"].size > 0]
+                radii_l = [t["ripley_radii"] for t in tiles if t["ripley_L"].size > 0]
+                if not curves:
+                    continue
+                mean_L    = np.mean(curves, axis=0)
+                radii_ref = radii_l[0]
+                if len(mean_L) == len(radii_ref) > 1:
+                    auc = float(np.trapz(mean_L - radii_ref, radii_ref))
+                    if np.isfinite(auc):
+                        pat_aucs.append(auc)
+            auc_by_ch[ch][group] = np.array(pat_aucs)
+    stats_results = _run_cohort_stats(auc_by_ch)
+
+    # Build long-form DataFrame from per-patient AUC values
+    records_auc: List[Dict] = []
+    for ch in non_bg_channels:
+        for group, aucs in auc_by_ch[ch].items():
+            for v in aucs:
+                records_auc.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch], "AUC": float(v)})
+    df_auc = pd.DataFrame(records_auc)
+
+    n_ch = len(non_bg_channels)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 4.8), sharey=False, squeeze=False)
+
+    for col_idx, ch in enumerate(non_bg_channels):
+        ax = axes[0][col_idx]
+        ch_name = CHANNEL_NAMES[ch]
+        subset = df_auc[df_auc["Cell Type"] == ch_name]
+
+        if subset.empty:
+            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                    transform=ax.transAxes, color="grey")
+            continue
+
+        sns.boxplot(
+            data=subset, x="Group", y="AUC",
+            order=group_order, palette=group_palette,
+            linewidth=0.8, fliersize=0, ax=ax,
+        )
+        sns.stripplot(
+            data=subset, x="Group", y="AUC",
+            order=group_order, color="#333333",
+            alpha=0.30, size=1.8, jitter=True, ax=ax,
+        )
+        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xlabel("")
+        ax.set_ylabel("AUC of L(r) − r" if col_idx == 0 else "")
+        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+
+        sr   = stats_results.get(ch_name, {})
+        kw_q = sr.get("kruskal_q", 1.0)
+        eta  = sr.get("eta_sq", 0.0)
+        if kw_q < 0.05 and eta >= 0.01:
+            star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
+            ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
+                    transform=ax.transAxes, ha="right", va="top",
+                    fontsize=7, color="#333333",
+                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+
+    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.02,
+        "One point = one patient. Y-axis: AUC of L(r)−r; "
+        "more negative = cells more regularly spaced than random.  "
+        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / f"{out_stem}.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved → {out}")
+
+    with open(output_dir / f"{out_stem}_stats.json", "w") as _f:
+        json.dump(stats_results, _f, indent=2)
+    if verbose:
+        print(f"[OK] Stats → {output_dir / (out_stem + '_stats.json')}")
+
+
+def plot_pairwise_r_matrix_subtype(
+    stats_json: Union[str, Path],
+    output_dir: Union[str, Path],
+    *,
+    group_order: Optional[List[str]] = None,
+    cell_types: Optional[List[str]] = None,
+    r_threshold: float = 0.11,
+    q_threshold: float = 0.05,
+    vmax: float = 0.75,
+    out_stem: str = "subtype_pairwise_r_matrix",
+    figsize: Optional[Tuple[float, float]] = None,
+    dpi: int = 200,
+    verbose: bool = True,
+) -> None:
+    """Upper-triangle pairwise rank-biserial r heatmaps, one per cell type.
+
+    Reads directly from the stats JSON written by
+    :func:`plot_cell_type_boxplots_per_celltype` — no mask loading needed.
+
+    Layout: 2 rows × 3 columns of N×N upper-triangle matrices (N = groups).
+    Colour = rank-biserial r on a diverging RdBu_r map (warm = row > col).
+    Grey cells = not significant (q ≥ q_threshold or |r| < r_threshold).
+    """
+    _check_matplotlib()
+    setup_style()
+    import matplotlib.colors as mcolors
+
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    with open(stats_json) as _f:
+        stats = json.load(_f)
+
+    if group_order is None:
+        first_ct = next(iter(stats.values()))
+        all_groups = list(first_ct.get("n_patients", {}).keys())
+        pam50_idx = {g: i for i, g in enumerate(PAM50_ORDER)}
+        group_order = sorted(all_groups, key=lambda g: pam50_idx.get(g, 99))
+
+    if cell_types is None:
+        ct_order = [CHANNEL_NAMES[ch] for ch in range(1, 7)]
+        cell_types = [ct for ct in ct_order if ct in stats]
+
+    n_groups = len(group_order)
+    n_ct = len(cell_types)
+    n_cols_g = min(3, n_ct)
+    n_rows_g = (n_ct + n_cols_g - 1) // n_cols_g
+
+    cell_px = max(0.75, 4.0 / n_groups)
+    if figsize is None:
+        figsize = (
+            n_cols_g * (n_groups * cell_px + 1.2),
+            n_rows_g * (n_groups * cell_px + 1.0),
+        )
+
+    cmap = plt.get_cmap("RdBu_r")
+    norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
+    group_idx = {g: i for i, g in enumerate(group_order)}
+
+    fig, axes = plt.subplots(n_rows_g, n_cols_g, figsize=figsize, squeeze=False)
+
+    for panel_idx, ct_name in enumerate(cell_types):
+        row_g = panel_idx // n_cols_g
+        col_g = panel_idx % n_cols_g
+        ax = axes[row_g][col_g]
+
+        ct_stats = stats.get(ct_name, {})
+        pq = ct_stats.get("pairwise_q", {})
+        pr = ct_stats.get("pairwise_r", {})
+
+        # Build upper-triangle r / q matrices
+        r_mat = np.full((n_groups, n_groups), np.nan)
+        q_mat = np.full((n_groups, n_groups), 1.0)
+        for key, r_val in pr.items():
+            sep = key.find("_vs_")
+            if sep == -1:
+                continue
+            g1, g2 = key[:sep], key[sep + 4:]
+            if g1 not in group_idx or g2 not in group_idx:
+                continue
+            i, j = group_idx[g1], group_idx[g2]
+            if i > j:
+                i, j = j, i
+                r_val = -r_val  # ensure upper-triangle = row > col direction
+            r_mat[i, j] = r_val
+            q_mat[i, j] = pq.get(key, pq.get(f"{g2}_vs_{g1}", 1.0))
+
+        ax.set_xlim(-0.5, n_groups - 0.5)
+        ax.set_ylim(-0.5, n_groups - 0.5)
+        ax.invert_yaxis()
+        ax.set_aspect("equal")
+
+        for i in range(n_groups):
+            for j in range(n_groups):
+                if j <= i:
+                    ax.add_patch(plt.Rectangle(
+                        (j - 0.5, i - 0.5), 1, 1,
+                        facecolor="#f0f0f0", edgecolor="white", linewidth=0.8,
+                    ))
+                    continue
+                r_val = r_mat[i, j]
+                q_val = q_mat[i, j]
+                if np.isnan(r_val):
+                    continue
+                is_sig = (q_val < q_threshold) and (abs(r_val) >= r_threshold)
+                fc = cmap(norm(r_val)) if is_sig else "#d4d4d4"
+                ax.add_patch(plt.Rectangle(
+                    (j - 0.5, i - 0.5), 1, 1,
+                    facecolor=fc, edgecolor="white", linewidth=0.8,
+                ))
+                if is_sig:
+                    star = ("***" if q_val < 0.001 else "**" if q_val < 0.01 else "*")
+                    tc = "white" if abs(norm(r_val) - 0.5) > 0.27 else "#222222"
+                    ax.text(j, i - 0.14, star, ha="center", va="center",
+                            fontsize=6, color=tc, fontweight="bold")
+                    ax.text(j, i + 0.22, f"{r_val:+.2f}", ha="center", va="center",
+                            fontsize=5.5, color=tc)
+                else:
+                    ax.text(j, i, f"{r_val:+.2f}", ha="center", va="center",
+                            fontsize=5.0, color="#aaaaaa")
+
+        ax.set_title(ct_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_xticks(range(n_groups))
+        ax.set_xticklabels(group_order, rotation=35, ha="right", fontsize=8)
+        ax.set_yticks(range(n_groups))
+        ax.set_yticklabels(group_order, fontsize=8)
+        ax.tick_params(length=0)
+        for spine in ax.spines.values():
+            spine.set_visible(False)
+
+    for panel_idx in range(len(cell_types), n_rows_g * n_cols_g):
+        axes[panel_idx // n_cols_g][panel_idx % n_cols_g].set_visible(False)
+
+    sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
+    sm.set_array([])
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.45, pad=0.03, aspect=22)
+    cbar.set_label("Rank-biserial r  (row > col)", fontsize=8)
+    cbar.ax.tick_params(labelsize=7)
+
+    fig.suptitle("Pairwise Effect Size (Rank-Biserial r) by Cell Type", fontsize=12, y=1.01)
+    fig.tight_layout()
+    fig.text(
+        0.5, -0.01,
+        f"Coloured: BH q < {q_threshold} and |r| ≥ {r_threshold}.  "
+        "Grey: not significant.  Blank: diagonal / lower triangle.  "
+        "Positive r = row subtype has higher fraction than column subtype.",
+        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+    )
+    out = output_dir / f"{out_stem}.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved r-matrix → {out}")
+
+
+def plot_combined_panel_per_celltype(
+    group_masks: Dict[str, Path],
+    group_pids: Dict[str, List[str]],
+    group_order: List[str],
+    group_palette: Dict[str, str],
+    output_dir: Union[str, Path],
+    *,
+    non_bg_channels: Optional[List[int]] = None,
+    include_background: bool = False,
+    max_tiles_composition: int = 50,
+    max_tiles_spatial: int = 20,
+    max_tiles_ripley: int = 10,
+    n_bootstrap: int = 20,
+    out_stem: str = "subtype_combined_panel",
+    title: str = "Cell Biology by PAM50 Subtype",
+    dpi: int = 200,
+    seed: int = 42,
+    verbose: bool = True,
+) -> None:
+    """Three-row combined figure: composition / NN distance / Ripley AUC.
+
+    Columns = cell types (6), rows = metric type.  All data collected in a
+    single function call so the mask files are opened at most once per metric.
+    Significance shown as KW omnibus badge (η², stars) in each panel corner.
+    """
+    _check_seaborn()
+    setup_style()
+    output_dir = Path(output_dir)
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    ch_start = 0 if include_background else 1
+    channels = [(ch, name) for ch, name in CHANNEL_NAMES.items() if ch >= ch_start]
+    ch_indices = [ch for ch, _ in channels]
+    if non_bg_channels is None:
+        non_bg_channels = ch_indices
+
+    # ── Row 0: composition ────────────────────────────────────────────────────
+    if verbose:
+        print("  [combined] Collecting composition fractions…")
+    fracs_by_group = _collect_fractions_by_cohort(
+        group_masks, group_pids, max_tiles_composition, seed=seed,
+    )
+    comp_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in ch_indices}
+    comp_records: List[Dict] = []
+    for group in group_order:
+        pid_medians = _patient_medians(fracs_by_group.get(group, {}))
+        for pid_med in pid_medians.values():
+            for ch in ch_indices:
+                if ch < len(pid_med):
+                    comp_records.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch],
+                                         "Fraction": float(pid_med[ch])})
+        for ch in ch_indices:
+            comp_by_ch[ch][group] = np.array([
+                float(np.nanmedian(tiles[:, ch]))
+                for tiles in fracs_by_group.get(group, {}).values()
+                if ch < tiles.shape[1]
+            ])
+    comp_stats = _run_cohort_stats(comp_by_ch)
+    df_comp = pd.DataFrame(comp_records)
+
+    # ── Row 1: NN distance ────────────────────────────────────────────────────
+    if verbose:
+        print("  [combined] Collecting NN distances…")
+    spatial_by_group = _collect_spatial_stats_by_cohort(
+        group_masks, group_pids, non_bg_channels,
+        max_per_patient=max_tiles_spatial, seed=seed, verbose=False,
+    )
+    nn_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+    nn_records: List[Dict] = []
+    for group in group_order:
+        pid_stats = spatial_by_group.get(group, {})
+        for i, ch in enumerate(non_bg_channels):
+            vals = np.array([
+                float(np.nanmedian(pid_stats[pid]["nn_intra"][:, i]))
+                for pid in pid_stats
+                if np.any(np.isfinite(pid_stats[pid]["nn_intra"][:, i]))
+            ])
+            valid = vals[np.isfinite(vals)]
+            nn_by_ch[ch][group] = valid
+            for v in valid:
+                nn_records.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch],
+                                   "NN Distance (px)": float(v)})
+    nn_stats = _run_cohort_stats(nn_by_ch)
+    df_nn = pd.DataFrame(nn_records)
+
+    # ── Row 2: Ripley AUC ────────────────────────────────────────────────────
+    if verbose:
+        print("  [combined] Collecting Ripley L per cell type…")
+    ripley_data = _collect_ripley_per_celltype_for_cohorts(
+        cohort_masks=group_masks, cohort_pids=group_pids,
+        non_bg_channels=non_bg_channels,
+        max_per_patient=max_tiles_ripley,
+        n_bootstrap=n_bootstrap, seed=seed, verbose=False,
+    )
+    auc_by_ch: Dict[int, Dict[str, np.ndarray]] = {ch: {} for ch in non_bg_channels}
+    auc_records: List[Dict] = []
+    for group in group_order:
+        for ch in non_bg_channels:
+            pat_aucs: List[float] = []
+            for pid, tiles in ripley_data.get(group, {}).get(ch, {}).items():
+                curves  = [t["ripley_L"]    for t in tiles if t["ripley_L"].size > 0]
+                radii_l = [t["ripley_radii"] for t in tiles if t["ripley_L"].size > 0]
+                if not curves:
+                    continue
+                mean_L    = np.mean(curves, axis=0)
+                radii_ref = radii_l[0]
+                if len(mean_L) == len(radii_ref) > 1:
+                    auc = float(np.trapz(mean_L - radii_ref, radii_ref))
+                    if np.isfinite(auc):
+                        pat_aucs.append(auc)
+            auc_by_ch[ch][group] = np.array(pat_aucs)
+            for v in auc_by_ch[ch][group]:
+                auc_records.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch],
+                                    "AUC": float(v)})
+    auc_stats = _run_cohort_stats(auc_by_ch)
+    df_auc = pd.DataFrame(auc_records)
+
+    # ── Build figure ──────────────────────────────────────────────────────────
+    n_ch = len(non_bg_channels)
+    ch_names = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
+
+    fig, axes = plt.subplots(
+        3, n_ch, figsize=(n_ch * 2.5, 9.0),
+        sharey=False, squeeze=False,
+        gridspec_kw={"hspace": 0.55, "wspace": 0.10},
+    )
+    row_labels = ["Fraction of nuclei area", "Median NN dist (px)", "AUC of L(r) − r"]
+    row_dfs    = [df_comp,      df_nn,              df_auc]
+    row_ycols  = ["Fraction",   "NN Distance (px)", "AUC"]
+    row_stats  = [comp_stats,   nn_stats,            auc_stats]
+    row_log    = [False,        True,                False]
+    row_pct    = [True,         False,               False]
+
+    for row_idx in range(3):
+        df_row   = row_dfs[row_idx]
+        y_col    = row_ycols[row_idx]
+        stats_r  = row_stats[row_idx]
+
+        for col_idx, ch_name in enumerate(ch_names):
+            ax = axes[row_idx][col_idx]
+            subset = df_row[df_row["Cell Type"] == ch_name]
+
+            if subset.empty:
+                ax.text(0.5, 0.5, "no data", ha="center", va="center",
+                        transform=ax.transAxes, color="grey", fontsize=7)
+            else:
+                sns.boxplot(
+                    data=subset, x="Group", y=y_col,
+                    order=group_order, palette=group_palette,
+                    linewidth=0.7, fliersize=0, ax=ax,
+                )
+                sns.stripplot(
+                    data=subset, x="Group", y=y_col,
+                    order=group_order, color="#333333",
+                    alpha=0.25, size=1.5, jitter=True, ax=ax,
+                )
+                if row_log[row_idx]:
+                    ax.set_yscale("log")
+                if row_pct[row_idx]:
+                    ax.yaxis.set_major_formatter(
+                        mticker.PercentFormatter(xmax=1, decimals=0)
+                    )
+
+            # Column title only on top row
+            if row_idx == 0:
+                ax.set_title(ch_name, fontsize=9, fontweight="bold", pad=4)
+            ax.set_xlabel("")
+            ax.set_ylabel(row_labels[row_idx] if col_idx == 0 else "", fontsize=8)
+            ax.tick_params(axis="x", labelrotation=35, labelsize=6.5)
+            ax.tick_params(axis="y", labelsize=7)
+
+            # KW badge
+            sr   = stats_r.get(ch_name, {})
+            kw_q = sr.get("kruskal_q", 1.0)
+            eta  = sr.get("eta_sq", 0.0)
+            if kw_q < 0.05 and eta >= 0.01:
+                star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
+                ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
+                        transform=ax.transAxes, ha="right", va="top",
+                        fontsize=6, color="#333333",
+                        bbox=dict(boxstyle="round,pad=0.15", fc="white",
+                                  alpha=0.75, ec="none"))
+
+        # Equalise y-limits across all panels in the NN row (shared scale)
+        if row_log[row_idx]:
+            all_axes_row = [axes[row_idx][c] for c in range(n_ch)]
+            lims = [ax.get_ylim() for ax in all_axes_row]
+            y_lo = min(lo for lo, hi in lims)
+            y_hi = max(hi for lo, hi in lims)
+            for ax in all_axes_row:
+                ax.set_ylim(y_lo, y_hi)
+
+    fig.suptitle(title, fontsize=12, y=1.01)
+    fig.text(
+        0.5, -0.01,
+        "Row 1: fraction of non-background nuclei area (per patient median).  "
+        "Row 2: median intra-type nearest-neighbour distance, log scale.  "
+        "Row 3: AUC of Ripley L(r)−r (more negative = more regular spacing).  "
+        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.",
+        ha="center", va="top", fontsize=6, color="#555555", style="italic",
+    )
+    out = output_dir / f"{out_stem}.png"
+    save_figure(fig, out, dpi=dpi)
+    if verbose:
+        print(f"[OK] Saved combined panel → {out}")
+
+
+def run_tfd_separability_viz_subtype(cfg: dict, verbose: bool = True) -> None:
+    """Config-driven entry for per-cell-type PAM50-subtype comparison plots.
+
+    Expected keys in the ``tfd_separability_viz_subtype`` config section
+    --------------------------------------------------------------------
+    masks_dir : str
+        Single directory of per-patient ``<pid>.zip`` mask archives.
+    metadata_csv : str
+        CSV with patient → subtype mapping.
+    patient_col : str          (default ``Patient_ID``)
+    subtype_col : str          (default ``Majority_Subtype_mRNA``)
+    subtype_order : list[str]  (default PAM50_ORDER)
+        Left-to-right x-axis order for all plots.
+    subtype_palette : {name: hex_colour} or null
+        If null, auto-assigned from ``cmap_categorical``.
+    cmap_categorical : str     (default ``romaO``)
+    output_dir : str
+    plots : list[str]
+        Subset of ``["cell_type_boxplots", "nn_distance_violins", "ripley_L"]``.
+    max_tiles_per_patient : int   (default 50)
+    max_tiles_spatial : int       (default 20)
+    max_tiles_ripley : int        (default 10)
+    include_background : bool     (default false)
+    ripley_n_bootstrap : int      (default 20)
+    dpi : int                     (default 200)
+    seed : int                    (default 42)
+    """
+    output_dir = Path(cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    masks_dir    = Path(cfg["masks_dir"])
+    metadata_csv = cfg["metadata_csv"]
+    patient_col  = cfg.get("patient_col", "Patient_ID")
+    subtype_col  = cfg.get("subtype_col", "Majority_Subtype_mRNA")
+    subtype_order_cfg = cfg.get("subtype_order", PAM50_ORDER)
+
+    group_masks, group_pids = _build_subtype_group_dicts(
+        masks_dir=masks_dir,
+        metadata_csv=metadata_csv,
+        patient_col=patient_col,
+        subtype_col=subtype_col,
+        subtype_order=subtype_order_cfg,
+    )
+    group_order = list(group_masks.keys())
+    if verbose:
+        for g, pids in group_pids.items():
+            n_masks = sum(1 for p in pids if (masks_dir / f"{p}.zip").exists())
+            print(f"  [{g}] {n_masks}/{len(pids)} patients with masks")
+
+    # Build palette — start from cmap, then apply per-group overrides (non-null only)
+    group_palette = build_label_palette(
+        np.array(group_order),
+        cmap_name=cfg.get("cmap_categorical", CATEGORICAL_CMAP),
+    )
+    palette_raw: Optional[Dict] = cfg.get("subtype_palette")
+    if palette_raw:
+        for g, c in palette_raw.items():
+            if c is not None and g in group_palette:
+                group_palette[g] = str(c)
+
+    inc_bg     = cfg.get("include_background", False)
+    non_bg_chs = list(range(0 if inc_bg else 1, 7))
+    dpi        = cfg.get("dpi",  200)
+    seed       = cfg.get("seed", 42)
+    plots_raw  = cfg.get("plots", ["cell_type_boxplots", "nn_distance_violins", "ripley_L"])
+    plots      = set(plots_raw) if not isinstance(plots_raw, str) else {plots_raw}
+
+    if "cell_type_boxplots" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Subtype] Cell-type composition boxplots…")
+        plot_cell_type_boxplots_per_celltype(
+            group_masks=group_masks, group_pids=group_pids,
+            group_order=group_order, group_palette=group_palette,
+            output_dir=output_dir,
+            max_tiles_per_patient=cfg.get("max_tiles_per_patient", 50),
+            include_background=inc_bg, dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "nn_distance_violins" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Subtype] Intra-type NN distance violins…")
+        plot_nn_distance_violins_per_celltype(
+            group_masks=group_masks, group_pids=group_pids,
+            group_order=group_order, group_palette=group_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            max_tiles_per_patient=cfg.get("max_tiles_spatial", 20),
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "ripley_L" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Subtype] Ripley L(r) per cell type…")
+        plot_ripley_L_per_celltype(
+            group_masks=group_masks, group_pids=group_pids,
+            group_order=group_order, group_palette=group_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            max_tiles_per_patient=cfg.get("max_tiles_ripley", 10),
+            n_bootstrap=cfg.get("ripley_n_bootstrap", 20),
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "pairwise_r_matrix" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Subtype] Pairwise r-matrix…")
+        stats_json = output_dir / "subtype_cell_type_boxplots_stats.json"
+        if not stats_json.exists():
+            print(f"  [WARN] Stats JSON not found at {stats_json}; "
+                  "run cell_type_boxplots first.")
+        else:
+            plot_pairwise_r_matrix_subtype(
+                stats_json=stats_json,
+                output_dir=output_dir,
+                group_order=group_order,
+                r_threshold=cfg.get("r_threshold", 0.11),
+                q_threshold=cfg.get("q_threshold", 0.05),
+                dpi=dpi, verbose=verbose,
+            )
+
+    if "combined_panel" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Subtype] Combined 3-row panel…")
+        plot_combined_panel_per_celltype(
+            group_masks=group_masks, group_pids=group_pids,
+            group_order=group_order, group_palette=group_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            include_background=inc_bg,
+            max_tiles_composition=cfg.get("max_tiles_per_patient", 50),
+            max_tiles_spatial=cfg.get("max_tiles_spatial", 20),
+            max_tiles_ripley=cfg.get("max_tiles_ripley", 10),
+            n_bootstrap=cfg.get("ripley_n_bootstrap", 20),
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+
+# ── cohort pipeline entry point ──────────────────────────────────────────────
+
+def run_tfd_separability_viz_cohort(cfg: dict, verbose: bool = True) -> None:
+    """Config-driven entry for cohort-level cell biology comparison plots.
+
+    Expected keys in the ``tfd_separability_viz_poc`` config section
+    -----------------------------------------------------------------
+    cohorts : {name: {masks_dir, patient_splits?}}
+        ``masks_dir``: directory of per-patient ``<pid>.zip`` mask archives.
+        ``patient_splits``: optional path to a JSON file whose top-level
+        keys are cohort names mapping to lists of patient IDs; if omitted
+        every ZIP in ``masks_dir`` is used.
+    cohort_labels : {name: display_label}
+        Human-readable names used as axis tick labels.
+    cohort_palette : {name: hex_colour}
+        Box/violin/line colours per cohort.
+    output_dir : str
+    plots : list[str]
+        Any subset of ``["cell_type_boxplots", "nn_distance_violins", "ripley_L"]``.
+    max_tiles_per_patient : int   (default 50  — composition boxplots, fast)
+    max_tiles_spatial : int       (default 20  — NN violins, moderate)
+    max_tiles_ripley : int        (default 10  — Ripley L, slow)
+    include_background : bool     (default false)
+    ripley_n_bootstrap : int      (default 20)
+    dpi : int                     (default 200)
+    seed : int                    (default 42)
+    """
+    import json as _json
+
+    output_dir = Path(cfg["output_dir"])
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    cohorts_cfg: Dict[str, Dict] = cfg["cohorts"]
+    cohort_labels: Dict[str, str]  = cfg.get("cohort_labels", {c: c for c in cohorts_cfg})
+    cohort_palette_raw: Dict[str, str] = cfg.get("cohort_palette", {})
+
+    _defaults = ["#FDAE61", "#762A83", "#1B7837", "#D73027"]
+    cohort_palette = {
+        c: cohort_palette_raw.get(c, _defaults[i % len(_defaults)])
+        for i, c in enumerate(cohorts_cfg)
+    }
+
+    cohort_masks: Dict[str, Path]        = {}
+    cohort_pids:  Dict[str, List[str]]   = {}
+    for cname, ccfg in cohorts_cfg.items():
+        masks_dir = Path(ccfg["masks_dir"])
+        cohort_masks[cname] = masks_dir
+        splits_path = ccfg.get("patient_splits")
+        if splits_path:
+            with open(splits_path) as _f:
+                splits = _json.load(_f)
+            pids = splits.get(cname, [])
+            if not pids:
+                pids = [p for v in splits.values() for p in v]
+        else:
+            pids = [p.stem for p in sorted(masks_dir.glob("*.zip"))]
+        cohort_pids[cname] = pids
+        if verbose:
+            print(f"  [{cname}] {len(pids)} patients | masks: {masks_dir}")
+
+    inc_bg       = cfg.get("include_background", False)
+    non_bg_chs   = list(range(0 if inc_bg else 1, 7))
+    dpi          = cfg.get("dpi",  200)
+    seed         = cfg.get("seed", 42)
+    plots_raw    = cfg.get("plots", ["cell_type_boxplots", "nn_distance_violins", "ripley_L"])
+    plots        = set(plots_raw) if not isinstance(plots_raw, str) else {plots_raw}
+
+    if "cell_type_boxplots" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Cohort] Cell-type composition boxplots…")
+        plot_cell_type_boxplots_by_cohort(
+            cohort_masks=cohort_masks, cohort_pids=cohort_pids,
+            cohort_labels=cohort_labels, cohort_palette=cohort_palette,
+            output_dir=output_dir,
+            max_tiles_per_patient=cfg.get("max_tiles_per_patient", 50),
+            include_background=inc_bg, dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "nn_distance_violins" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Cohort] Intra-type NN distance violins…")
+        plot_nn_distance_violins_by_cohort(
+            cohort_masks=cohort_masks, cohort_pids=cohort_pids,
+            cohort_labels=cohort_labels, cohort_palette=cohort_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            max_tiles_per_patient=cfg.get("max_tiles_spatial", 20),
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "ripley_L" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Cohort] Ripley L(r) per cell type…")
+        plot_ripley_L_by_cohort(
+            cohort_masks=cohort_masks, cohort_pids=cohort_pids,
+            cohort_labels=cohort_labels, cohort_palette=cohort_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            max_tiles_per_patient=cfg.get("max_tiles_ripley", 10),
+            n_bootstrap=cfg.get("ripley_n_bootstrap", 20),
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+    if "combined_panel" in plots:
+        if verbose:
+            print("\n[TFD-Viz-Cohort] Combined 3-row panel…")
+        # Remap internal cohort keys → display labels so axis ticks read correctly
+        display_masks   = {cohort_labels.get(c, c): p    for c, p    in cohort_masks.items()}
+        display_pids    = {cohort_labels.get(c, c): pids for c, pids in cohort_pids.items()}
+        display_palette = {cohort_labels.get(c, c): col  for c, col  in cohort_palette.items()}
+        display_order   = [cohort_labels.get(c, c) for c in cohorts_cfg]
+        plot_combined_panel_per_celltype(
+            group_masks=display_masks, group_pids=display_pids,
+            group_order=display_order, group_palette=display_palette,
+            output_dir=output_dir,
+            non_bg_channels=non_bg_chs,
+            include_background=inc_bg,
+            max_tiles_composition=cfg.get("max_tiles_per_patient", 50),
+            max_tiles_spatial=cfg.get("max_tiles_spatial", 20),
+            max_tiles_ripley=cfg.get("max_tiles_ripley", 10),
+            n_bootstrap=cfg.get("ripley_n_bootstrap", 20),
+            out_stem="cohort_combined_panel",
+            title="Cell Biology by Cohort: Breast vs Liver Cancer",
+            dpi=dpi, seed=seed, verbose=verbose,
+        )
+
+
+# ===================================================================
 # § 4  Pipeline entry point
 # ===================================================================
 

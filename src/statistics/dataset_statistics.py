@@ -48,11 +48,12 @@ except ImportError:  # pragma: no cover
 
 try:
     from lifelines import KaplanMeierFitter
-    from lifelines.statistics import logrank_test
+    from lifelines.statistics import logrank_test, multivariate_logrank_test
     HAS_LIFELINES = True
 except ImportError:  # pragma: no cover
     KaplanMeierFitter = None
     logrank_test = None
+    multivariate_logrank_test = None
     HAS_LIFELINES = False
 
 try:
@@ -299,6 +300,7 @@ def plot_subtype_distribution(
     subtype_col: str,
     output_dir: Path,
     cmap_name: str = CATEGORICAL_CMAP,
+    palette: Optional[Dict[str, str]] = None,
     figsize: tuple = (8, 8),
     dpi: int = 200,
 ) -> Dict[str, str]:
@@ -324,8 +326,9 @@ def plot_subtype_distribution(
     ordered = _canonical_order(list(counts.index))
     counts = counts.reindex(ordered).dropna()
 
-    palette = build_label_palette(np.array(ordered), cmap_name=cmap_name)
-    colours = [palette[s] for s in counts.index]
+    if palette is None:
+        palette = build_label_palette(np.array(ordered), cmap_name=cmap_name)
+    colours = [palette.get(s, "#888888") for s in counts.index]
     count_values = counts.to_numpy(dtype=float)
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -417,31 +420,29 @@ def plot_kaplan_meier_by_subtype(
     if palette is None:
         palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
 
-    fig, ax = plt.subplots(figsize=figsize)
+    # ── Layout: KM curves (top) + pairwise p-value table (bottom) ────────────
+    fig = plt.figure(figsize=figsize)
+    gs  = fig.add_gridspec(2, 1, height_ratios=[3.2, 1.0], hspace=0.08)
+    ax       = fig.add_subplot(gs[0])
+    ax_table = fig.add_subplot(gs[1])
+    ax_table.axis("off")
 
-    kmf_fits = {}
+    # ── Fit and plot KM curves (no CI shading) ────────────────────────────────
     for subtype in subtypes:
-        mask = km_df[subtype_col] == subtype
-        sub = km_df[mask]
-        kmf = KaplanMeierFitter()
+        mask   = km_df[subtype_col] == subtype
+        sub    = km_df[mask]
+        kmf    = KaplanMeierFitter()
         kmf.fit(sub["os_years"], event_observed=sub[os_event_col], label=subtype)
-        kmf_fits[subtype] = kmf
-
-        colour = palette.get(subtype, "#888888")
         kmf.plot_survival_function(
             ax=ax,
-            ci_show=True,
-            color=colour,
+            ci_show=False,
+            color=palette.get(subtype, "#888888"),
             linewidth=2.5,
-            ci_alpha=0.12,
         )
 
-    # Patient counts in legend
+    # ── Patient counts in legend ──────────────────────────────────────────────
     handles, labels = ax.get_legend_handles_labels()
-    new_labels = []
-    for lbl in labels:
-        n = (km_df[subtype_col] == lbl).sum()
-        new_labels.append(f"{lbl}  (n={n:,})")
+    new_labels = [f"{lbl}  (n={(km_df[subtype_col] == lbl).sum():,})" for lbl in labels]
     ax.legend(handles, new_labels, title="PAM50 Subtype", fontsize=9,
               title_fontsize=10, frameon=False,
               bbox_to_anchor=(1.02, 1), loc="upper left")
@@ -451,6 +452,76 @@ def plot_kaplan_meier_by_subtype(
     ax.set_ylim(0, 1.05)
     ax.set_xlim(left=0)
     ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1.0))
+
+    # ── Overall multivariate log-rank test ────────────────────────────────────
+    assert multivariate_logrank_test is not None
+    mlr      = multivariate_logrank_test(km_df["os_years"], km_df[subtype_col], km_df[os_event_col])
+    overall_p = mlr.p_value
+    p_str    = "p < 0.001" if overall_p < 0.001 else f"p = {overall_p:.3f}"
+    ax.text(
+        0.98, 0.98, f"Overall log-rank {p_str}",
+        transform=ax.transAxes, ha="right", va="top", fontsize=10,
+        bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85, edgecolor="#aaaaaa"),
+    )
+
+    # ── Pairwise log-rank tests ───────────────────────────────────────────────
+    assert logrank_test is not None
+    pairwise: dict = {}
+    for i, s1 in enumerate(subtypes):
+        for s2 in subtypes[i + 1:]:
+            m1  = km_df[subtype_col] == s1
+            m2  = km_df[subtype_col] == s2
+            res = logrank_test(
+                km_df.loc[m1, "os_years"], km_df.loc[m2, "os_years"],
+                event_observed_A=km_df.loc[m1, os_event_col],
+                event_observed_B=km_df.loc[m2, os_event_col],
+            )
+            pairwise[(s1, s2)] = res.p_value
+
+    def _fmt_p(p: float) -> str:
+        if p < 0.001:
+            return "<.001"
+        if p < 0.01:
+            return f"{p:.3f}"
+        return f"{p:.3f}"
+
+    # Lower-triangular matrix: rows = subtypes[1:], cols = subtypes[:-1]
+    row_labels = subtypes[1:]
+    col_labels = subtypes[:-1]
+    cell_text  = []
+    for s_row in row_labels:
+        row = []
+        for s_col in col_labels:
+            key = (s_col, s_row) if (s_col, s_row) in pairwise else (s_row, s_col)
+            if s_col == s_row or key not in pairwise:
+                row.append("")
+            else:
+                ri = subtypes.index(s_row)
+                ci = subtypes.index(s_col)
+                row.append(_fmt_p(pairwise[key]) if ci < ri else "")
+        cell_text.append(row)
+
+    tbl = ax_table.table(
+        cellText=cell_text,
+        rowLabels=row_labels,
+        colLabels=col_labels,
+        loc="center",
+        cellLoc="center",
+    )
+    tbl.auto_set_font_size(False)
+    tbl.set_fontsize(8.5)
+    tbl.scale(1.0, 1.25)
+
+    # Style: header row and row-label column
+    for (r, c), cell in tbl.get_celld().items():
+        cell.set_edgecolor("#cccccc")
+        if r == 0 or c == -1:
+            cell.set_facecolor("#f0f0f0")
+            cell.set_text_props(fontweight="bold")
+        else:
+            cell.set_facecolor("white")
+
+    ax_table.set_title("Pairwise log-rank p-values", fontsize=9, pad=4)
 
     fig.tight_layout()
     save_figure(fig, output_dir / "kaplan_meier_overall_survival_by_subtype.png", dpi=dpi)
@@ -546,10 +617,22 @@ def plot_combined_overview(
             kmf.fit(sub["os_years"], event_observed=sub[os_event_col], label=subtype)
             kmf.plot_survival_function(
                 ax=ax_km,
-                ci_show=True,
+                ci_show=False,
                 color=palette.get(subtype, "#888888"),
                 linewidth=2.0,
-                ci_alpha=0.12,
+            )
+
+        if multivariate_logrank_test is not None:
+            mlr_ov = multivariate_logrank_test(
+                km_df["os_years"], km_df[subtype_col], km_df[os_event_col]
+            )
+            ov_p   = mlr_ov.p_value
+            ov_str = "p < 0.001" if ov_p < 0.001 else f"p = {ov_p:.3f}"
+            ax_km.text(
+                0.97, 0.97, f"Log-rank\n{ov_str}",
+                transform=ax_km.transAxes, ha="right", va="top", fontsize=9,
+                bbox=dict(boxstyle="round,pad=0.3", facecolor="white",
+                          alpha=0.85, edgecolor="#aaaaaa"),
             )
     else:
         ax_km.text(0.5, 0.5, "OS data not available", ha="center", va="center",
@@ -935,6 +1018,11 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
         if ordered:
             shared_palette = build_label_palette(np.array(ordered), cmap_name=cmap_cat)
 
+    # Apply per-subtype colour overrides (e.g. Normal → pinkish to distinguish from Basal)
+    palette_override = cfg.get("palette_override", {})
+    for subtype, colour in palette_override.items():
+        shared_palette[str(subtype)] = str(colour)
+
     if verbose:
         n_sub = df[subtype_col].nunique() if subtype_col in df.columns else 0
         print(f"[DatasetStats] Patients: {len(df):,}  |  Subtypes: {n_sub}  |  Output: {output_dir}")
@@ -955,17 +1043,18 @@ def run_dataset_statistics(cfg: dict, verbose: bool = True) -> None:
     palette: Dict[str, str] = {}
     if "subtype_distribution" in requested:
         palette = plot_subtype_distribution(df, subtype_col, output_dir,
-                                            cmap_name=cmap_cat, figsize=figsize_pie, dpi=dpi)
+                                            cmap_name=cmap_cat, palette=shared_palette,
+                                            figsize=figsize_pie, dpi=dpi)
     elif shared_palette:
         palette = shared_palette
 
     # ── Plot: Kaplan-Meier ────────────────────────────────────────────────────
     if "kaplan_meier_by_subtype" in requested:
-        # Use the same palette generated by the pie chart; if the pie wasn't
-        # requested, build a fresh palette here so colours still match.
         if not palette and subtype_col in df.columns:
             subtypes = df[subtype_col].dropna().unique().tolist()
             palette = build_label_palette(np.array(_canonical_order(subtypes)), cmap_name=cmap_cat)
+            for subtype, colour in palette_override.items():
+                palette[str(subtype)] = str(colour)
         plot_kaplan_meier_by_subtype(
             df, subtype_col, os_time_col, os_event_col,
             output_dir, palette=palette,

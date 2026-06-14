@@ -266,11 +266,16 @@ def generate_batch(
     n_steps: int,
     device: torch.device,
     seed: Optional[int] = None,
+    use_noise_cond: bool = False,
 ) -> List[np.ndarray]:
     """Generate ``batch_size`` tiles conditioned on ``cond_vec`` (1-d unit vector).
 
+    When ``use_noise_cond=True`` a fresh random unit-sphere vector is sampled
+    per tile (matches conditioning_type="noise" training exactly).
+
     Returns a list of (H, W, 3) uint8 numpy arrays.
     """
+    import torch.nn.functional as _NF
     from mopadi.diffusion.base import DummyReturn
 
     if seed is not None:
@@ -283,7 +288,13 @@ def generate_batch(
     img_size = model.conf.img_size
     feat_dim = model.conf.feat_dim
 
-    cond  = cond_vec.view(1, -1).expand(batch_size, -1).to(device)
+    if use_noise_cond:
+        # Fresh unit-sphere random vector per tile — matches noise-run training exactly.
+        # Seeded above, so the noise tensor and cond vectors are jointly reproducible.
+        raw = torch.randn(batch_size, feat_dim, device=device)
+        cond = _NF.normalize(raw, p=2, dim=-1)
+    else:
+        cond  = cond_vec.view(1, -1).expand(batch_size, -1).to(device)
     zeros = torch.zeros(batch_size, feat_dim, device=device, dtype=torch.float32)
     noise = torch.randn(batch_size, 3, img_size, img_size, device=device)
 
@@ -388,6 +399,7 @@ def generate_cohort_tiles(
     skip_existing: bool = True,
     genomic_h5_dir: Optional[Path] = None,
     normalize_feats: bool = False,
+    use_noise_cond: bool = False,
 ) -> None:
     """Generate and save per-patient ZIPs for one cohort.
 
@@ -439,6 +451,7 @@ def generate_cohort_tiles(
                 n_steps=n_steps,
                 device=device,
                 seed=tile_seed,
+                use_noise_cond=use_noise_cond,
             )
             imgs.extend(batch_imgs)
             remaining -= bs
@@ -636,10 +649,23 @@ def run(
         logger.info(f"  img_size={conf.img_size}  feat_dim={conf.feat_dim}")
 
         normalize_feats = getattr(conf, "normalize_feats", True)
-        cond_vecs = build_conditioning_vectors(conf.feat_dim, device_obj, normalize=normalize_feats)
+        conditioning_type = getattr(conf, "conditioning_type", "one_hot")
+
+        # Build cohort-level conditioning vectors that match training distribution
+        use_noise_cond = False
+        if conditioning_type == "zeros":
+            zero_vec = torch.zeros(conf.feat_dim, device=device_obj)
+            cond_vecs = {c: zero_vec for c in COHORTS}
+            logger.info("zeros model: using all-zero conditioning vectors at inference")
+        elif conditioning_type == "noise":
+            # cond_vecs unused — per-tile fresh randn is generated inside generate_batch
+            cond_vecs = {c: torch.zeros(conf.feat_dim, device=device_obj) for c in COHORTS}
+            use_noise_cond = True
+            logger.info("noise model: using per-tile fresh unit-sphere conditioning at inference")
+        else:
+            cond_vecs = build_conditioning_vectors(conf.feat_dim, device_obj, normalize=normalize_feats)
 
         # For RNA models, use per-patient H5 features instead of cohort-level codes
-        conditioning_type = getattr(conf, "conditioning_type", "one_hot")
         genomic_h5_dir: Optional[Path] = None
         if conditioning_type == "real":
             h5_dir_str = getattr(conf, "genomic_feature_dir", None)
@@ -667,6 +693,7 @@ def run(
                 skip_existing=True,
                 genomic_h5_dir=genomic_h5_dir,
                 normalize_feats=normalize_feats,
+                use_noise_cond=use_noise_cond,
             )
     else:
         logger.info("--skip-generate: skipping tile generation")

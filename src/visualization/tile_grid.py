@@ -40,10 +40,10 @@ from PIL import Image
 
 
 _ROW_DEFS = [
-    ("real",      "TCGA-BRCA", "Real TCGA-BRCA"),
-    ("generated", "TCGA-BRCA", "Generated TCGA-BRCA"),
-    ("real",      "TCGA-LIHC", "Real TCGA-LIHC"),
-    ("generated", "TCGA-LIHC", "Generated TCGA-LIHC"),
+    ("real",      "TCGA-BRCA", "Real Breast"),
+    ("generated", "TCGA-BRCA", "Generated Breast"),
+    ("real",      "TCGA-LIHC", "Real Liver"),
+    ("generated", "TCGA-LIHC", "Generated Liver"),
 ]
 
 
@@ -117,7 +117,7 @@ def main() -> None:
     grid = make_grid(eval_dir, cols=args.cols, seed=args.seed, gap=args.gap)
 
     tile_h = grid.shape[0] // len(_ROW_DEFS)  # approximate
-    label_width_in = 1.4
+    label_width_in = 1.6
     grid_w_in = grid.shape[1] / 128  # 1 inch per tile at 128 dpi
     grid_h_in = grid.shape[0] / 128
 
@@ -138,7 +138,7 @@ def main() -> None:
             label,
             transform=ax.transAxes,
             ha="right", va="center",
-            fontsize=7, fontfamily="sans-serif",
+            fontsize=10, fontfamily="sans-serif",
         )
 
     # Thin horizontal separators between rows

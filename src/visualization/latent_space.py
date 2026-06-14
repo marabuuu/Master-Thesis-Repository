@@ -262,6 +262,9 @@ def plot_projection(
     cmap_name: str = CATEGORICAL_CMAP,
     palette: Optional[Dict[str, str]] = None,
     markers: Optional[Dict[str, str]] = None,
+    hue_title: str = "hue",
+    style_title: str = "style",
+    label_rename: Optional[Dict[str, str]] = None,
     figsize: Tuple[float, float] = (8, 6),
     point_size: int = 80,
     alpha: float = 0.8,
@@ -298,22 +301,37 @@ def plot_projection(
     _check_seaborn()
     setup_style()
 
+    if label_rename:
+        hue_labels = np.array([label_rename.get(str(l), str(l)) for l in hue_labels])
+        if style_labels is not None:
+            style_labels = np.array([label_rename.get(str(l), str(l)) for l in style_labels])
+        if palette is not None:
+            palette = {label_rename.get(k, k): v for k, v in palette.items()}
+        if markers is not None:
+            markers = {label_rename.get(k, k): v for k, v in markers.items()}
+
     if palette is None:
         palette = build_label_palette(hue_labels, cmap_name)
+    else:
+        # Treat palette as override: auto-fill any labels not covered by cmap
+        missing = set(np.unique(hue_labels)) - set(palette.keys())
+        if missing:
+            auto = build_label_palette(hue_labels, cmap_name)
+            palette = {**auto, **palette}
 
     tmp = pd.DataFrame(
-        {"x": coords[:, 0], "y": coords[:, 1], "hue": hue_labels}
+        {"x": coords[:, 0], "y": coords[:, 1], hue_title: hue_labels}
     )
     if style_labels is not None:
-        tmp["style"] = style_labels
+        tmp[style_title] = style_labels
 
     fig, ax = plt.subplots(figsize=figsize)
     sns.scatterplot(
         data=tmp,
         x="x",
         y="y",
-        hue="hue",
-        style="style" if style_labels is not None else None,
+        hue=hue_title,
+        style=style_title if style_labels is not None else None,
         palette=palette,
         markers=markers,
         s=point_size,
@@ -556,6 +574,11 @@ def plot_cosine_distance_clustermap(
         sub_labels = labels[idx]
         if _pal is None:
             _pal = build_label_palette(sub_labels, cat_cmap_name)
+        else:
+            missing = set(np.unique(sub_labels)) - set(_pal.keys())
+            if missing:
+                auto = build_label_palette(sub_labels, cat_cmap_name)
+                _pal = {**auto, **_pal}
         row_colors = pd.Series(sub_labels).map(_pal).values
 
     import warnings
@@ -616,6 +639,7 @@ def plot_silhouette_per_group(
     metric: str = "euclidean",
     cmap_name: str = CATEGORICAL_CMAP,
     palette: Optional[Dict[str, str]] = None,
+    label_rename: Optional[Dict[str, str]] = None,
     figsize: Tuple[float, float] = (8, 5),
     save_path: Optional[Union[str, Path]] = None,
     show: bool = True,
@@ -645,7 +669,11 @@ def plot_silhouette_per_group(
     labels = np.asarray(labels)
     sil_vals = silhouette_samples(X, labels, metric=metric)
 
-    _pal = palette if palette is not None else build_label_palette(labels, cmap_name)
+    if palette is None:
+        _pal = build_label_palette(labels, cmap_name)
+    else:
+        missing = set(np.unique(labels)) - set(palette.keys())
+        _pal = {**build_label_palette(labels, cmap_name), **palette} if missing else palette
     tmp = pd.DataFrame({group_col_name: labels, "silhouette": sil_vals})
 
     fig, ax = plt.subplots(figsize=figsize)
@@ -656,6 +684,8 @@ def plot_silhouette_per_group(
         palette=_pal,
         ax=ax,
     )
+    if label_rename:
+        ax.set_xticklabels([label_rename.get(t.get_text(), t.get_text()) for t in ax.get_xticklabels()])
     ax.set_ylabel("Silhouette coefficient", fontsize=13)
     ax.set_xlabel("", fontsize=13)
     ax.tick_params(axis="x", labelsize=13)

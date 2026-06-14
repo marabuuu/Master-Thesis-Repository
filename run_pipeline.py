@@ -217,6 +217,18 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'tfd_separability_viz' section in config.yaml")
         run_tfd_separability_viz(config["tfd_separability_viz"], verbose=verbose)
 
+    elif stage == "tfd_separability_viz_poc":
+        from src.visualization.tfd_separability import run_tfd_separability_viz_cohort
+        if "tfd_separability_viz_poc" not in config:
+            raise ValueError("No 'tfd_separability_viz_poc' section in config.yaml")
+        run_tfd_separability_viz_cohort(config["tfd_separability_viz_poc"], verbose=verbose)
+
+    elif stage == "tfd_separability_viz_subtype":
+        from src.visualization.tfd_separability import run_tfd_separability_viz_subtype
+        if "tfd_separability_viz_subtype" not in config:
+            raise ValueError("No 'tfd_separability_viz_subtype' section in config.yaml")
+        run_tfd_separability_viz_subtype(config["tfd_separability_viz_subtype"], verbose=verbose)
+
     elif stage == "tfd_separability_generated":
         from src.quality_assurance.tfd_separability import run_tfd_separability_from_dirs
         if "tfd_separability_generated" not in config:
@@ -296,6 +308,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         if "brca_pam50_cfg_v2_1hot" not in config:
             raise ValueError("No 'brca_pam50_cfg_v2_1hot' section in config.yaml")
         run_cfg_training(config["brca_pam50_cfg_v2_1hot"], verbose=verbose)
+
+    elif stage == "brca_pam50_cfg_v2_1hot_256":
+        from src.poc_experiment.run_cfg_training import run_cfg_training
+        if "brca_pam50_cfg_v2_1hot_256" not in config:
+            raise ValueError("No 'brca_pam50_cfg_v2_1hot_256' section in config.yaml")
+        run_cfg_training(config["brca_pam50_cfg_v2_1hot_256"], verbose=verbose)
 
     elif stage == "brca_pam50_cfg_v2_1hot_smoketest":
         from src.poc_experiment.run_cfg_training import run_cfg_training
@@ -380,7 +398,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_generated", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

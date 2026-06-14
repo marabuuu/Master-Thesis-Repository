@@ -550,12 +550,11 @@ def run_virchow2_umap(cfg: dict, verbose: bool = True) -> None:
     if verbose:
         print(f"[Virchow2UMAP] Saved coordinates → {coords_path.name}")
 
-    # ── Palette — explicit override wins; otherwise auto-build from colormap ──
+    # ── Palette — auto-build from colormap, then apply any overrides on top ──
+    palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
     palette_override: Optional[Dict[str, str]] = cfg.get("palette_override")
     if palette_override:
-        palette = {k: str(v) for k, v in palette_override.items()}
-    else:
-        palette = build_label_palette(np.array(subtypes), cmap_name=cmap_name)
+        palette.update({k: str(v) for k, v in palette_override.items()})
 
     # ── Plot ──────────────────────────────────────────────────────────────────
     plot_umap_scatter(

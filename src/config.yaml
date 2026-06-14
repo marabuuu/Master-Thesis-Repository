@@ -8,6 +8,8 @@ dataset_statistics:
   menopause_col: menopause_status
   os_time_col: OS.time
   os_event_col: OS
+  palette_override:
+    Normal: "#F4A7B9"   # soft pink — distinguishable from Basal (berry)
   masks_dir: ./experiments/20260509_tfd_separability/masks
   output_dir: ./experiments/20260504_dataset_statistics
   plots:
@@ -119,6 +121,9 @@ poc_breast_vs_liver_visualize_latents:
   palette_override:
     TCGA-BRCA: "#FDAE61"   # amber — matches virchow2_umap_cohort
     TCGA-LIHC: "#762A83"   # violet
+  label_rename:
+    TCGA-BRCA: Breast
+    TCGA-LIHC: Liver
 
 visualize_latents:
   latent_dir: ./experiments/20260528_genomic_features/genomic_h5
@@ -127,6 +132,10 @@ visualize_latents:
   output_dir: ../experiments/20260528_genomic_features/latent_plots_clean
   patient_col: Patient_ID
   label_col: Majority_Subtype_mRNA
+  palette_override:
+    Normal: "#F4A7B9"  # soft pink — visually distinct from Basal (berry)
+  hue_title: "PAM50 Subtype"
+  style_title: "Split"
 
 training_stats:
   logdir: ./experiments/20260517_gda_v13
@@ -274,6 +283,67 @@ tfd_separability_viz:
   figsize_nn_violins: null      # null = auto (same layout as boxplots)
   figsize_proximity: null       # null = auto (5 panels x 6x6 matrix)
   dpi: 200
+
+# ── Cohort comparison: BRCA vs LIHC cell-type biology ─────────────────────────
+# One panel per cell type; each panel shows both cohorts side-by-side.
+# Statistical tests: Mann-Whitney U per cell type, global BH FDR; effect size
+# = rank-biserial r.  Annotations shown only when q<0.05 AND |r|≥0.11.
+# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz_poc
+tfd_separability_viz_poc:
+  cohorts:
+    TCGA-BRCA:
+      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+    TCGA-LIHC:
+      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/lihc_masks
+  cohort_labels:
+    TCGA-BRCA: "Breast"
+    TCGA-LIHC: "Liver"
+  cohort_palette:
+    TCGA-BRCA: "#FDAE61"   # amber — matches latent-space UMAP
+    TCGA-LIHC: "#762A83"   # violet
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/cohort_plots
+  plots:
+    - cell_type_boxplots      # → cohort_cell_type_boxplots.png + stats JSON
+    - nn_distance_violins     # → cohort_nn_distance_violins.png + stats JSON
+    - ripley_L                # → cohort_ripley_L.png + stats JSON
+    - combined_panel          # → cohort_combined_panel.png (3-row × 6-col overview)
+  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
+  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
+  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
+  include_background: false
+  ripley_n_bootstrap: 20
+  dpi: 200
+  seed: 42
+
+# Run: python run_pipeline.py --config src/config.yaml --stage tfd_separability_viz_subtype
+tfd_separability_viz_subtype:
+  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+  metadata_csv: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  subtype_order:
+    - Normal
+    - LumA
+    - LumB
+    - Her2
+    - Basal
+  subtype_palette:
+    Normal: "#F4A7B9"   # soft pink override (romaO default too light)
+  cmap_categorical: romaO
+  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/subtype_plots
+  plots:
+    - cell_type_boxplots      # → subtype_cell_type_boxplots.png + stats JSON
+    - nn_distance_violins     # → subtype_nn_distance_violins.png + stats JSON
+    - ripley_L                # → subtype_ripley_L.png + stats JSON
+    - pairwise_r_matrix       # → subtype_pairwise_r_matrix.png (reads stats JSON, no mask loading)
+    - combined_panel          # → subtype_combined_panel.png (3-row × 6-col overview)
+  max_tiles_per_patient: 50   # per patient for composition boxplots (fast)
+  max_tiles_spatial: 20       # per patient for NN distance violins (moderate)
+  max_tiles_ripley: 10        # per patient for Ripley L per cell type (slow)
+  include_background: false
+  ripley_n_bootstrap: 20
+  dpi: 200
+  seed: 42
 
 segmentation:
   reference_tiles_dir: ./experiments/20260316_joint_training/sampling_image_guided/original_samples
@@ -1393,6 +1463,8 @@ virchow2_umap:
   metric: cosine
   seed: 42
   cmap_categorical: romaO           # same palette as dataset_statistics + genomic UMAP
+  palette_override:
+    Normal: "#F4A7B9"               # soft pink — consistent with dataset_statistics
   figsize:
   - 10
   - 8
@@ -1614,6 +1686,74 @@ brca_pam50_cfg_v2_1hot:
   output_dir: ./experiments/20260610_brca_pam50_cfg_v2_1hot
   base_dir: ./experiments/20260610_brca_pam50_cfg_v2_1hot
   logdir: ./experiments/20260610_brca_pam50_cfg_v2_1hot/gda
+
+# ══════════════════════════════════════════════════════════════════════════════
+# brca_pam50_cfg_v2_1hot_256 — same as brca_pam50_cfg_v2_1hot but trained on
+# 256×256 pixel tiles (BRCA-tumor-tiles-256) so it is directly comparable to
+# brca_pam50_cfg_v2_256 (real RNA-seq, 256px).
+# ══════════════════════════════════════════════════════════════════════════════
+brca_pam50_cfg_v2_1hot_256:
+  training_mode: cfg_backbone
+  conditioning_type: one_hot
+  normalize_feats: false
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-256
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  backbone_ckpt_path: ""
+  val_swap_basal_luma: true
+  do_resize: false
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 256
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.15
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 16
+  accumulate_grad_batches: 2
+  total_samples: 200000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 16
+  gpus: [0, 1, 2, 3]
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256
+  base_dir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256
+  logdir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256/gda
 
 # ── Smoke test for brca_pam50_cfg_v2_1hot ────────────────────────────────────
 # srun --pty -p capella-interactive -N 1 --ntasks=1 --cpus-per-task=2 --gres=gpu:1 --time=1:00:00 bash
