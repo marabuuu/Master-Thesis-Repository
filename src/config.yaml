@@ -107,6 +107,32 @@ subtype_classifier:
   evaluate:
     model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
 
+subtype_classifier_cv:
+  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  label_csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
+  patient_col: Patient_ID
+  subtype_col: Majority_Subtype_mRNA
+  output_dir: ./experiments/20260618_subtype_classifier_cv
+  max_tiles_per_patient: 100
+  seed: 42
+  n_folds: 5
+  n_bootstrap: 1000
+  solver: liblinear
+  Cs:
+  - 0.01
+  - 0.1
+  - 1.0
+  - 10.0
+  - 100.0
+  max_iter: 2000
+  class_weight: balanced
+
+generated_subtype_eval:
+  model_path: ./experiments/20260618_subtype_classifier_cv/final_model/subtype_linear_model.joblib
+  cv_summary_path: ./experiments/20260618_subtype_classifier_cv/cv_results/cv_summary.json
+  generated_features_dir: ./experiments/20260618_subtype_classifier_cv/generated_virchow2_features
+  output_dir: ./experiments/20260618_subtype_classifier_cv/generated_eval
+
 # ═════════════════════════════════════════════════════════
 # 3. TRAINING — PoC: BRCA vs LIHC binary discrimination
 # ═════════════════════════════════════════════════════════
@@ -449,8 +475,40 @@ poc_128_rna_30M:
   base_dir: ./experiments/20260607_poc_128_rna_norm_30M
   logdir: ./experiments/20260607_poc_128_rna_norm_30M/gda
 
+# ══════════════════════════════════
+# 4. GENE MANIPULATION
+# ══════════════════════════════════
+#
+# Generates paired tiles: original vs. gene-perturbed conditioning vectors.
+# Each manipulation shifts one gene dimension by delta_std standard deviations
+# (in StandardScaler space, where 1 unit = 1 std dev of log1p expression).
+# The same noise seed is used for original and perturbed tiles so any visual
+# difference is attributable solely to the conditioning change.
+
+gene_manipulation:
+  run_dir: ./experiments/20260607_brca_pam50_cfg_v2_256/gda
+  genomic_h5_dir: ./experiments/20260528_genomic_features/genomic_h5
+  gene_list_path: ./experiments/20260528_genomic_features/gene_list.txt
+  output_path: ./experiments/20260607_brca_pam50_cfg_v2_256/manipulation_panel.png
+
+  # Patient with a naturally stromal-rich phenotype — POSTN suppression should
+  # reduce desmoplastic stroma and reveal the underlying epithelial compartment.
+  patient_id: TCGA-E9-A1NF
+  n_tiles: 10
+  guidance_scale: 5.0
+  steps: 20
+  seed: 42
+
+  manipulations:
+    - gene: POSTN
+      delta_std: -3.0     # suppress CAF / desmoplastic stroma marker
+
+  compute_metrics: true
+  feature_models:
+    - virchow2
+
 # ═══════════════════════════════════════════════════════════
-# 4. TRAINING — BRCA PAM50 subtype conditioning (512×512)
+# 5. TRAINING — BRCA PAM50 subtype conditioning (512×512)
 # ═══════════════════════════════════════════════════════════
 
 brca_pam50_cfg_v2:
@@ -675,7 +733,7 @@ tfd_separability:
   device: null
   batch_size: 4
   grouping_json: null
-  use_alpha_complex: true
+  use_alpha_complex: false
   n_landscape_bins: 100
   n_landscape_layers: 1
   min_cells_per_image: 3
@@ -702,7 +760,7 @@ tfd_separability_poc:
   device: null
   batch_size: 4
   grouping_json: null
-  use_alpha_complex: true
+  use_alpha_complex: false
   n_landscape_bins: 100
   n_landscape_layers: 1
   min_cells_per_image: 3

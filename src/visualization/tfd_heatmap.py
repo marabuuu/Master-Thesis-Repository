@@ -24,6 +24,7 @@ matplotlib.use("Agg")
 import matplotlib.pyplot as plt
 import matplotlib.ticker as mticker
 import numpy as np
+from cmcrameri import cm as crameri_cm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 
 # ---------------------------------------------------------------------------
@@ -84,7 +85,7 @@ def main() -> None:
     vmax = np.nanmax(mat)
 
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    cmap = plt.get_cmap("magma")
+    cmap = crameri_cm.oslo
     im = ax.imshow(mat, cmap=cmap, aspect="equal", interpolation="nearest",
                    vmin=vmin, vmax=vmax)
 
@@ -96,9 +97,8 @@ def main() -> None:
     divider = make_axes_locatable(ax)
     cax = divider.append_axes("right", size="4%", pad=0.1)
     cb = fig.colorbar(im, cax=cax)
-    cb.formatter = mticker.FuncFormatter(lambda x, _: f"{x/1e6:.2f}")
     cb.update_ticks()
-    cb.set_label("TFD  (×10⁶)", fontsize=10)
+    cb.set_label("TFD", fontsize=10)
 
     # Axis labels
     ax.set_xticks(range(n))
@@ -119,8 +119,8 @@ def main() -> None:
                 ax.text(j, i, "—", ha="center", va="center", fontsize=8, color="white")
                 continue
             brightness = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-            text_color = "white" if brightness < 0.55 else "black"
-            ax.text(j, i, f"{val/1e3:.0f}k",
+            text_color = "white" if brightness < 0.72 else "black"
+            ax.text(j, i, f"{val:.1f}",
                     ha="center", va="center", fontsize=8, color=text_color)
 
     fig.tight_layout()

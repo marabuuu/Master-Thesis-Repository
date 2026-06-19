@@ -5,7 +5,7 @@ Generates N tiles per subtype (default 10 000) for test-set patients and saves
 them as per-patient ZIP files, matching the layout used by fid_evaluation.py:
 
     <output-dir>/generated/<Subtype>/<patient_id>.zip
-        → {patient_id}_00000.png, {patient_id}_00001.png, …
+        -> {patient_id}_00000.png, {patient_id}_00001.png, ...
 
 Real tiles are sampled from the source zip directory and saved under:
 
@@ -14,14 +14,14 @@ Real tiles are sampled from the source zip directory and saved under:
 After generation and real-tile collection the FID matrix is computed:
 
     <output-dir>/fid_matrix_official.json
-    <output-dir>/fid_matrix_official.png   ← real×generated heatmap
+    <output-dir>/fid_matrix_official.png   <- real x generated heatmap
 
 Usage:
-    python -m src.reconstruction.poc_sample_bulk \\
+    python -m src.poc_experiment.sample_bulk_tiles \\
         --run-dir     experiments/20260607_brca_pam50_cfg_v2_256/gda \\
         --splits      experiments/20260528_genomic_features/patient_splits.json \\
         --genomic-dir experiments/20260528_genomic_features/genomic_h5 \\
-        --tiles-dir   ../data/BRCA-tumor-tiles-final \\
+        --tiles-dir   ../data/BRCA-tumor-tiles-256 \\
         --output      experiments/20260607_brca_pam50_cfg_v2_256/generated_tiles_cfg1 \\
         --subtypes    Basal LumA \\
         --n-per-subtype 10000 \\
@@ -116,7 +116,7 @@ def run(
         splits_path, subtypes, genomic_dir=genomic_dir, tiles_dir=tiles_dir,
     )
 
-    # ── Generate tiles ────────────────────────────────────────────────────────
+    # -- Generate tiles -------------------------------------------------------
     if not skip_generate:
         log.info("Device: %s  |  guidance_scale=%.1f  steps=%d  batch=%d",
                  device, guidance_scale, n_steps, batch_size)
@@ -138,7 +138,7 @@ def run(
                 log.warning("No test patients for %s, skipping", subtype)
                 continue
             gen_dir = output_dir / "generated" / subtype
-            log.info("Generating %d tiles for %s → %s", n_per_subtype, subtype, gen_dir)
+            log.info("Generating %d tiles for %s -> %s", n_per_subtype, subtype, gen_dir)
             generate_cohort_tiles(
                 model=model,
                 cond_vec=null_vec,       # overridden per-patient by genomic_h5_dir
@@ -157,14 +157,14 @@ def run(
     else:
         log.info("--skip-generate: skipping tile generation")
 
-    # ── Collect real tiles ────────────────────────────────────────────────────
+    # -- Collect real tiles ---------------------------------------------------
     if not skip_real:
         for subtype in subtypes:
             pids = patients[subtype]
             if not pids:
                 continue
             real_dir = output_dir / "real" / subtype
-            log.info("Collecting real tiles for %s → %s", subtype, real_dir)
+            log.info("Collecting real tiles for %s -> %s", subtype, real_dir)
             collect_real_cohort_tiles(
                 patient_ids=pids,
                 tiles_dir=tiles_dir,
@@ -176,9 +176,9 @@ def run(
     else:
         log.info("--skip-real: skipping real tile collection")
 
-    # ── FID matrix ────────────────────────────────────────────────────────────
+    # -- FID matrix -----------------------------------------------------------
     if not skip_fid:
-        log.info("Computing FID matrix → %s", output_dir)
+        log.info("Computing FID matrix -> %s", output_dir)
         run_fid_matrix(
             eval_dir=output_dir,
             device=device_str if torch.cuda.is_available() else "cpu",

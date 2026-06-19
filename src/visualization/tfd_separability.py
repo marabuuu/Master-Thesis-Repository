@@ -2189,20 +2189,23 @@ def _annotate_two_group_bracket(
     if q >= 0.05 or abs(r_val) < r_threshold:
         return 0.0
 
+    eta = stats_result.get("eta_sq", float("nan"))
     star = "***" if q < 0.001 else ("**" if q < 0.01 else "*")
     bar_y = y_top + 0.05 * y_span
     cap   = 0.01 * y_span
     ax.plot(
         [x_a, x_a, x_b, x_b],
         [bar_y - cap, bar_y, bar_y, bar_y - cap],
-        color="#333333", lw=0.7, clip_on=False,
+        color="#333333", lw=0.9, clip_on=False,
     )
+    eta_str = f",  η²={eta:.2f}" if not (eta != eta) else ""  # skip if nan
     ax.text(
         (x_a + x_b) / 2, bar_y + 0.01 * y_span,
-        f"{star}  r={r_val:+.2f}",
-        ha="center", va="bottom", fontsize=6.5, color="#333333", clip_on=False,
+        f"{star}  r={r_val:+.2f}{eta_str}",
+        ha="center", va="bottom", fontsize=9, color="#333333", clip_on=False,
+        fontweight="bold",
     )
-    return 0.20 * y_span
+    return 0.24 * y_span
 
 
 # ── cell-type composition boxplots ───────────────────────────────────────────
@@ -2318,13 +2321,6 @@ def plot_cell_type_boxplots_by_cohort(
 
     fig.suptitle("Cell-Type Nuclei Composition: Breast vs Liver Cancer", fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "One point = one patient (median tile fraction). "
-        "Bracket: BH q < 0.05 and |rank-biserial r| ≥ 0.11 (small-effect threshold). "
-        "Global BH correction across all cell types.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / "cohort_cell_type_boxplots.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -2442,21 +2438,17 @@ def plot_nn_distance_violins_by_cohort(
         k2 = f"{cohort_names[1]}_vs_{cohort_names[0]}"
         q     = pq.get(k1, pq.get(k2, 1.0))
         r_val = pr.get(k1, pr.get(k2, 0.0))
+        eta = sr.get("eta_sq", float("nan"))
         if q < 0.05 and abs(r_val) >= 0.11:
             star = "***" if q < 0.001 else ("**" if q < 0.01 else "*")
-            ax.text(0.97, 0.97, f"{star}  r={r_val:+.2f}",
+            eta_str = f"\nη²={eta:.2f}" if eta == eta else ""
+            ax.text(0.97, 0.97, f"{star}  r={r_val:+.2f}{eta_str}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=7, color="#333333",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+                    fontsize=9, color="#333333", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
     fig.suptitle("Intra-Cell-Type NN Distance: Breast vs Liver Cancer", fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "One point = one patient; per-patient medians of tile-level mean NN distance. "
-        "Log scale.  Badge: BH q < 0.05 and |rank-biserial r| ≥ 0.11.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / "cohort_nn_distance_violins.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -2590,13 +2582,6 @@ def plot_ripley_L_by_cohort(
 
     fig.suptitle("Ripley Spatial Regularity by Cell Type: Breast vs Liver Cancer", fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "One point = one patient. Y-axis: AUC of L(r)−r integrated over radii; "
-        "more negative = cells more regularly spaced than random (spatial inhibition). "
-        "Bracket: BH q < 0.05 and |rank-biserial r| ≥ 0.11.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / "cohort_ripley_L.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -2800,18 +2785,11 @@ def plot_cell_type_boxplots_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=7, color="#333333",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+                    fontsize=9, color="#333333", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
     fig.suptitle(title, fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "One point = one patient (median tile fraction).  "
-        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.  "
-        "See subtype_pairwise_r_matrix.png for pairwise effect sizes.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -2916,17 +2894,11 @@ def plot_nn_distance_violins_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=7, color="#333333",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+                    fontsize=9, color="#333333", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
     fig.suptitle(title, fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "Per-patient medians of tile-level mean intra-type NN distance.  Log scale.  "
-        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.  See JSON for pairwise r.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -3041,18 +3013,11 @@ def plot_ripley_L_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=7, color="#333333",
-                    bbox=dict(boxstyle="round,pad=0.2", fc="white", alpha=0.75, ec="none"))
+                    fontsize=9, color="#333333", fontweight="bold",
+                    bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
     fig.suptitle(title, fontsize=11, y=1.02)
     fig.tight_layout()
-    fig.text(
-        0.5, -0.02,
-        "One point = one patient. Y-axis: AUC of L(r)−r; "
-        "more negative = cells more regularly spaced than random.  "
-        "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
-    )
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
     if verbose:
@@ -3090,6 +3055,7 @@ def plot_pairwise_r_matrix_subtype(
     _check_matplotlib()
     setup_style()
     import matplotlib.colors as mcolors
+    from cmcrameri import cm as crameri_cm
 
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -3112,18 +3078,20 @@ def plot_pairwise_r_matrix_subtype(
     n_cols_g = min(3, n_ct)
     n_rows_g = (n_ct + n_cols_g - 1) // n_cols_g
 
-    cell_px = max(0.75, 4.0 / n_groups)
+    cell_px = max(1.2, 6.0 / n_groups)
     if figsize is None:
         figsize = (
-            n_cols_g * (n_groups * cell_px + 1.2),
-            n_rows_g * (n_groups * cell_px + 1.0),
+            n_cols_g * (n_groups * cell_px + 1.8),
+            n_rows_g * (n_groups * cell_px + 2.5),
         )
 
-    cmap = plt.get_cmap("RdBu_r")
+    # oslo: black (0) → blue (0.5) → white (1); map negative r → dark, zero → blue, positive → white
+    cmap = crameri_cm.oslo
     norm = mcolors.TwoSlopeNorm(vmin=-vmax, vcenter=0, vmax=vmax)
     group_idx = {g: i for i, g in enumerate(group_order)}
 
-    fig, axes = plt.subplots(n_rows_g, n_cols_g, figsize=figsize, squeeze=False)
+    fig, axes = plt.subplots(n_rows_g, n_cols_g, figsize=figsize, squeeze=False,
+                             layout="constrained")
 
     for panel_idx, ct_name in enumerate(cell_types):
         row_g = panel_idx // n_cols_g
@@ -3176,20 +3144,21 @@ def plot_pairwise_r_matrix_subtype(
                 ))
                 if is_sig:
                     star = ("***" if q_val < 0.001 else "**" if q_val < 0.01 else "*")
-                    tc = "white" if abs(norm(r_val) - 0.5) > 0.27 else "#222222"
+                    # oslo: dark at low norm values, light at high → dark text only near white end
+                    tc = "#111111" if norm(r_val) > 0.72 else "white"
                     ax.text(j, i - 0.14, star, ha="center", va="center",
-                            fontsize=6, color=tc, fontweight="bold")
+                            fontsize=10, color=tc, fontweight="bold")
                     ax.text(j, i + 0.22, f"{r_val:+.2f}", ha="center", va="center",
-                            fontsize=5.5, color=tc)
+                            fontsize=9, color=tc)
                 else:
                     ax.text(j, i, f"{r_val:+.2f}", ha="center", va="center",
-                            fontsize=5.0, color="#aaaaaa")
+                            fontsize=8, color="#aaaaaa")
 
-        ax.set_title(ct_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ct_name, fontsize=13, fontweight="bold", pad=6)
         ax.set_xticks(range(n_groups))
-        ax.set_xticklabels(group_order, rotation=35, ha="right", fontsize=8)
+        ax.set_xticklabels(group_order, rotation=45, ha="right", fontsize=11)
         ax.set_yticks(range(n_groups))
-        ax.set_yticklabels(group_order, fontsize=8)
+        ax.set_yticklabels(group_order, fontsize=11)
         ax.tick_params(length=0)
         for spine in ax.spines.values():
             spine.set_visible(False)
@@ -3199,12 +3168,11 @@ def plot_pairwise_r_matrix_subtype(
 
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
-    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.45, pad=0.03, aspect=22)
-    cbar.set_label("Rank-biserial r  (row > col)", fontsize=8)
-    cbar.ax.tick_params(labelsize=7)
+    cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.5, pad=0.02, aspect=20)
+    cbar.set_label("Rank-biserial r  (row > col)", fontsize=11)
+    cbar.ax.tick_params(labelsize=10)
 
-    fig.suptitle("Pairwise Effect Size (Rank-Biserial r) by Cell Type", fontsize=12, y=1.01)
-    fig.tight_layout()
+    fig.suptitle("Pairwise Effect Size (Rank-Biserial r) by Cell Type", fontsize=14)
     fig.text(
         0.5, -0.01,
         f"Coloured: BH q < {q_threshold} and |r| ≥ {r_threshold}.  "

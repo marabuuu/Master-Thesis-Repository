@@ -249,6 +249,20 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         cfg.setdefault("config_path", config_path)
         run_subtype_classifier(cfg, verbose=verbose)
 
+    elif stage == "subtype_classifier_cv":
+        from src.classifier import run_cv_subtype_classifier
+        if "subtype_classifier_cv" not in config:
+            raise ValueError("No 'subtype_classifier_cv' section in config.yaml")
+        cfg = dict(config["subtype_classifier_cv"])
+        cfg.setdefault("_config_path", config_path)
+        run_cv_subtype_classifier(cfg, verbose=verbose)
+
+    elif stage == "generated_subtype_eval":
+        from src.classifier import run_generated_subtype_eval
+        if "generated_subtype_eval" not in config:
+            raise ValueError("No 'generated_subtype_eval' section in config.yaml")
+        run_generated_subtype_eval(dict(config["generated_subtype_eval"]), verbose=verbose)
+
     elif stage == "build_genomic_features":
         from src.preprocessing.build_genomic_features import run_build_genomic_features
         if "build_genomic_features" not in config:
@@ -260,6 +274,12 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         if "poc_breast_vs_liver_genomic_features" not in config:
             raise ValueError("No 'poc_breast_vs_liver_genomic_features' section in config.yaml")
         run_build_genomic_features(config["poc_breast_vs_liver_genomic_features"], verbose=verbose)
+
+    elif stage == "gene_manipulation":
+        from src.reconstruction.manipulate_tiles import run_manipulation
+        if "gene_manipulation" not in config:
+            raise ValueError("No 'gene_manipulation' section in config.yaml")
+        run_manipulation(config["gene_manipulation"])
 
     elif stage == "genomic_adapter_training":
         from src.drafts.genomic_adapter.run_training import run_gda_training
@@ -366,7 +386,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
     
     else:
         raise ValueError(
-            f"Unknown stage: {stage}. Choose from: downscale_tiles, preprocessing, tar_to_tumor_zip, encoding, visualize_latents, poc_breast_vs_liver_visualize_latents, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, tfd_separability, tfd_separability_poc, tfd_separability_viz, tfd_separability_generated, subtype_classifier, build_genomic_features, poc_breast_vs_liver_genomic_features, genomic_adapter_training, poc_breast_vs_liver_gda, poc_breast_vs_liver_cfg, poc_breast_vs_liver_cfg_brca_init, brca_pam50_cfg, brca_pam50_cfg_v2, poc_brca_lihc_cfg_v2, virchow2_umap, evaluation, all"
+            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, downscale_tiles, build_genomic_features, poc_breast_vs_liver_genomic_features, subtype_classifier, gene_manipulation, poc_brca_lihc_cfg_v2_dgx, poc_128_1hot_nonorm_30M, poc_128_class_embed_30M, poc_128_zero_30M, poc_128_noise_30M, poc_128_rna_30M, brca_pam50_cfg_v2, brca_pam50_cfg_v2_1hot, brca_pam50_cfg_v2_1hot_256, tfd_separability, tfd_separability_poc, tfd_separability_viz, tfd_separability_viz_poc, tfd_separability_viz_subtype, dataset_statistics, training_stats, visualize_latents, poc_breast_vs_liver_visualize_latents, virchow2_umap, virchow2_umap_cohort"
         )
 
 
@@ -398,7 +418,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["downscale_tiles", "preprocessing", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "tar_to_tumor_zip", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "subtype_classifier_cv", "generated_subtype_eval", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "gene_manipulation", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
