@@ -1,23 +1,4 @@
-"""Top up generated tiles to reach a target count per subtype.
-
-After removing invalid patient ZIPs (patients with genomics but no histology),
-this script generates exactly the missing tiles and saves them as supplementary
-per-patient ZIPs (e.g., TCGA-XXX_topup_0.zip) that the FID pipeline picks up
-automatically.
-
-Usage:
-    python -m src.poc_experiment.topup_tiles \
-        --run-dir     experiments/20260607_brca_pam50_cfg_v2_256/gda \
-        --splits      experiments/20260528_genomic_features/patient_splits.json \
-        --genomic-dir experiments/20260528_genomic_features/genomic_h5 \
-        --tiles-dir   ../data/BRCA-tumor-tiles-256 \
-        --output      experiments/20260607_brca_pam50_cfg_v2_256/generated_tiles_cfg1 \
-        --subtypes    Basal LumA \
-        --target      10000 \
-        --guidance-scale 1.0 \
-        --steps       20 \
-        --batch-size  16
-"""
+"""Generate supplementary tiles to reach a target count per subtype."""
 
 from __future__ import annotations
 
@@ -39,7 +20,7 @@ from src.evaluation.poc_fid import (
     _load_patient_h5_feat,
 )
 from src.evaluation.fid_matrix_pytorch import run as run_fid_matrix
-from src.poc_experiment.sample_bulk_tiles import _load_test_patients_by_subtype
+from src.model_training.sample_bulk_tiles import _load_test_patients_by_subtype
 
 log = logging.getLogger(__name__)
 

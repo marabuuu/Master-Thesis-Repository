@@ -114,82 +114,14 @@ _ensure_mopadi_path()
 
 
 # ─────────────────────────────────────────────────────────────────────────────
-#  Model loading
+#  Model loading (canonical implementation in model_training.checkpoint)
 # ─────────────────────────────────────────────────────────────────────────────
 
-def _load_config(run_dir: Path):
-    """Load GDAConfig from hparams.yaml."""
-    try:
-        import yaml
-    except ImportError as e:
-        raise RuntimeError("PyYAML required") from e
-    from src.poc_experiment.config import GDAConfig
-    from mopadi.configs.choices import ModelName
-
-    hparams_path = run_dir / "hparams.yaml"
-    if not hparams_path.exists():
-        raise FileNotFoundError(f"hparams.yaml not found in {run_dir}")
-    with hparams_path.open() as f:
-        load_fn = getattr(yaml, "unsafe_load", yaml.full_load)
-        raw = load_fn(f)
-    conf = GDAConfig.from_dict(raw)
-    if getattr(conf, "model_name", None) is None:
-        conf.model_name = ModelName.beatgans_autoenc
-    return conf
-
-
-def _resolve_best_checkpoint(run_dir: Path, explicit: Optional[str]) -> Path:
-    """Return the checkpoint with the lowest val loss, or the explicitly given one."""
-    if explicit:
-        p = Path(explicit)
-        if not p.is_absolute():
-            p = _resolve(explicit)
-        if not p.exists():
-            raise FileNotFoundError(f"Checkpoint not found: {explicit}")
-        return p
-
-    autoenc_dir = run_dir / "autoenc"
-    ckpts = sorted(autoenc_dir.glob("*.ckpt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints found in {autoenc_dir}")
-
-    def _score(ckpt_path: Path) -> float:
-        try:
-            ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-        except Exception:
-            return float("inf")
-        best_scores = []
-        for v in ckpt.get("callbacks", {}).values():
-            if isinstance(v, dict):
-                s = v.get("best_model_score")
-                if s is not None:
-                    try:
-                        best_scores.append(float(s))
-                    except (TypeError, ValueError):
-                        pass
-        return min(best_scores) if best_scores else float("inf")
-
-    best = min(ckpts, key=_score)
-    logger.info(f"Auto-selected checkpoint: {best.name} (score={_score(best):.4f})")
-    return best
-
-
-def load_model(conf, ckpt_path: Path, device: torch.device):
-    from src.poc_experiment.cfg_model import CfgBackboneLitModel
-
-    ckpt = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = ckpt.get("state_dict", ckpt)
-
-    conf.backbone_ckpt_path = None  # skip warm-start load
-    model = CfgBackboneLitModel(conf)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        logger.info(f"  {len(missing)} missing keys (expected for new params)")
-    if unexpected:
-        logger.warning(f"  {len(unexpected)} unexpected keys in checkpoint")
-    model.eval()
-    model.to(device)
-    return model
+from src.model_training.checkpoint import (
+    load_config_from_run as _load_config,
+    resolve_checkpoint as _resolve_best_checkpoint,
+    load_model,
+)
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -200,26 +132,9 @@ COHORTS = ("TCGA-BRCA", "TCGA-LIHC")
 
 
 def build_conditioning_vectors(feat_dim: int, device: torch.device, normalize: bool = True) -> Dict[str, torch.Tensor]:
-    """Build the same orthogonal vectors the dataset uses during training.
-
-    normalize=True  → unit-norm (training default for most runs)
-    normalize=False → raw binary codes, norm=sqrt(feat_dim/2) ≈ 16 for feat_dim=512
-                      (matches runs trained with normalize_feats=False)
-    """
-    import torch.nn.functional as F
-
-    brca = torch.zeros(feat_dim, dtype=torch.float32)
-    lihc = torch.zeros(feat_dim, dtype=torch.float32)
-    brca[1::2] = 1.0
-    lihc[0::2] = 1.0
-    if normalize:
-        brca = F.normalize(brca, p=2, dim=-1)
-        lihc = F.normalize(lihc, p=2, dim=-1)
-    brca = brca.to(device)
-    lihc = lihc.to(device)
-    dot = float(torch.dot(brca, lihc).item())
-    logger.info(f"Orthogonal codes (normalize={normalize}): BRCA norm={float(brca.norm()):.4f}, LIHC norm={float(lihc.norm()):.4f}, dot={dot:.4f}")
-    return {"TCGA-BRCA": brca, "TCGA-LIHC": lihc}
+    """Build orthogonal conditioning vectors, delegating to the canonical implementation."""
+    from src.model_training.dataset import _make_orthogonal_binary_codes
+    return {k: v.to(device) for k, v in _make_orthogonal_binary_codes(feat_dim, normalize=normalize).items()}
 
 
 # ─────────────────────────────────────────────────────────────────────────────

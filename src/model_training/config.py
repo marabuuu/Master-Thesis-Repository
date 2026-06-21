@@ -1,9 +1,4 @@
-"""
-GDAConfig — config for Genomic Diffusion Adapter training.
-
-Extends MoPaDi's TrainConfig with genomic dataset fields (previously in
-GenomicTrainConfig) and adapter-specific fields.  No dependency on src/drafts.
-"""
+"""Training config extending MoPaDi's TrainConfig with genomic dataset and conditioning fields."""
 
 from __future__ import annotations
 

@@ -18,147 +18,32 @@ import logging
 import random
 from dataclasses import asdict
 from pathlib import Path
-from typing import Any, Iterable, Sequence
+from typing import Any, Sequence
 
 try:
     import yaml
 except Exception as exc:
     raise RuntimeError("PyYAML is required to read hparams.yaml") from exc
 
-from src.poc_experiment.config import GDAConfig
-from src.poc_experiment.dataset import (
+from src.model_training.config import GDAConfig
+from src.model_training.dataset import (
     ZipTilesWithGenomicFeatures,
     patient_id_from_tile_path,
     _build_genomic_cache,
     _load_splits_and_subtypes,
 )
+from src.model_training.checkpoint import (
+    load_config_from_run as _build_config,
+    resolve_checkpoint as _resolve_checkpoint,
+    load_model as _load_model_raw,
+)
 
 log = logging.getLogger(__name__)
 
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as f:
-        load_fn = getattr(yaml, "unsafe_load", None) or yaml.full_load
-        payload = load_fn(f)
-    if not isinstance(payload, dict):
-        raise ValueError(f"Expected a YAML mapping in {path}")
-    return payload
-
-
-def _to_float(value: Any) -> float | None:
-    import torch
-    if value is None:
-        return None
-    if isinstance(value, (int, float)):
-        return float(value)
-    if torch.is_tensor(value) and value.numel() == 1:
-        return float(value.item())
-    return None
-
-
-def _iter_checkpoint_scores(payload: dict[str, Any]) -> Iterable[float]:
-    def walk(obj: Any) -> Iterable[float]:
-        if isinstance(obj, dict):
-            for key, value in obj.items():
-                if key == "best_model_score":
-                    score = _to_float(value)
-                    if score is not None:
-                        yield score
-                elif key == "best_k_models" and isinstance(value, dict):
-                    for score in value.values():
-                        score_f = _to_float(score)
-                        if score_f is not None:
-                            yield score_f
-                else:
-                    yield from walk(value)
-        elif isinstance(obj, (list, tuple)):
-            for item in obj:
-                yield from walk(item)
-
-    callbacks = payload.get("callbacks", payload)
-    yield from walk(callbacks)
-
-
-def _resolve_checkpoint(run_dir: Path, explicit_ckpt: str | None = None) -> Path:
-    if explicit_ckpt:
-        ckpt = Path(explicit_ckpt)
-        if not ckpt.is_absolute():
-            direct = run_dir / ckpt
-            under_autoenc = run_dir / "autoenc" / ckpt
-            if direct.exists():
-                ckpt = direct
-            elif under_autoenc.exists():
-                ckpt = under_autoenc
-            else:
-                raise FileNotFoundError(f"checkpoint not found: {direct} or {under_autoenc}")
-        if not ckpt.exists():
-            raise FileNotFoundError(f"checkpoint not found: {ckpt}")
-        return ckpt
-
-    autoenc_dir = run_dir / "autoenc"
-    for candidate_name in ("best.ckpt", "best_model.ckpt", "best_model_path.ckpt"):
-        candidate = autoenc_dir / candidate_name
-        if candidate.exists():
-            return candidate
-
-    ckpts = sorted(autoenc_dir.glob("*.ckpt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints found in {autoenc_dir}")
-
-    scored: list[tuple[float, Path]] = []
-    fallback: list[tuple[int, Path]] = []
-    for ckpt in ckpts:
-        try:
-            import torch
-            payload = torch.load(ckpt, map_location="cpu", weights_only=False)
-        except Exception as exc:
-            log.warning("Could not inspect checkpoint %s: %s", ckpt.name, exc)
-            fallback.append((0, ckpt))
-            continue
-        scores = list(_iter_checkpoint_scores(payload))
-        if scores:
-            scored.append((min(scores), ckpt))
-            continue
-        fallback.append((int(payload.get("global_step", 0)), ckpt))
-
-    if scored:
-        return min(scored, key=lambda item: item[0])[1]
-    if fallback:
-        return max(fallback, key=lambda item: item[0])[1]
-    return ckpts[-1]
-
-
-def _build_config(run_dir: Path) -> GDAConfig:
-    from mopadi.configs.choices import ModelName
-    hparams_path = run_dir / "hparams.yaml"
-    if not hparams_path.exists():
-        raise FileNotFoundError(f"Missing hparams.yaml in {run_dir}")
-    conf = GDAConfig.from_dict(_load_yaml(hparams_path))
-    if getattr(conf, "model_name", None) is None:
-        conf.model_name = ModelName.beatgans_autoenc
-    return conf
-
-
 def _load_model(conf: GDAConfig, ckpt_path: Path):
-    import torch
-    from src.poc_experiment.cfg_model import CfgBackboneLitModel
-
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = payload.get("state_dict", payload)
-    if not isinstance(state_dict, dict):
-        raise ValueError(f"Unsupported checkpoint structure in {ckpt_path}")
-
-    # backbone_ckpt_path in hparams.yaml points to the warm-start predecessor run.
-    # We are loading a full checkpoint state dict below, so the warm-start load in
-    # __init__ would be wasted (and slow — the file is ~20 GB).  Clear it first.
-    conf.backbone_ckpt_path = None
-    model = CfgBackboneLitModel(conf)
-    missing, unexpected = model.load_state_dict(state_dict, strict=False)
-    if missing:
-        log.info("Loaded %s with %d missing keys", ckpt_path.name, len(missing))
-    if unexpected:
-        log.info("Loaded %s with %d unexpected keys", ckpt_path.name, len(unexpected))
-    model.eval()
+    """Load CfgBackboneLitModel, returning (model, variant_tag) tuple."""
+    model = _load_model_raw(conf, ckpt_path)
     return model, "cfg_backbone"
 
 
@@ -295,7 +180,7 @@ def main() -> None:
     else:
         # Synthetic conditioning: build the same fixed vectors the dataset would return.
         import torch
-        from src.poc_experiment.dataset import _ONEHOT_COHORT_INDEX
+        from src.model_training.dataset import COHORT_INDEX
         genomic_cache = {}
         for pid in candidates:
             subtype = subtype_map.get(pid, "unknown")
@@ -305,10 +190,10 @@ def main() -> None:
                 v = torch.randn(feat_dim)
                 genomic_cache[pid] = v / v.norm().clamp(min=1e-8)
             elif conditioning_type == "one_hot":
-                if subtype not in _ONEHOT_COHORT_INDEX:
+                if subtype not in COHORT_INDEX:
                     raise KeyError(f"one_hot: unknown subtype '{subtype}'")
                 v = torch.zeros(feat_dim)
-                v[_ONEHOT_COHORT_INDEX[subtype]] = 1.0
+                v[COHORT_INDEX[subtype]] = 1.0
                 genomic_cache[pid] = v
 
     class _FakeDataset:

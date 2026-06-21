@@ -1,10 +1,4 @@
-"""
-ZipTilesWithGenomicFeatures — dataset pairing ZIP-archived tiles with genomic vectors.
-
-Moved here from src/drafts/mopadi_genomic/dataset.py.  The drafts copy is kept
-for backwards compatibility with older checkpoints but this is the authoritative
-version used by GDALitModel.
-"""
+"""Dataset pairing ZIP-archived tiles with genomic conditioning vectors."""
 
 from __future__ import annotations
 
@@ -32,18 +26,7 @@ log = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 def patient_id_from_tile_path(path: str) -> str:
-    """Extract the 3-token TCGA patient barcode from a tile path.
-
-    Works for both ZIP-internal paths (``/path/zip.zip:tile.jpg``) and plain
-    filesystem paths (``/path/TCGA-XX-XXXX.../tile.jpg``).
-
-    Examples
-    --------
-    >>> patient_id_from_tile_path("/data/TCGA-3C-AALI-01Z-00-DX1.UUID.zip:tile.png")
-    'TCGA-3C-AALI'
-    >>> patient_id_from_tile_path("/data/TCGA-3C-AALI-01Z-00-DX1/tile.png")
-    'TCGA-3C-AALI'
-    """
+    """Extract TCGA-XX-XXXX patient barcode from a tile or zip path."""
     zip_or_dir = path.split(":")[0]
     basename = os.path.basename(zip_or_dir)
     stem = basename[:-4] if basename.lower().endswith(".zip") else basename
@@ -69,25 +52,13 @@ def find_genomic_h5(patient_id: str, genomic_h5_dir: str) -> Optional[str]:
 # Dataset
 # ---------------------------------------------------------------------------
 
-_ONEHOT_COHORT_INDEX = {
-    "TCGA-BRCA": 0,
-    "TCGA-LIHC": 1,
-}
-
-
-# Fixed cohort → integer index for class_embed conditioning.
-# Order must match nn.Embedding indices in CfgBackboneLitModel.
+# Fixed cohort → integer index, used for class_embed conditioning
+# (nn.Embedding) and one_hot error messages.
 COHORT_INDEX: Dict[str, int] = {"TCGA-BRCA": 0, "TCGA-LIHC": 1}
 
 
 def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict[str, torch.Tensor]:
-    """Return two complementary binary codes for BRCA and LIHC.
-
-    With normalize=True (default) both codes are L2-normalised to unit norm.
-    With normalize=False they retain their natural magnitude (norm = sqrt(feat_dim/2)
-    ≈ 16 for feat_dim=512), giving a stronger raw conditioning signal into the
-    style MLP.
-    """
+    """Return alternating binary codes for BRCA (odd indices) and LIHC (even indices)."""
     if feat_dim < 2:
         raise ValueError(f"feat_dim must be at least 2, got {feat_dim}")
     if feat_dim % 2 != 0:
@@ -121,13 +92,7 @@ def _make_orthogonal_codes(
     feat_dim: int,
     normalize: bool = True,
 ) -> Dict[str, torch.Tensor]:
-    """Return one orthogonal binary code per class, generalised to N classes.
-
-    Positions are assigned round-robin: class i owns positions i, i+N, i+2N, ...
-    All pairs are exactly orthogonal (no shared positions).  With normalize=False
-    the raw norm is ~sqrt(feat_dim / N), giving a signal strength similar to the
-    2-class alternating codes.
-    """
+    """Return one orthogonal binary code per class via round-robin position assignment."""
     n = len(class_names)
     if n < 2:
         raise ValueError(f"Need at least 2 class names, got {n}")
@@ -155,20 +120,10 @@ def _make_orthogonal_codes(
 class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
     """Pairs ZIP-archived tile images with patient-level genomic conditioning vectors.
 
-    Each ``__getitem__`` returns a dict with keys:
-      ``img``      — (3, H, W) float32 in [-1, 1]
-      ``feat``     — (feat_dim,) float32 conditioning vector
-      ``coords``   — (2,) tile coordinates (from parent)
-      ``filename`` — str tile path (from parent)
-      ``subtype``  — str subtype/cohort label (for balanced sampling only)
-
-    conditioning_type controls what ``feat`` contains:
-      ``"real"``    — log1p+StandardScaler normalised RNA-seq from H5 files (requires genomic_h5_dir)
-      ``"zeros"``   — zero vector of length feat_dim
-      ``"noise"``   — fresh unit-sphere random vector each call (different per sample)
-      ``"one_hot"``     — fixed orthogonal unit vector indexed by cohort (BRCA→e₁, LIHC→e₂)
-      ``"class_embed"`` — integer class index as torch.long tensor of shape (1,);
-                          the model owns the nn.Embedding that maps it to a vector
+    Returns dicts with img, feat, coords, filename, subtype.
+    conditioning_type selects what feat contains: real (RNA-seq), zeros,
+    noise (random unit sphere), one_hot (orthogonal per cohort), or class_embed
+    (integer index for nn.Embedding).
     """
 
     def __init__(
@@ -306,7 +261,7 @@ class ZipTilesWithGenomicFeatures(DefaultTilesDataset):
         elif self._conditioning_type == "one_hot":
             subtype = item["subtype"]
             if self._orthogonal_codes is None or subtype not in self._orthogonal_codes:
-                known = list(self._orthogonal_codes.keys()) if self._orthogonal_codes is not None else list(_ONEHOT_COHORT_INDEX.keys())
+                known = list(self._orthogonal_codes.keys()) if self._orthogonal_codes is not None else list(COHORT_INDEX.keys())
                 raise KeyError(
                     f"one_hot conditioning: unknown subtype '{subtype}'. "
                     f"Known: {known}"

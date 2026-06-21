@@ -681,8 +681,8 @@ brca_pam50_cfg_v2_1hot_256:
 
   # ── Optimisation ─────────────────────────────────────────────────────────
   backbone_lr: 1.0e-4
-  batch_size: 16
-  accumulate_grad_batches: 2
+  batch_size: 64
+  accumulate_grad_batches: 1
   total_samples: 200000000
   ema_decay: 0.9999
   grad_clip: 1.0
@@ -702,9 +702,9 @@ brca_pam50_cfg_v2_1hot_256:
   gpus: [0, 1, 2, 3]
 
   # ── Output ───────────────────────────────────────────────────────────────
-  output_dir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256
-  base_dir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256
-  logdir: ./experiments/20260614_brca_pam50_cfg_v2_1hot_256/gda
+  output_dir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256
+  base_dir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256
+  logdir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256/gda
 
 # ═════════════════
 # 5. EVALUATION

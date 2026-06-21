@@ -25,7 +25,7 @@ from src.reconstruction.poc_sample_tiles import (
     _sample_cfg_backbone_pair,
     _save_pair_image,
 )
-from src.poc_experiment.dataset import _make_orthogonal_binary_codes
+from src.model_training.dataset import _make_orthogonal_binary_codes
 
 
 def main() -> None:

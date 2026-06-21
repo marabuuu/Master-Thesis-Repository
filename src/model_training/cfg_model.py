@@ -1,26 +1,15 @@
-"""
-CfgBackboneLitModel — MoPaDi backbone trained with CFG dropout on genomic features.
+"""MoPaDi backbone trained with CFG dropout on genomic features.
 
-The backbone IS the conditioned denoiser — no separate adapter:
-  - Receives real genomic features as its style conditioning input
-  - CFG dropout replaces features with zeros on a fraction of batches
-  - Single MSE loss: MSE(backbone(x_t, t, cond_or_null), ε)
-  - CFG at inference: ε_guided = ε_null + s * (ε_cond − ε_null)
+The backbone is the conditioned denoiser — no separate adapter.
+It receives genomic features via AdaGN (style conditioning) and CFG
+dropout replaces them with zeros on a fraction of batches.
 
-The backbone is the artist; the genomic vector is the muse.
+At inference: ε_guided = ε_null + s * (ε_cond − ε_null)
 
-Why this works where GDA failed:
-  GDA always passed zeros_cond to the backbone → backbone became unconditional
-  → adapter had to do ALL denoising → backbone gave up → oscillating loss ~1.0.
-  Here, the backbone IS conditioned: it receives the patient's genomic profile and
-  learns to generate different tissue for different patients. The gradient from
-  MSE(backbone(cond), ε) directly rewards patient-specific denoising.
-
-Health metric:
-  cond/signal = E[‖ε_cond − ε_null‖²]  — must grow as backbone learns to
-  produce different noise predictions for different patients vs null input.
-  cond/gap = loss/val_shuffled − loss/val — positive means conditioning carries
-  patient-specific information (shuffled patients → worse predictions).
+Health metrics:
+  cond/signal  E[‖ε_cond − ε_null‖²] — must grow during training
+  cond/gap     loss/val_shuffled − loss/val — positive means conditioning
+               carries patient-specific information
 """
 
 from __future__ import annotations
@@ -264,6 +253,9 @@ class CfgBackboneLitModel(LitModel):
                 normalize=self.conf.normalize_feats,
             )
             log.info("Subtype mean feats for sep metric: %s", sorted(self._subtype_mean_feats))
+        elif self.conf.conditioning_type == "one_hot" and self.train_data._orthogonal_codes is not None:
+            self._subtype_mean_feats = dict(self.train_data._orthogonal_codes)
+            log.info("One-hot codes for sep metric: %s", sorted(self._subtype_mean_feats))
 
     def train_dataloader(self):
         import torch.utils.data as tud
@@ -402,8 +394,8 @@ class CfgBackboneLitModel(LitModel):
                     eps_lihc_emb = self.ema_model.forward(x=x_t[:bm], t=t_scaled[:bm], x_start=None, cond=e_lihc_emb).pred
                     self.logger.experiment.add_scalar("cond/brca_lihc_sep_embed", (eps_brca_emb - eps_lihc_emb).pow(2).mean().item(), self.num_samples)
 
-                # real: additionally probe with mean RNA features per cohort
-                elif self.conf.conditioning_type == "real" and hasattr(self, "_subtype_mean_feats"):
+                # real/one_hot: probe with mean RNA features or orthogonal codes per subtype
+                elif self.conf.conditioning_type in ("real", "one_hot") and hasattr(self, "_subtype_mean_feats"):
                     sf = self._subtype_mean_feats
                     if "TCGA-BRCA" in sf and "TCGA-LIHC" in sf:
                         e_brca_rna = sf["TCGA-BRCA"].to(self.device).unsqueeze(0).expand(bm, -1)

@@ -24,31 +24,13 @@ if mopadi_src.exists() and str(mopadi_src) not in sys.path:
 
 
 def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
-    """
-    Recursively resolve relative paths in config relative to repo_root.
-    
-    Converts paths like "./data/..." or "experiments/..." to absolute paths
-    based on the repository root. Leaves absolute paths unchanged.
-    
-    Parameters
-    ----------
-    config_dict : Dict[str, Any]
-        Configuration dictionary (may contain nested dicts and lists)
-    repo_root : Path
-        Repository root directory to use as base for relative paths
-    
-    Returns
-    -------
-    Dict[str, Any]
-        Configuration with resolved paths
-    """
+    """Recursively resolve relative paths in *config_dict* against *repo_root*."""
     def _resolve_path(value: str) -> str:
         repo_candidate = (repo_root / value).resolve()
         normalized = value[2:] if value.startswith("./") else value
 
-        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
-        # are siblings of the repository root.
-        # of the repository root. Use parent fallback when needed.
+        # data/, dataframes/, experiments/ are siblings of the repo root
+
         if normalized.startswith(("data/", "dataframes/", "experiments/")):
             parent_candidate = (repo_root.parent / normalized).resolve()
             if parent_candidate.exists() or not repo_candidate.exists():
@@ -80,21 +62,7 @@ def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[s
 
 
 def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str, Any]:
-    """
-    Load configuration from YAML file and resolve relative paths.
-    
-    Parameters
-    ----------
-    config_path : str
-        Path to config.yaml file
-    repo_root : Path, optional
-        Repository root for resolving relative paths. If None, inferred from config_path.
-    
-    Returns
-    -------
-    Dict[str, Any]
-        Configuration with resolved paths
-    """
+    """Load config from YAML and resolve relative paths."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     
@@ -108,6 +76,19 @@ def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str,
     
     resolve_config_paths(config, repo_root)
     return config
+
+
+_CFG_TRAINING_STAGES = {
+    "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest",
+    "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256",
+    "brca_pam50_cfg_v2_1hot_smoketest",
+    "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx",
+    "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M",
+    "poc_128_zero", "poc_128_zero_30M",
+    "poc_128_noise", "poc_128_noise_30M",
+    "poc_128_rna", "poc_128_rna_30M",
+    "poc_128_class_embed_30M",
+}
 
 
 def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose: bool = True) -> None:
@@ -311,50 +292,8 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
             raise ValueError("No 'brca_pam50_cfg' section in config.yaml")
         run_gda_training(config["brca_pam50_cfg"], verbose=verbose)
 
-    elif stage == "brca_pam50_cfg_v2":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "brca_pam50_cfg_v2" not in config:
-            raise ValueError("No 'brca_pam50_cfg_v2' section in config.yaml")
-        run_cfg_training(config["brca_pam50_cfg_v2"], verbose=verbose)
-
-    elif stage == "brca_pam50_cfg_v2_smoketest":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "brca_pam50_cfg_v2_smoketest" not in config:
-            raise ValueError("No 'brca_pam50_cfg_v2_smoketest' section in config.yaml")
-        run_cfg_training(config["brca_pam50_cfg_v2_smoketest"], verbose=verbose)
-
-    elif stage == "brca_pam50_cfg_v2_1hot":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "brca_pam50_cfg_v2_1hot" not in config:
-            raise ValueError("No 'brca_pam50_cfg_v2_1hot' section in config.yaml")
-        run_cfg_training(config["brca_pam50_cfg_v2_1hot"], verbose=verbose)
-
-    elif stage == "brca_pam50_cfg_v2_1hot_256":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "brca_pam50_cfg_v2_1hot_256" not in config:
-            raise ValueError("No 'brca_pam50_cfg_v2_1hot_256' section in config.yaml")
-        run_cfg_training(config["brca_pam50_cfg_v2_1hot_256"], verbose=verbose)
-
-    elif stage == "brca_pam50_cfg_v2_1hot_smoketest":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "brca_pam50_cfg_v2_1hot_smoketest" not in config:
-            raise ValueError("No 'brca_pam50_cfg_v2_1hot_smoketest' section in config.yaml")
-        run_cfg_training(config["brca_pam50_cfg_v2_1hot_smoketest"], verbose=verbose)
-
-    elif stage == "poc_brca_lihc_cfg_v2":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "poc_brca_lihc_cfg_v2" not in config:
-            raise ValueError("No 'poc_brca_lihc_cfg_v2' section in config.yaml")
-        run_cfg_training(config["poc_brca_lihc_cfg_v2"], verbose=verbose)
-
-    elif stage == "poc_brca_lihc_cfg_v2_dgx":
-        from src.poc_experiment.run_cfg_training import run_cfg_training
-        if "poc_brca_lihc_cfg_v2_dgx" not in config:
-            raise ValueError("No 'poc_brca_lihc_cfg_v2_dgx' section in config.yaml")
-        run_cfg_training(config["poc_brca_lihc_cfg_v2_dgx"], verbose=verbose)
-
-    elif stage in ("poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M"):
-        from src.poc_experiment.run_cfg_training import run_cfg_training
+    elif stage in _CFG_TRAINING_STAGES:
+        from src.model_training.run_cfg_training import run_cfg_training
         if stage not in config:
             raise ValueError(f"No '{stage}' section in config.yaml")
         run_cfg_training(config[stage], verbose=verbose)
@@ -385,9 +324,7 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
                     return
     
     else:
-        raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, tar_to_tumor_zip, downscale_tiles, build_genomic_features, poc_breast_vs_liver_genomic_features, subtype_classifier, gene_manipulation, poc_brca_lihc_cfg_v2_dgx, poc_128_1hot_nonorm_30M, poc_128_class_embed_30M, poc_128_zero_30M, poc_128_noise_30M, poc_128_rna_30M, brca_pam50_cfg_v2, brca_pam50_cfg_v2_1hot, brca_pam50_cfg_v2_1hot_256, tfd_separability, tfd_separability_poc, tfd_separability_viz, tfd_separability_viz_poc, tfd_separability_viz_subtype, dataset_statistics, training_stats, visualize_latents, poc_breast_vs_liver_visualize_latents, virchow2_umap, virchow2_umap_cohort"
-        )
+        raise ValueError(f"Unknown stage: '{stage}'")
 
 
 def main():

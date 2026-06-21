@@ -52,6 +52,7 @@ from src.visualization.training_plots import (
 # ── fixed paths ───────────────────────────────────────────────────────────────
 _GENOMIC_RUN = _EXP / "20260607_brca_pam50_cfg_v2_256" / "gda"
 _GENOMIC_BASE = _EXP / "20260607_brca_pam50_cfg_v2_256"
+_ORTHOGONAL_RUN = _EXP / "20260614_brca_pam50_cfg_v2_1hot_256" / "gda"
 OUT = _GENOMIC_BASE / "brca_pam50_results_panel.png"
 
 # ── colours — match make_paper_panels.py ─────────────────────────────────────
@@ -179,27 +180,43 @@ def main() -> None:
     gen_gap_s, gen_gap_v = _aggregate_by_step(_gap_rs, _gap_rv)
     gen_sep_s, gen_sep_v = gen_data.get("cond/basal_luma_sep", ([], []))
 
-    def _col_ylim(steps, vals, *, is_gap):
-        if not vals:
+    print("Loading orthogonal (1-hot) run TFEvents …")
+    orth_data = load_gda_tfevents(_ORTHOGONAL_RUN)
+
+    orth_sig_s, orth_sig_v = orth_data.get("cond/signal", ([], []))
+    _ogap_rs, _ogap_rv     = orth_data.get("cond/gap", ([], []))
+    orth_gap_s, orth_gap_v = _aggregate_by_step(_ogap_rs, _ogap_rv)
+    orth_sep_s, orth_sep_v = orth_data.get("cond/brca_lihc_sep", ([], []))
+
+    def _col_ylim_pair(steps_a, vals_a, steps_b, vals_b, *, is_gap):
+        all_vals = []
+        all_maxes = []
+        for steps, vals in ((steps_a, vals_a), (steps_b, vals_b)):
+            if not vals:
+                continue
+            fin = [v for v in vals if np.isfinite(v)]
+            if not fin:
+                continue
+            all_vals.extend(fin)
+            if not is_gap:
+                s_M = [s / 1e6 for s in steps]
+                _, v_ema = _ema_series(s_M, fin, alpha=0.05)
+                all_maxes.append(max(v_ema) if v_ema else max(fin))
+            else:
+                all_maxes.append(max(fin))
+        if not all_vals:
             return 0.0, 1e-4
-        fin = [v for v in vals if np.isfinite(v)]
-        if not fin:
-            return 0.0, 1e-4
-        if not is_gap:
-            s_M = [s / 1e6 for s in steps]
-            _, v_ema = _ema_series(s_M, fin, alpha=0.05)
-            col_max = max(v_ema) if v_ema else max(fin)
-        else:
-            col_max = max(fin)
-        col_min = min(fin)
+        col_max = max(all_maxes)
+        col_min = min(all_vals)
         top = col_max * 1.25
         bot = col_min * 1.20 if col_min < 0 else -top * 0.08
         return bot, top
 
     ylims = [
-        _col_ylim(gen_sig_s,                     gen_sig_v, is_gap=False),
-        _col_ylim([float(s) for s in gen_gap_s], gen_gap_v, is_gap=True),
-        _col_ylim(gen_sep_s,                     gen_sep_v, is_gap=False),
+        _col_ylim_pair(gen_sig_s, gen_sig_v, orth_sig_s, orth_sig_v, is_gap=False),
+        _col_ylim_pair([float(s) for s in gen_gap_s], gen_gap_v,
+                       [float(s) for s in orth_gap_s], orth_gap_v, is_gap=True),
+        _col_ylim_pair(gen_sep_s, gen_sep_v, orth_sep_s, orth_sep_v, is_gap=False),
     ]
     y_bots = [b for b, _ in ylims]
     y_tops = [t for _, t in ylims]
@@ -241,15 +258,21 @@ def main() -> None:
 
     col_ylabels = ["Conditioning signal", "Conditioning gap", "Cond. separation"]
 
-    # ── Row 0: Orthogonal (placeholder) ──────────────────────────────────────
+    # ── Row 0: Orthogonal (1-hot) conditioning ─────────────────────────────────
     inner0 = gridspec.GridSpecFromSubplotSpec(
         1, 3, subplot_spec=outer[0, :], wspace=0.42
     )
+    orth_row_data = [
+        (orth_sig_s,                     orth_sig_v, C_SIG, False),
+        ([float(s) for s in orth_gap_s], orth_gap_v, C_GAP, True),
+        (orth_sep_s,                     orth_sep_v, C_SEP, False),
+    ]
     orth_axes = []
-    for ci in range(3):
+    for ci, (steps, vals, color, is_gap) in enumerate(orth_row_data):
         ax = fig.add_subplot(inner0[ci])
         orth_axes.append(ax)
-        _placeholder_panel(ax, y_tops[ci], y_bots[ci])
+        _plot_metric(ax, steps, vals, color,
+                     is_gap=is_gap, y_top=y_tops[ci], y_bot=y_bots[ci])
         ax.set_ylabel(col_ylabels[ci])
         ax.tick_params(labelbottom=False)
 

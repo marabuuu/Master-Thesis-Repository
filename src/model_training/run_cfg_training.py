@@ -1,13 +1,8 @@
-"""
-Entry point for Backbone-CFG training (CfgBackboneLitModel).
+"""Entry point for CFG backbone training (CfgBackboneLitModel).
 
-The backbone directly receives genomic features with CFG dropout — no adapter.
-
-Usage (via run_pipeline.py):
-    python run_pipeline.py --config src/config.yaml --stage poc_brca_lihc_cfg_v2
-
-Usage (standalone, for debugging):
-    python -m src.poc_experiment.run_cfg_training --config src/config.yaml
+Usage:
+    python run_pipeline.py --config src/config.yaml --stage brca_pam50_cfg_v2
+    python -m src.model_training.run_cfg_training --config src/config.yaml
 """
 
 from __future__ import annotations

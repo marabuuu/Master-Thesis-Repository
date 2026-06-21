@@ -20,9 +20,7 @@ from __future__ import annotations
 
 import argparse
 import logging
-import re
 from pathlib import Path
-from typing import Any
 
 import h5py
 import numpy as np
@@ -38,46 +36,17 @@ log = logging.getLogger(__name__)
 
 # ── Checkpoint / model loading ────────────────────────────────────────────────
 
-def _load_yaml(path: Path) -> dict[str, Any]:
-    import yaml
-    with path.open("r") as f:
-        load_fn = getattr(yaml, "unsafe_load", None) or yaml.full_load
-        return load_fn(f)
-
-
-def _resolve_checkpoint(run_dir: Path) -> Path:
-    autoenc_dir = run_dir / "autoenc"
-    for name in ("best.ckpt", "best_model.ckpt"):
-        p = autoenc_dir / name
-        if p.exists():
-            return p
-    ckpts = sorted(autoenc_dir.glob("*.ckpt"))
-    if not ckpts:
-        raise FileNotFoundError(f"No checkpoints in {autoenc_dir}")
-    step_ckpts = []
-    for c in ckpts:
-        m = re.search(r"step[=_]?(\d+)", c.stem)
-        if m:
-            step_ckpts.append((int(m.group(1)), c))
-    return max(step_ckpts, key=lambda x: x[0])[1] if step_ckpts else ckpts[-1]
+from src.model_training.checkpoint import (
+    load_config_from_run as _load_config,
+    resolve_checkpoint as _resolve_checkpoint,
+    load_model as _load_model_raw,
+)
 
 
 def _load_model(run_dir: Path, ckpt_path: Path):
-    from mopadi.configs.choices import ModelName
-    from src.poc_experiment.config import GDAConfig
-    from src.poc_experiment.cfg_model import CfgBackboneLitModel
-
-    conf = GDAConfig.from_dict(_load_yaml(run_dir / "hparams.yaml"))
-    if getattr(conf, "model_name", None) is None:
-        conf.model_name = ModelName.beatgans_autoenc
-    conf.backbone_ckpt_path = None
-
-    payload = torch.load(ckpt_path, map_location="cpu", weights_only=False)
-    state_dict = payload.get("state_dict", payload)
-    model = CfgBackboneLitModel(conf)
-    model.load_state_dict(state_dict, strict=False)
-    model.eval()
-    return model
+    """Load CfgBackboneLitModel from a run directory and checkpoint."""
+    conf = _load_config(run_dir)
+    return _load_model_raw(conf, ckpt_path)
 
 
 # ── Feature helpers ───────────────────────────────────────────────────────────

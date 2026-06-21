@@ -1,8 +1,4 @@
-"""Shared training utilities for the PoC CFG backbone experiment.
-
-Extracted from src/genomic_adapter/run_training.py to avoid pulling in
-GDALitModel and adapter.py as transitive imports.
-"""
+"""Training utilities for the CFG backbone (config building, cohort validation)."""
 
 from __future__ import annotations
 

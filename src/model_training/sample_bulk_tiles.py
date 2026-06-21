@@ -1,33 +1,6 @@
-"""Generate bulk conditioned tiles for PAM50 subtype evaluation, then compute
-the real×generated FID matrix and save the heatmap.
+"""Generate bulk conditioned tiles per subtype, collect real tiles, and compute the FID matrix.
 
-Generates N tiles per subtype (default 10 000) for test-set patients and saves
-them as per-patient ZIP files, matching the layout used by fid_evaluation.py:
-
-    <output-dir>/generated/<Subtype>/<patient_id>.zip
-        -> {patient_id}_00000.png, {patient_id}_00001.png, ...
-
-Real tiles are sampled from the source zip directory and saved under:
-
-    <output-dir>/real/<Subtype>/<patient_id>.zip
-
-After generation and real-tile collection the FID matrix is computed:
-
-    <output-dir>/fid_matrix_official.json
-    <output-dir>/fid_matrix_official.png   <- real x generated heatmap
-
-Usage:
-    python -m src.poc_experiment.sample_bulk_tiles \\
-        --run-dir     experiments/20260607_brca_pam50_cfg_v2_256/gda \\
-        --splits      experiments/20260528_genomic_features/patient_splits.json \\
-        --genomic-dir experiments/20260528_genomic_features/genomic_h5 \\
-        --tiles-dir   ../data/BRCA-tumor-tiles-256 \\
-        --output      experiments/20260607_brca_pam50_cfg_v2_256/generated_tiles_cfg1 \\
-        --subtypes    Basal LumA \\
-        --n-per-subtype 10000 \\
-        --guidance-scale 1.0 \\
-        --batch-size  16 \\
-        --steps       20
+Outputs per-patient ZIPs under <output>/generated/<Subtype>/ and <output>/real/<Subtype>/.
 """
 
 from __future__ import annotations
