@@ -13,8 +13,8 @@ def extract_patient_id(name: str) -> str:
     """Extract TCGA patient identifier from a filename or string.
     
     Handles both patterns:
-    - Long SVS-derived names: ``TCGA-AR-A2LK-01Z-00-DX1.UUID.HASH.zip``
-    - Short reconstructed names: ``TCGA-AR-A2LK.zip``
+    - Long SVS-derived names: ``patient1-DX1.UUID.HASH.zip``
+    - Short reconstructed names: ``patient1.zip``
     - Any string containing TCGA pattern
     
     Parameters
@@ -25,7 +25,7 @@ def extract_patient_id(name: str) -> str:
     Returns
     -------
     str
-        Extracted TCGA identifier (e.g., ``TCGA-AR-A2LK``) or 'unknown'
+        Extracted TCGA identifier (e.g., ``patient1``) or 'unknown'
     """
     stem = Path(name).stem.upper()
     

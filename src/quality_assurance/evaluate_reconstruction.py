@@ -24,7 +24,7 @@ Usage:
     python evaluate_reconstruction.py \\
         --original-zip-dir /path/to/original_tiles \\
         --reconstructed-zip-dir /path/to/reconstructed_tiles \\
-        --patient-ids TCGA-BH-A0AU TCGA-LL-A5YL \\
+        --patient-ids patient1 patient2 \\
         --output-dir ./evaluation_results
 """
 
