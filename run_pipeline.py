@@ -81,9 +81,10 @@ def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str,
 _CFG_TRAINING_STAGES = {
     "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest",
     "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256",
-    "brca_pam50_cfg_v2_1hot_smoketest",
+    "brca_pam50_cfg_v2_1hot_norm_256", "brca_pam50_cfg_v2_1hot_smoketest",
     "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx",
     "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M",
+    "poc_128_1hot_norm_30M",
     "poc_128_zero", "poc_128_zero_30M",
     "poc_128_noise", "poc_128_noise_30M",
     "poc_128_rna", "poc_128_rna_30M",
@@ -126,10 +127,6 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         _sys.argv = ["tar_to_tumor_zip", "--config", config_path]
         run_tar_to_tumor_zip()
     
-    elif stage == "encoding":
-        print(f"[INFO] Encoding stage not yet configured in this CLI")
-        print(f"       Run: python -m src.encoding.encode_genomics --config {config_path}")
-    
     elif stage == "visualize_latents":
         from src.visualization.visualize_latents import run_visualizations
         if "visualize_latents" not in config:
@@ -141,10 +138,6 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         if "poc_breast_vs_liver_visualize_latents" not in config:
             raise ValueError("No 'poc_breast_vs_liver_visualize_latents' section in config.yaml")
         run_visualizations(config["poc_breast_vs_liver_visualize_latents"], verbose=verbose)
-    
-    elif stage == "training":
-        print(f"[INFO] Training stage not yet configured in this CLI")
-        print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
     
     elif stage == "dataset_statistics":
         from src.visualization.dataset_statistics import run_dataset_statistics
@@ -164,10 +157,6 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         finally:
             sys.argv = old_argv
 
-    elif stage == "sampling":
-        print(f"[INFO] Sampling stage not yet configured in this CLI")
-        print(f"       Run: python -m src.sampling.sample_from_model --config {config_path}")
-    
     elif stage == "reconstruction":
         from src.reconstruction import run_reconstruction
         if "reconstruction" not in config:
@@ -312,16 +301,15 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
 
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
-        for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
+        for s in ["preprocessing", "evaluation"]:
             print(f"\n{'='*70}")
             print(f"STAGE: {s.upper()}")
             print(f"{'='*70}\n")
             try:
                 run_stage(config, s, config_path, verbose=verbose)
             except Exception as e:
-                if "not yet configured" not in str(e):
-                    print(f"[ERROR] Stage '{s}' failed: {e}")
-                    return
+                print(f"[ERROR] Stage '{s}' failed: {e}")
+                return
     
     else:
         raise ValueError(f"Unknown stage: '{stage}'")
@@ -355,7 +343,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["downscale_tiles", "preprocessing", "tar_to_tumor_zip", "encoding", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "subtype_classifier_cv", "generated_subtype_eval", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "gene_manipulation", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "tar_to_tumor_zip", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "dataset_statistics", "training_stats", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "subtype_classifier_cv", "generated_subtype_eval", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "gene_manipulation", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_norm_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_1hot_norm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     
