@@ -1,6 +1,6 @@
 """MoPaDi backbone trained with CFG dropout on genomic features.
 
-The backbone is the conditioned denoiser — no separate adapter.
+The backbone is the conditioned denoiser,
 It receives genomic features via AdaGN (style conditioning) and CFG
 dropout replaces them with zeros on a fraction of batches.
 
@@ -100,7 +100,7 @@ def _build_subtype_mean_feats(
 class CfgBackboneLitModel(LitModel):
     """
     Standard CFG training on MoPaDi backbone with genomic style conditioning.
-    No adapter — the backbone handles both denoising and genomic conditioning.
+    The backbone handles both denoising and genomic conditioning.
     """
 
     automatic_optimization = False

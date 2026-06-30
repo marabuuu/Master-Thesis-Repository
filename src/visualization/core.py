@@ -7,14 +7,11 @@ Used across all visualization sub-modules in the pipeline.
 
 Colour maps
 -----------
-We use Fabio Crameri's perceptually uniform, colour-vision-deficiency-friendly
+Fabio Crameri's (https://www.fabiocrameri.ch/colourmaps/) perceptually uniform, colour-vision-deficiency-friendly
 scientific colour maps (``cmcrameri`` package).  The module exposes a small
 curated palette for the most common use-cases (categorical subtypes,
 sequential heatmaps, diverging diff-maps) while allowing any ``cmc.*``
 map to be requested by name.
-
-Reference:  Crameri, F. (2018). Scientific colour maps. Zenodo.
-            https://doi.org/10.5281/zenodo.1243862
 """
 
 from __future__ import annotations

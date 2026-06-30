@@ -23,8 +23,6 @@ Colour maps
 -----------
 Every function defaults to `Fabio Crameri`_ scientific colour maps
 (``cmcrameri`` package).
-
-.. _Fabio Crameri: https://doi.org/10.5281/zenodo.1243862
 """
 
 from __future__ import annotations

@@ -5,10 +5,10 @@ Expects per-patient H5 files in a directory organised by subtype::
 
     generated_features_dir/
         Basal/
-            TCGA-A2-A0ST.h5
+            patient1.h5
             ...
         LumA/
-            TCGA-XX-XXXX.h5
+            patient2.h5
             ...
 
 Each H5 file is produced by ``extract_virchow2_features.py`` and contains a

@@ -8,8 +8,8 @@ contains PNG tiles) or per-patient subdirectories, encodes every tile with the
 frozen Virchow2 ViT, and writes one HDF5 file per patient::
 
     output_dir/
-        TCGA-3C-AALI.h5   # dataset "features", shape (N, 1280), float32
-        TCGA-A2-A04T.h5
+        patient1.h5   # dataset "features", shape (N, 1280), float32
+        patient2.h5
         ...
 
 The HDF5 layout is intentionally identical to the real-slide Virchow2 feature
