@@ -51,6 +51,7 @@ venv.bak/
 *.h5
 *.svg
 
-# SLURM logs
+# SLURM logs and scripts (use slurm/committed/ for scripts to track in git)
 *.out
 *.err
+!slurm/committed/*.sh
