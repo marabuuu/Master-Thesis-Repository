@@ -26,7 +26,7 @@ from tqdm import tqdm
 # Add the project root to the python path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent.parent))
 
-from visualization import (
+from src.visualization import (
     build_embedding_matrix,
     prepare_labels,
     plot_umap,
@@ -42,6 +42,7 @@ from visualization import (
     plot_countplot,
     plot_stacked_bar,
     plot_mosaic,
+    plot_composite_latent_analysis,
     setup_style,
 )
 
@@ -137,7 +138,19 @@ def load_latents_from_dir(latent_dir: str, patient_splits: Optional[Dict[str, st
 
 
 def run_visualizations(config: dict, verbose: bool = True):
-    setup_style()
+    # Palette override: if supplied in config, use it for all plots
+    palette_override: Optional[Dict[str, str]] = config.get("palette_override")
+    if palette_override is not None:
+        palette_override = {str(k): str(v) for k, v in palette_override.items()}
+
+    # Optional label rename: e.g. {"TCGA-BRCA": "Breast Cancer Cohort"}
+    label_rename: Optional[Dict[str, str]] = config.get("label_rename")
+    if label_rename is not None:
+        label_rename = {str(k): str(v) for k, v in label_rename.items()}
+
+    setup_style(extra_rc={"font.size": 12, "axes.labelsize": 13,
+                           "xtick.labelsize": 12, "ytick.labelsize": 12,
+                           "legend.fontsize": 11, "legend.title_fontsize": 12})
 
     latent_dir = config["latent_dir"]
     clinical_csv = config["csv_path"]
@@ -216,19 +229,29 @@ def run_visualizations(config: dict, verbose: bool = True):
     plot_stacked_bar(df_all, group_col=label_col, stack_col="split", title="Split composition", save_path=out_dir / "distribution_splits.png")
     plot_mosaic(df_all, columns=[label_col, "split"], title="Mosaic", save_path=out_dir / "mosaic_splits.png")
 
+    _hue_title = config.get("hue_title", "Cohort")
+    _style_title = config.get("style_title", "Split")
+    _proj_kw = dict(hue_title=_hue_title, style_title=_style_title, label_rename=label_rename)
+
     # 5. UMAP
     if verbose: print("[Latents] Computing UMAP...")
-    X_umap, _ = plot_umap(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "UMAP.png")
+    X_umap, _ = plot_umap(X, y_subtype, style_labels=y_split, markers=markers,
+                           palette=palette_override, save_path=out_dir / "UMAP.png",
+                           **_proj_kw)
     df_all["UMAP1"] = X_umap[:, 0]
     df_all["UMAP2"] = X_umap[:, 1]
 
     # 6. t-SNE
     if verbose: print("[Latents] Computing t-SNE...")
-    X_tsne, _ = plot_tsne(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "tSNE.png")
-    
+    X_tsne, _ = plot_tsne(X, y_subtype, style_labels=y_split, markers=markers,
+                           palette=palette_override, save_path=out_dir / "tSNE.png",
+                           **_proj_kw)
+
     # 8. PCA
     if verbose: print("[Latents] Computing PCA...")
-    X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers, save_path=out_dir / "PCA.png")
+    X_pca, _, _ = plot_pca(X, y_subtype, style_labels=y_split, markers=markers,
+                            palette=palette_override, save_path=out_dir / "PCA.png",
+                            **_proj_kw)
 
     # 8.b PCA variance scree plot
     if verbose: print("[Latents] PCA variance scree plot...")
@@ -239,16 +262,24 @@ def run_visualizations(config: dict, verbose: bool = True):
 
     # 8.c UMAP coloured by split (second view)
     if verbose: print("[Latents] UMAP coloured by split...")
-    plot_umap(X, y_split, title="UMAP — coloured by data split", style_labels=y_subtype,
-              markers={"LumA": "o", "LumB": "s", "Basal": "^", "Her2": "D", "Normal": "P"},
-              save_path=out_dir / "UMAP_split.png", show=False)
+    _marker_shapes = ["o", "s", "^", "D", "P", "v", "<", ">"]
+    _unique_subtypes = sorted(set(y_subtype))
+    _subtype_markers = {s: _marker_shapes[i % len(_marker_shapes)] for i, s in enumerate(_unique_subtypes)}
+    try:
+        plot_umap(X, y_split, style_labels=y_subtype,
+                  markers=_subtype_markers,
+                  hue_title=_style_title, style_title=_hue_title, label_rename=label_rename,
+                  save_path=out_dir / "UMAP_split.png", show=False)
+    except Exception as e:
+        print(f"  ⚠️ UMAP split plot failed: {e}")
 
     # 9. Cosine Distance Clustermap
     if verbose: print("[Latents] Plotting Cosine Clustermap...")
     n_sample = min(200, len(X))
-    # Pass labels so we can see the subtype along the edges
-    plot_cosine_distance_clustermap(X, labels=y_subtype, n_samples=n_sample, save_path=out_dir / "cosine_distance_matrix_clustermap.png")
-    
+    plot_cosine_distance_clustermap(X, labels=y_subtype, n_samples=n_sample,
+                                    palette=palette_override,
+                                    save_path=out_dir / "cosine_distance_matrix_clustermap.png")
+
     # 10. Silhouette
     if verbose: print("[Latents] Computing Silhouette scores...")
     try:
@@ -258,7 +289,10 @@ def run_visualizations(config: dict, verbose: bool = True):
             print(f"  Silhouette (raw 512-D, cosine):    {sil_raw:.3f}")
             print(f"  Silhouette (UMAP 2-D, euclidean):  {sil_umap:.3f}")
 
-        plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col, metric="euclidean", save_path=out_dir / "silhouette_per_subtype_umap.png")
+        plot_silhouette_per_group(X_umap, y_subtype, group_col_name=label_col,
+                                  metric="euclidean", palette=palette_override,
+                                  label_rename=label_rename,
+                                  save_path=out_dir / "silhouette_per_subtype_umap.png")
     except Exception as e:
         print(f"  ⚠️ Silhouette failed: {e}")
 
@@ -275,9 +309,26 @@ def run_visualizations(config: dict, verbose: bool = True):
     if verbose: print("[Latents] Plotting Dendrogram...")
     try:
         n_sample_dendro = min(150, len(X))
-        plot_dendrogram(X, y_subtype, n_samples=n_sample_dendro, metric="cosine", method="ward", save_path=out_dir / "ward_dendrogram.png")
+        plot_dendrogram(X, y_subtype, n_samples=n_sample_dendro, metric="cosine", method="ward",
+                        palette=palette_override, save_path=out_dir / "ward_dendrogram.png")
     except Exception as e:
         print(f"  ⚠️ Dendrogram failed: {e}")
+
+    # 13. COMPOSITE REPORT FIGURE
+    if verbose: print("[Latents] Generating composite report figure...")
+    try:
+        plot_composite_latent_analysis(
+            X,
+            coords_umap=X_umap,
+            hue_labels=y_subtype,
+            style_labels=y_split,
+            figsize=(18, 10),
+            n_samples_heatmap=200,
+            save_path=out_dir / "composite_latent_analysis_report.png",
+            show=False,
+        )
+    except Exception as e:
+        print(f"  ⚠️ Composite figure failed: {e}")
 
     if verbose: print(f"[Latents] 🚀 All latent visualizations generated in {out_dir}")
 
@@ -285,15 +336,20 @@ def run_visualizations(config: dict, verbose: bool = True):
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str, required=True, help="Path to config.yaml")
+    parser.add_argument(
+        "--section",
+        default="visualize_latents",
+        help="Top-level config section to use (default: visualize_latents)",
+    )
     args = parser.parse_args()
 
     with open(args.config, "r") as f:
         full_cfg = yaml.safe_load(f)
 
-    if "visualize_latents" not in full_cfg:
-        raise ValueError("Missing 'visualize_latents' key in config file.")
+    if args.section not in full_cfg:
+        raise ValueError(f"Missing '{args.section}' key in config file.")
 
-    run_visualizations(full_cfg["visualize_latents"])
+    run_visualizations(full_cfg[args.section])
 
 
 if __name__ == "__main__":

@@ -241,6 +241,67 @@ def build_tile_feature_table(
     return df
 
 
+def build_tile_feature_table_all(
+    features_dir: str | Path,
+    subtype_df: pd.DataFrame,
+    max_tiles_per_patient: Optional[int] = None,
+    seed: int = 42,
+) -> pd.DataFrame:
+    """Load tile features for ALL patients with a valid Basal/LumA subtype.
+
+    Unlike ``build_tile_feature_table``, this does not require a patient splits
+    dict.  The returned DataFrame has no ``split`` column.
+    """
+    features_dir = Path(features_dir)
+    if not features_dir.exists():
+        raise FileNotFoundError(f"Features directory not found: {features_dir}")
+
+    all_h5 = sorted(list(features_dir.glob("*.h5")) + list(features_dir.glob("*.hdf5")))
+    if not all_h5:
+        raise FileNotFoundError(f"No .h5/.hdf5 files found in: {features_dir}")
+
+    subtype_map = dict(zip(subtype_df["patient_id"], subtype_df["subtype"]))
+    rows: List[dict] = []
+    rng = np.random.RandomState(seed)
+
+    for h5_path in all_h5:
+        pid, feats, coords = load_patient_h5_features(h5_path)
+        if pid not in subtype_map:
+            continue
+
+        n = feats.shape[0]
+        indices = np.arange(n)
+        if max_tiles_per_patient is not None and n > max_tiles_per_patient:
+            indices = rng.choice(indices, size=max_tiles_per_patient, replace=False)
+
+        for i in indices:
+            rows.append({
+                "patient_id": pid,
+                "subtype": subtype_map[pid],
+                "tile_index": int(i),
+                "feature": feats[i],
+            })
+
+    if not rows:
+        raise ValueError("No samples found after applying subtype filters")
+
+    return pd.DataFrame(rows)
+
+
+def patients_to_arrays(
+    df: pd.DataFrame,
+    patient_ids: Iterable[str],
+) -> Tuple[np.ndarray, np.ndarray, pd.DataFrame]:
+    """Select tiles belonging to *patient_ids* and return (X, y, sub_df)."""
+    pid_set = set(patient_ids)
+    sub = df[df["patient_id"].isin(pid_set)].reset_index(drop=True)
+    if len(sub) == 0:
+        raise ValueError("No rows found for the given patient IDs")
+    x = np.stack(sub["feature"].to_list()).astype(np.float32)
+    y = encode_labels(sub["subtype"].tolist())
+    return x, y, sub
+
+
 def encode_labels(labels: Iterable[str]) -> np.ndarray:
     y = np.array([1 if str(lbl) == "Basal" else 0 for lbl in labels], dtype=np.int64)
     return y

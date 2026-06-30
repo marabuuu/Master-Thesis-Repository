@@ -75,6 +75,9 @@ _IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".tif", ".tiff"}
 def discover_tiles_from_zips(
     input_dir: Path,
     max_tiles_per_zip: Optional[int] = None,
+    *,
+    per_zip_max_tiles: Optional[Dict[str, int]] = None,
+    include_pids: Optional[set] = None,
 ) -> List[Tuple[Path, str]]:
     """Return a list of ``(zip_path, internal_name)`` for every tile image.
 
@@ -83,7 +86,16 @@ def discover_tiles_from_zips(
     input_dir : Path
         Directory containing ``*.zip`` archives.
     max_tiles_per_zip : int or None
-        If set, randomly sub-sample at most *N* tiles per ZIP (reproducible).
+        Global fallback cap applied to every ZIP (reproducible random subsample).
+    per_zip_max_tiles : dict[str, int] or None
+        Per-patient cap: maps canonical patient ID (e.g. ``'TCGA-AR-A2LK'``) to
+        the maximum number of tiles to sample from that patient's ZIP.  Overrides
+        ``max_tiles_per_zip`` on a per-patient basis.
+    include_pids : set of str or None
+        When provided, only ZIPs whose patient ID is in this set are processed.
+        ZIPs that do not match any patient ID in the set are silently skipped.
+        Use this to restrict segmentation to a specific subset of patients
+        (e.g. only the patients belonging to the classes being analysed).
 
     Returns
     -------
@@ -94,7 +106,14 @@ def discover_tiles_from_zips(
         raise FileNotFoundError(f"No .zip files found in {input_dir}")
 
     tiles: List[Tuple[Path, str]] = []
+    skipped = 0
     for zp in zip_files:
+        pid = _patient_id_from_zip(zp)
+
+        if include_pids is not None and pid not in include_pids:
+            skipped += 1
+            continue
+
         try:
             with zipfile.ZipFile(zp, "r") as zf:
                 candidates = [
@@ -105,14 +124,23 @@ def discover_tiles_from_zips(
             logger.warning("Skipping bad zip: %s", zp)
             continue
 
-        if max_tiles_per_zip and len(candidates) > max_tiles_per_zip:
+        # Resolve the cap for this specific patient (per-zip overrides global)
+        cap: Optional[int] = None
+        if per_zip_max_tiles is not None:
+            cap = per_zip_max_tiles.get(pid)  # None means "no cap for this patient"
+        if cap is None:
+            cap = max_tiles_per_zip
+
+        if cap is not None and len(candidates) > cap:
             rng = np.random.RandomState(hash(zp.name) % 2**32)
-            candidates = list(rng.choice(candidates, max_tiles_per_zip, replace=False))
+            candidates = list(rng.choice(candidates, cap, replace=False))
 
         for name in candidates:
             tiles.append((zp, name))
 
-    logger.info("Discovered %d tiles from %d ZIP archives.", len(tiles), len(zip_files))
+    if skipped:
+        logger.info("Skipped %d ZIPs not in requested patient set.", skipped)
+    logger.info("Discovered %d tiles from %d ZIP archives.", len(tiles), len(zip_files) - skipped)
     return tiles
 
 
@@ -429,6 +457,8 @@ def process_tiles_from_zips(
     segmenter: DeepCMorphSegmenter,
     *,
     max_tiles_per_zip: Optional[int] = None,
+    per_zip_max_tiles: Optional[Dict[str, int]] = None,
+    include_pids: Optional[set] = None,
     save_seg: bool = True,
     per_patient_dirs: bool = True,
 ) -> int:
@@ -443,7 +473,13 @@ def process_tiles_from_zips(
     segmenter : DeepCMorphSegmenter
         Initialised segmenter.
     max_tiles_per_zip : int or None
-        Optional cap on tiles per ZIP.
+        Global fallback cap on tiles per ZIP.
+    per_zip_max_tiles : dict[str, int] or None
+        Per-patient tile cap.  Maps canonical patient ID to max tiles.
+        Overrides ``max_tiles_per_zip`` on a per-patient basis.  ``None``
+        entry for a patient means no cap for that patient.
+    include_pids : set of str or None
+        When set, only ZIPs whose patient ID is in this set are processed.
     save_seg : bool
         If True, also save the global nuclei segmentation ``*_seg.npy``.
     per_patient_dirs : bool
@@ -454,7 +490,12 @@ def process_tiles_from_zips(
     int
         Total number of tiles processed.
     """
-    tile_entries = discover_tiles_from_zips(input_dir, max_tiles_per_zip)
+    tile_entries = discover_tiles_from_zips(
+        input_dir,
+        max_tiles_per_zip,
+        per_zip_max_tiles=per_zip_max_tiles,
+        include_pids=include_pids,
+    )
 
     # Group entries by zip for efficient sequential reads
     from collections import defaultdict

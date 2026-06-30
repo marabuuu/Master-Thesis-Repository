@@ -11,22 +11,14 @@ fid_score
     Compute FID between real and generated images.
 """
 
-from .fid_score import compute_fid
-from .training_curves import (
-    parse_experiment_dir,
-    parse_lightning_log,
-    parse_stderr_log,
-    parse_tensorboard_events,
-    print_training_summary,
-)
+try:
+    from .fid_score import compute_fid
+except ImportError:
+    pass
+from .training_curves import load_scalars, plot_training_stats
 
 __all__ = [
-    # training-curve parsing
-    "parse_experiment_dir",
-    "parse_tensorboard_events",
-    "parse_lightning_log",
-    "parse_stderr_log",
-    "print_training_summary",
-    # FID
+    "load_scalars",
+    "plot_training_stats",
     "compute_fid",
 ]

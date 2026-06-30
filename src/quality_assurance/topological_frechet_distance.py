@@ -437,7 +437,7 @@ def compute_topofd(
     reference_segmentations: Iterable[np.ndarray],
     generated_segmentations: Iterable[np.ndarray],
     *,
-    use_alpha: bool = True,
+    use_alpha: bool = False,
     n_landscape_bins: int = 100,
     n_landscape_layers: int = 1,
     min_cells: int = 3,
@@ -664,7 +664,132 @@ def compute_topofd(
 
 
 # ===================================================================
-# § 6  Convenience – compute from folders of .npy files
+# § 6  Per-class distribution fitting (for separability analysis)
+# ===================================================================
+
+@dataclass
+class ClassDistribution:
+    """Gaussian distribution of persistence landscape vectors for one class.
+
+    Produced by :func:`compute_class_distribution` and consumed by
+    :mod:`quality_assurance.tfd_separability` to compute pairwise Fréchet
+    distances between histological classes.
+
+    Attributes
+    ----------
+    class_name : str
+        Human-readable class label (e.g. ``'Basal'``, ``'LumA'``).
+    n_channels : int
+        Number of cell-type channels in the segmentation masks.
+    vec_dim : int
+        Dimension of each persistence landscape vector (n_bins × n_layers).
+    mean : dict[int, np.ndarray]
+        Per-channel mean vector, shape ``(vec_dim,)``.
+    cov : dict[int, np.ndarray]
+        Per-channel covariance matrix, shape ``(vec_dim, vec_dim)``.
+    n_samples : dict[int, int]
+        Number of segmentation masks contributing to each channel.
+    """
+    class_name: str
+    n_channels: int
+    vec_dim: int
+    mean: Dict[int, np.ndarray]
+    cov: Dict[int, np.ndarray]
+    n_samples: Dict[int, int]
+
+
+def compute_class_distribution(
+    segmentations: "Iterable[np.ndarray]",
+    *,
+    class_name: str = "",
+    use_alpha: bool = False,
+    n_landscape_bins: int = 100,
+    n_landscape_layers: int = 1,
+    min_cells: int = 3,
+) -> ClassDistribution:
+    """Fit a Gaussian to the persistence landscape vectors of one class.
+
+    This is the per-class analogue of the internal accumulation logic inside
+    :func:`compute_topofd`.  Call it once per class, then compare classes with
+    :func:`_calculate_frechet_distance` or via
+    :func:`~quality_assurance.tfd_separability.compute_tfd_separability`.
+
+    Parameters
+    ----------
+    segmentations : iterable of np.ndarray
+        Segmentation masks for this class.  Each element is ``(H, W)`` or
+        ``(H, W, C)``.
+    class_name : str
+        Label attached to the returned :class:`ClassDistribution`.
+    use_alpha, n_landscape_bins, n_landscape_layers, min_cells :
+        Forwarded to the persistence homology and vectorisation helpers.
+
+    Returns
+    -------
+    ClassDistribution
+    """
+    _check_gudhi()
+    _check_gtda()
+
+    seg_iter = iter(segmentations)
+    try:
+        first = next(seg_iter)
+    except StopIteration:
+        raise ValueError(f"Empty segmentation set for class '{class_name}'")
+
+    sample = np.asarray(first)
+    n_channels = sample.shape[2] if sample.ndim == 3 else 1
+    vec_dim = n_landscape_bins * n_landscape_layers
+
+    stats: Dict[int, _OnlineMeanCov] = {
+        c: _OnlineMeanCov(vec_dim) for c in range(n_channels)
+    }
+
+    def _process(seg: np.ndarray) -> None:
+        centres_per_ch = extract_centres_multichannel(np.asarray(seg))
+        if len(centres_per_ch) != n_channels:
+            logger.warning(
+                "Skipping segmentation with %d channels (expected %d)",
+                len(centres_per_ch), n_channels,
+            )
+            return
+        for ch_idx, centres in enumerate(centres_per_ch):
+            if centres.shape[0] < min_cells:
+                stats[ch_idx].update(np.zeros(vec_dim, dtype=np.float64))
+                continue
+            diagram = compute_persistence_diagram_1d(centres, use_alpha=use_alpha)
+            vec = vectorise_persistence_landscape(
+                diagram,
+                n_bins=n_landscape_bins,
+                n_layers=n_landscape_layers,
+            )
+            stats[ch_idx].update(vec)
+
+    _process(first)
+    for seg in seg_iter:
+        _process(seg)
+
+    mean_dict: Dict[int, np.ndarray] = {}
+    cov_dict: Dict[int, np.ndarray] = {}
+    n_dict: Dict[int, int] = {}
+    for ch, acc in stats.items():
+        mu, cov, n = acc.finalize()
+        mean_dict[ch] = mu
+        cov_dict[ch] = cov
+        n_dict[ch] = n
+
+    return ClassDistribution(
+        class_name=class_name,
+        n_channels=n_channels,
+        vec_dim=vec_dim,
+        mean=mean_dict,
+        cov=cov_dict,
+        n_samples=n_dict,
+    )
+
+
+# ===================================================================
+# § 7  Convenience – compute from folders of .npy files
 # ===================================================================
 
 def compute_topofd_from_folders(

@@ -20,27 +20,47 @@ from .metrics import (
     compute_ssim,
     compute_all_metrics,
 )
-from .evaluate_reconstruction import (
-    ReconstructionEvaluator,
-    evaluate_patient_tiles,
-)
-from visualization.reconstruction_eval import (
-    plot_metrics_summary,
-    plot_comparison_grid,
-    plot_per_patient_metrics,
-    plot_metric_correlation,
-    plot_single_comparison,
-    save_figure,
-)
+
+try:
+    from .evaluate_reconstruction import (
+        ReconstructionEvaluator,
+        evaluate_patient_tiles,
+    )
+except Exception:
+    pass
+
+try:
+    from src.visualization.reconstruction_eval import (
+        plot_metrics_summary,
+        plot_comparison_grid,
+        plot_per_patient_metrics,
+        plot_metric_correlation,
+        plot_single_comparison,
+        save_figure,
+    )
+except Exception:
+    pass
+
 from .topological_frechet_distance import (
     compute_topofd,
     compute_topofd_from_folders,
     TopoFDResult,
+    ClassDistribution,
+    compute_class_distribution,
 )
-from .run_evaluation import (
-    run_evaluation,
-    load_config,
+from .tfd_separability import (
+    TFDSeparabilityResult,
+    compute_tfd_separability,
+    run_tfd_separability,
 )
+
+try:
+    from .run_evaluation import (
+        run_evaluation,
+        load_config,
+    )
+except Exception:
+    pass
 
 __all__ = [
     # Metrics
@@ -60,8 +80,14 @@ __all__ = [
     "plot_metric_correlation",
     "plot_single_comparison",
     "save_figure",
-    # Topological Fréchet Distance
+    # Topological Fréchet Distance (ref vs gen)
     "compute_topofd",
     "compute_topofd_from_folders",
     "TopoFDResult",
+    # TFD Class Separability
+    "ClassDistribution",
+    "compute_class_distribution",
+    "TFDSeparabilityResult",
+    "compute_tfd_separability",
+    "run_tfd_separability",
 ]

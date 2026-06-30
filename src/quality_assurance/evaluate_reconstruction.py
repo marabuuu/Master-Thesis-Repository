@@ -45,13 +45,23 @@ from tqdm import tqdm
 try:
     from .metrics import compute_all_metrics
     from .utils import extract_patient_id
-    from ..joint_training.dataset import canonical_patient_id
 except Exception:
-    # Allow running the script directly (not as a package) by falling
-    # back to absolute import when the relative import fails.
     from quality_assurance.metrics import compute_all_metrics
     from quality_assurance.utils import extract_patient_id
-    from joint_training.dataset import canonical_patient_id
+
+
+def canonical_patient_id(name: str) -> str:
+    """Extract TCGA-XX-XXXX from various filename formats."""
+    from pathlib import Path as _Path
+    stem = _Path(name).stem.upper()
+    for sep in ("_", "."):
+        stem = stem.replace(sep, "-")
+    while "--" in stem:
+        stem = stem.replace("--", "-")
+    parts = stem.split("-")
+    if len(parts) >= 3 and parts[0].startswith("TCGA"):
+        return "-".join(parts[:3])
+    return stem
 try:
     from visualization.reconstruction_eval import plot_metrics_summary, plot_per_patient_metrics, plot_comparison_grid, plot_metric_correlation, plot_single_comparison
 except ImportError:

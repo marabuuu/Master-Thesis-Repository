@@ -1,0 +1,533 @@
+"""
+GenomicLitModel — PyTorch Lightning module for training MoPaDi from scratch
+with gene-expression conditioning (no image feature extractor).
+
+Overrides from MoPaDi's ``LitModel``:
+
+``setup()``
+    Creates ``ZipTilesWithGenomicFeatures`` datasets for train and val.
+    Does NOT initialise any image feature extractor.
+
+``on_fit_start()``
+    Replaces MoPaDi's WebDataset sanity check (which expects tar shards)
+    with a lightweight check on the ZIP-based genomic dataset.
+
+``training_step()``
+    Calls the parent implementation and additionally logs ``loss/train``
+    so TensorBoard groups it on the same chart as ``loss/val``.
+
+``validation_step()``
+    Computes the diffusion loss on a held-out val batch (no gradients,
+    EMA model) and logs ``loss/val`` at the same ``num_samples`` x-axis
+    as the training scalars.  Validation is run every ``val_every_steps``
+    training steps (configured in ``run_genomic_training.py``), capped at
+    ``limit_val_batches`` batches so it does not slow training significantly.
+"""
+
+from __future__ import annotations
+
+import logging
+import random
+
+import numpy as np
+import torch
+import torch.nn.functional as F
+
+from mopadi.train_diff_autoenc import LitModel
+from mopadi.utils.dist_utils import get_world_size
+
+from .genomic_config import GenomicTrainConfig
+from .genomic_dataset import ZipTilesWithGenomicFeatures
+
+log = logging.getLogger(__name__)
+
+
+class GenomicLitModel(LitModel):
+    """MoPaDi diffusion autoencoder conditioned on patient gene-expression.
+
+    Parameters
+    ----------
+    conf:
+        A ``GenomicTrainConfig`` instance (subclass of MoPaDi's ``TrainConfig``).
+    """
+
+    def __init__(self, conf: GenomicTrainConfig):
+        super().__init__(conf)
+        # Overwrite to the typed subclass for IDE support; the parent __init__
+        # already stored conf as self.conf — this just re-annotates the type.
+        self.conf: GenomicTrainConfig = conf
+
+    @staticmethod
+    def _non_identity_permutation(n: int, device: torch.device) -> torch.Tensor:
+        """Return a permutation where no element maps to itself (if n > 1)."""
+        perm = torch.randperm(n, device=device)
+        if n > 1 and torch.equal(perm, torch.arange(n, device=device)):
+            perm = torch.roll(perm, shifts=1)
+        return perm
+
+    @staticmethod
+    def _flatten_bag_batch(batch: dict) -> tuple:
+        """Flatten a bag batch (B, N, C, H, W) → (B*N, C, H, W).
+
+        Returns (flat_batch, N) where N=1 if the input was already flat.
+        The feat tensor is expanded along the tile dimension so each tile
+        carries its patient's genomic vector.
+        """
+        img = batch["img"]
+        if img.dim() == 5:
+            B, N, C, H, W = img.shape
+            flat = dict(batch)
+            flat["img"] = img.reshape(B * N, C, H, W)
+            feat = batch["feat"]  # (B, n_genes)
+            flat["feat"] = feat.unsqueeze(1).expand(-1, N, -1).reshape(B * N, -1)
+            return flat, N
+        return batch, 1
+
+    # ------------------------------------------------------------------
+    # Dataset creation (overrides parent)
+    # ------------------------------------------------------------------
+
+    def setup(self, stage=None) -> None:
+        """Create genomic datasets; skip image feature extractor entirely."""
+        # ── Seed ────────────────────────────────────────────────────────
+        if self.conf.seed is not None:
+            seed = self.conf.seed * get_world_size() + self.global_rank
+            np.random.seed(seed)
+            torch.manual_seed(seed)
+            torch.cuda.manual_seed(seed)
+            log.info("Local seed: %d", seed)
+
+        n_tiles_per_bag = int(getattr(self.conf, "n_tiles_per_bag", 1))
+
+        # ── Training dataset ─────────────────────────────────────────────
+        self.train_data = ZipTilesWithGenomicFeatures(
+            zip_dir=self.conf.zip_dir,
+            genomic_h5_dir=self.conf.genomic_feature_dir,
+            patient_splits_path=self.conf.patient_splits_path,
+            split="train",
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
+            tile_sampling_seed=self.conf.tile_sampling_seed,
+            n_tiles_per_bag=n_tiles_per_bag,
+            img_size=self.conf.img_size,
+            do_resize=self.conf.do_resize,
+            do_normalize=self.conf.do_normalize,
+            cache_pickle_tiles_path=getattr(self.conf, "cache_pickle_tiles_path", None),
+        )
+
+        # ── Validation dataset (always single-tile for clean cond/gap metrics)
+        self.val_data = ZipTilesWithGenomicFeatures(
+            zip_dir=self.conf.zip_dir,
+            genomic_h5_dir=self.conf.genomic_feature_dir,
+            patient_splits_path=self.conf.patient_splits_path,
+            split="val",
+            max_tiles_by_subtype=self.conf.max_tiles_by_subtype,
+            tile_sampling_seed=self.conf.tile_sampling_seed,
+            n_tiles_per_bag=1,
+            img_size=self.conf.img_size,
+            do_resize=self.conf.do_resize,
+            do_normalize=self.conf.do_normalize,
+        )
+
+        # ── NO image feature extractor ───────────────────────────────────
+        # self.feat_extractor remains None (set by parent __init__).
+        # self.model.feat_extractor is also None — the model's forward() will
+        # raise ValueError if cond is None, but our dataset always provides
+        # feat, so this path is never reached during normal training.
+        if self.global_rank == 0:
+            log.info(
+                "train items: %d  |  val tiles: %d  |  genomic features: %d-dim%s",
+                len(self.train_data),
+                len(self.val_data),
+                next(iter(self.train_data._genomic_cache.values())).shape[0]
+                if self.train_data._genomic_cache else 0,
+                f" [bag_size={n_tiles_per_bag}]" if n_tiles_per_bag > 1 else "",
+            )
+
+    # ------------------------------------------------------------------
+    # Per-epoch tile resampling for training diversity
+    # ------------------------------------------------------------------
+
+    def on_train_epoch_start(self) -> None:
+        """Rotate tile caps each epoch so different tiles are seen per epoch."""
+        if hasattr(self, "train_data") and hasattr(self.train_data, "resample_tiles"):
+            self.train_data.resample_tiles(self.current_epoch)
+
+    # ------------------------------------------------------------------
+    # Val dataloader (parent only defines train_dataloader)
+    # ------------------------------------------------------------------
+
+    def val_dataloader(self):
+        """Return a DataLoader for the validation split, capped at val_limit_batches.
+
+        MoPaDi's parent ``LitModel`` only defines ``train_dataloader``;
+        without this method Lightning silently skips the entire val loop.
+
+        Lightning's ``limit_val_batches`` is unreliable with integer
+        ``val_check_interval`` in 2.5.x, so we cap the dataset directly.
+        
+        Uses stratified sampling across subtypes when possible: picks roughly equal
+        tiles per subtype to ensure cond/gap is representative across all classes.
+        Randomizes which tiles are selected each epoch (seed = base + epoch).
+        """
+        import torch.utils.data as tud
+        from collections import defaultdict
+
+        # self.conf.batch_size is global batch size in MoPaDi's TrainConfig.
+        # Using local self.batch_size here would shrink validation by world_size
+        # under DDP (e.g. 4x fewer val batches on 4 GPUs).
+        limit = self.conf.val_limit_batches * self.conf.batch_size
+        
+        # Stratified sampling: group tiles by subtype and pick roughly equal from each
+        try:
+            subtype_map = self.val_data._subtype_map if hasattr(self.val_data, "_subtype_map") else {}
+            tile_paths = self.val_data.tile_paths if hasattr(self.val_data, "tile_paths") else []
+            
+            if subtype_map and tile_paths and len(subtype_map) > 0:
+                # group by subtype
+                subtype_indices = defaultdict(list)
+                for idx, path in enumerate(tile_paths):
+                    from .genomic_dataset import patient_id_from_tile_path
+                    pid = patient_id_from_tile_path(path)
+                    subtype = subtype_map.get(pid, "unknown")
+                    subtype_indices[subtype].append(idx)
+                
+                # stratified sampling: pick equal tiles from each subtype
+                rng = random.Random(self.current_epoch + 42)  # randomize per epoch
+                selected_indices = []
+                tiles_per_subtype = max(1, limit // max(1, len(subtype_indices)))
+                for subtype, indices in subtype_indices.items():
+                    sampled = rng.sample(indices, min(tiles_per_subtype, len(indices)))
+                    selected_indices.extend(sampled)
+                
+                selected_indices = selected_indices[:limit]
+                dataset = tud.Subset(self.val_data, selected_indices)
+                
+                if self.global_rank == 0:
+                    log.info(
+                        f"Val sampling: stratified across {len(subtype_indices)} subtypes, "
+                        f"using {len(selected_indices)} tiles (epoch {self.current_epoch})"
+                    )
+            else:
+                # fallback: simple limit
+                dataset = (
+                    tud.Subset(self.val_data, list(range(limit)))
+                    if len(self.val_data) > limit
+                    else self.val_data
+                )
+        except Exception as e:
+            # fallback on any error — still randomize per epoch so different
+            # tiles are evaluated across epochs for data augmentation purposes
+            if self.global_rank == 0:
+                log.warning(f"Stratified val sampling failed: {e}, using shuffled limit")
+            if len(self.val_data) > limit:
+                rng = random.Random(self.current_epoch + 42)
+                indices = list(range(len(self.val_data)))
+                rng.shuffle(indices)
+                dataset = tud.Subset(self.val_data, indices[:limit])
+            else:
+                dataset = self.val_data
+        
+        conf = self.conf.clone()
+        conf.batch_size = self.batch_size
+        return conf.make_loader(dataset, shuffle=False, drop_last=False)
+
+    # ------------------------------------------------------------------
+    # TensorBoard logging — grouped train / val loss curves
+    # ------------------------------------------------------------------
+
+    def training_step(self, batch, batch_idx):
+        """Forward to parent, then add a grouped ``loss/train`` scalar.
+
+        MoPaDi's parent logs the scalar ``"loss"`` directly via
+        ``add_scalar``.  We additionally write ``"loss/train"`` so that
+        TensorBoard places the training curve on the same chart as
+        ``"loss/val"`` (TensorBoard groups series by the prefix before
+        the first ``/``).
+
+        In bag mode (n_tiles_per_bag > 1) the batch arrives with
+        ``img: (B, N, C, H, W)``.  We flatten to ``(B*N, C, H, W)`` before
+        the UNet forward pass.  The counterfactual shuffle operates at the
+        patient (bag) level so all N tiles from one patient always receive
+        a different patient's genomic vector.
+        """
+        # Flatten bag batches → (B*N, C, H, W) before parent processes them.
+        batch, _bag_n = self._flatten_bag_batch(batch)
+
+        out = super().training_step(batch, batch_idx)
+
+        # ── Counterfactual gap metric (diagnostic only — not a training loss) ──
+        # Measures loss(shuffled_cond) − loss(correct_cond) to track whether the
+        # model is learning to use genomic conditioning.  Both passes run under
+        # no_grad so they save memory and do not influence the gradient.
+        cf_every = max(1, int(getattr(self.conf, "counterfactual_every_n_steps", 1)))
+        cf_temperature = max(1e-6, float(getattr(self.conf, "counterfactual_temperature", 0.05)))
+
+        loss_val = out["loss"] if isinstance(out, dict) else out
+        if (
+            (self.global_step % cf_every == 0)
+            and batch["feat"].shape[0] > 1
+        ):
+            imgs = batch["img"].to(self.device)
+            feats = batch["feat"].to(self.device, dtype=torch.float32)
+
+            if _bag_n > 1:
+                B_bags = feats.shape[0] // _bag_n
+                bag_perm = self._non_identity_permutation(B_bags, feats.device)
+                feats_shuffled = (
+                    feats.reshape(B_bags, _bag_n, -1)[bag_perm]
+                    .reshape(B_bags * _bag_n, -1)
+                )
+            else:
+                perm = self._non_identity_permutation(feats.size(0), feats.device)
+                feats_shuffled = feats[perm]
+
+            with torch.no_grad():
+                t_cf, _ = self.T_sampler.sample(len(imgs), imgs.device)
+                noise_cf = torch.randn_like(imgs)
+
+                losses_cond_cf = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats,
+                    t=t_cf,
+                    noise=noise_cf,
+                    model_kwargs={"cond": feats},
+                )
+                losses_shuffled = self.sampler.training_losses(
+                    model=self.model,
+                    x_start=imgs,
+                    cond=feats_shuffled,
+                    t=t_cf,
+                    noise=noise_cf,
+                    model_kwargs={"cond": feats_shuffled},
+                )
+                gap = losses_shuffled["loss"].mean() - losses_cond_cf["loss"].mean()
+                cf_penalty_metric = F.softplus(-gap / cf_temperature)
+
+            self.log(
+                "cond/gap_train",
+                gap,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+            self.log(
+                "loss/counterfactual",
+                cf_penalty_metric,
+                on_step=True,
+                on_epoch=False,
+                prog_bar=False,
+                logger=True,
+            )
+
+        # Expose a Lightning-native metric key for ModelCheckpoint(monitor="loss").
+        # add_scalar writes only to TensorBoard and is invisible to callbacks.
+        self.log("loss", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+        self.log("loss/train", loss_val, on_step=True, on_epoch=False, prog_bar=False, logger=True)
+
+        if self.global_rank == 0:
+            if self.global_step % 500 == 0 and self.global_step != getattr(self, "_last_train_log_step", -1):
+                self._last_train_log_step = self.global_step
+                log.info(
+                    "step %6d | samples %10d | loss/train %.4f",
+                    self.global_step, self.num_samples, loss_val.item(),
+                )
+        return out
+
+    def validation_step(self, batch, batch_idx):
+        """Compute diffusion loss and conditioning gap on a val batch.
+
+        Logs three scalars — all under the same ``num_samples`` x-axis as
+        the training loss, so the curves align in TensorBoard:
+
+        ``loss/val``
+            Standard val loss with the *correct* genomic conditioning vector.
+            Tracks model quality; goes down as training progresses.
+
+        ``loss/val_shuffled``
+            Val loss with a *randomly permuted* conditioning vector
+            (same images, wrong patient genomic features).
+
+        ``cond/gap``
+            ``loss/val_shuffled − loss/val``.  Near zero early in training
+            (model ignores conditioning); grows positive once the model
+            learns to exploit the genomic signal.  If this stays flat at
+            zero after tens of thousands of steps, the genomic conditioning
+            is not being learned — a reliable signal to cancel the run.
+        """
+        # Lightning runs a brief sanity check (2 batches) before training to
+        # validate the val loop.  We skip it here because on_fit_start() already
+        # does a dedicated sanity check, and logging during the sanity phase
+        # can cause issues with partially initialised trainer state.
+        if self.trainer.sanity_checking:
+            return None
+
+        imgs = batch["img"].to(self.device)
+        feats = batch["feat"].to(self.device, dtype=torch.float32)
+
+        with torch.no_grad():
+            # Use batch_idx as seed so the same batch always draws the same
+            # timesteps and permutation across val epochs.  This removes t-
+            # and perm-variance from cond/gap so the trend is visible earlier.
+            # CPU-based sampling avoids CUDA RNG interference.
+            with torch.random.fork_rng(devices=[]):  # CPU-only sampling; don't init all 4 CUDA devices
+                torch.manual_seed(batch_idx)
+                t = torch.randint(0, self.conf.T, (len(imgs),)).to(imgs.device)
+                perm = self._non_identity_permutation(feats.size(0), device="cpu").to(feats.device)
+
+            # ── Loss with correct conditioning ───────────────────────────
+            losses_cond = self.sampler.training_losses(
+                model=self.ema_model,
+                x_start=imgs,
+                cond=feats,
+                t=t,
+                model_kwargs={"cond": feats},
+            )
+            loss_cond = losses_cond["loss"].mean()
+
+            # ── Loss with shuffled conditioning ──────────────────────────
+            # Permute genomic vectors within the batch so each image is
+            # paired with a random (likely wrong) patient's features.
+            feats_shuffled = feats[perm]
+            losses_shuffled = self.sampler.training_losses(
+                model=self.ema_model,
+                x_start=imgs,
+                cond=feats_shuffled,
+                t=t,                    # same noise timesteps for fair comparison
+                model_kwargs={"cond": feats_shuffled},
+            )
+            loss_shuffled = losses_shuffled["loss"].mean()
+
+        if self.global_rank == 0:
+            gap = (loss_shuffled - loss_cond).item()
+            self.logger.experiment.add_scalar("loss/val",          loss_cond.item(),     self.num_samples)
+            self.logger.experiment.add_scalar("loss/val_shuffled", loss_shuffled.item(), self.num_samples)
+            self.logger.experiment.add_scalar("cond/gap",          gap,                  self.num_samples)
+
+        # Lightning-native logs for callbacks (e.g. ModelCheckpoint monitor).
+        self.log("loss/val", loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("loss/val_shuffled", loss_shuffled, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+        self.log("cond/gap", loss_shuffled - loss_cond, on_step=False, on_epoch=True, prog_bar=False, logger=True, sync_dist=True)
+
+        # Accumulate for on_validation_epoch_end summary log line.
+        if not hasattr(self, "_val_losses"):
+            self._val_losses: list = []
+        self._val_losses.append(loss_cond.item())
+        if not hasattr(self, "_val_gaps"):
+            self._val_gaps: list = []
+        self._val_gaps.append((loss_shuffled - loss_cond).item())
+
+        return loss_cond
+
+    def on_validation_epoch_end(self) -> None:
+        """Log a one-line summary of the completed validation pass."""
+        if self.trainer.sanity_checking:
+            return
+        if not getattr(self, "_val_losses", None):
+            return
+        if self.global_rank == 0:
+            mean_loss = sum(self._val_losses) / len(self._val_losses)
+            mean_gap  = sum(self._val_gaps)   / len(self._val_gaps)
+            log.info(
+                "step %6d | samples %10d | loss/val %.4f | cond/gap %.6e  (%d batches)",
+                self.global_step, self.num_samples,
+                mean_loss, mean_gap, len(self._val_losses),
+            )
+        self._val_losses = []
+        self._val_gaps   = []
+
+    # ------------------------------------------------------------------
+    # Disable LPIPS/FID evaluation (requires feat_extractor which is None)
+    # ------------------------------------------------------------------
+
+    def evaluate_scores(self) -> None:
+        """No-op: parent's LPIPS/FID evaluation calls feat_extractor.extract_feats()
+        which is None in genomic mode.  We use loss/val and cond/gap instead."""
+        pass
+
+    def log_sample(self, x_start, cond):
+        """Skip reconstruction logging at sample 0 to avoid startup OOM.
+
+        MoPaDi's timing helper treats ``num_samples == 0`` as an active logging
+        window. In large 512x512 runs, that triggers an expensive model+EMA
+        reconstruction pass immediately at startup, which can exceed GPU memory.
+        """
+        if self.num_samples <= 0:
+            return
+        return super().log_sample(x_start, cond)
+
+    # ------------------------------------------------------------------
+    # Sanity check (replaces parent's WebDataset-specific check)
+    # ------------------------------------------------------------------
+
+    def on_fit_start(self) -> None:
+        """Lightweight sanity check on the ZIP genomic dataset.
+
+        The parent implementation calls ``expand_shards()`` which expects tar
+        shards and would raise an error with our ZIP-based dataset.  We
+        replace it with a single-batch check that verifies shape and dtype.
+        """
+        actual_world_size = get_world_size()
+        expected_world_size = int(getattr(self, "expected_world_size", 1))
+        if expected_world_size > 1 and actual_world_size != expected_world_size:
+            raise RuntimeError(
+                "Distributed world-size mismatch: requested "
+                f"{expected_world_size} GPU ranks but got world_size={actual_world_size}. "
+                "This usually means Lightning fell back to single-GPU execution. "
+                "Check SLURM env and trainer strategy before launching a long run."
+            )
+
+        if self.global_rank != 0:
+            return
+
+        log.info(
+            "Distributed setup: world_size=%d, global_rank=%d, local_rank=%d",
+            actual_world_size,
+            self.global_rank,
+            self.local_rank,
+        )
+
+        loader = self.conf.make_loader(
+            self.train_data,
+            shuffle=False,
+            batch_size=min(4, len(self.train_data)),
+            num_worker=1,
+        )
+        try:
+            batch = next(iter(loader))
+        except StopIteration:
+            raise RuntimeError(
+                "Training dataset is empty — check zip_dir, genomic_feature_dir "
+                "and patient_splits_path."
+            )
+
+        img = batch["img"]
+        feat = batch["feat"]
+
+        if img.dim() == 5:
+            # Bag mode: (B, N, C, H, W)
+            _B, _N, C, H, W = img.shape
+            if C != 3 or H != self.conf.img_size or W != self.conf.img_size:
+                raise RuntimeError(
+                    f"Unexpected bag image shape: {tuple(img.shape)}, "
+                    f"expected (B, N, 3, {self.conf.img_size}, {self.conf.img_size})"
+                )
+        else:
+            # Single-tile mode: (B, C, H, W)
+            if img.shape[1] != 3 or img.shape[2] != self.conf.img_size or img.shape[3] != self.conf.img_size:
+                raise RuntimeError(
+                    f"Unexpected image shape: {tuple(img.shape)}, "
+                    f"expected (B, 3, {self.conf.img_size}, {self.conf.img_size})"
+                )
+        if feat.shape[1] != self.conf.feat_dim:
+            raise RuntimeError(
+                f"Unexpected feat shape: {tuple(feat.shape)}, "
+                f"expected (B, {self.conf.feat_dim})"
+            )
+
+        log.info(
+            "[sanity] img %s %s  |  feat %s %s  ✓",
+            tuple(img.shape), img.dtype,
+            tuple(feat.shape), feat.dtype,
+        )

@@ -8,6 +8,8 @@ cell segmentation and classification for histopathology tiles.
 Components:
     - train_subtype_classifier: Train Basal-vs-LumA classifier on Virchow2 H5 features
     - evaluate_subtype_classifier: Evaluate subtype classifier on val/test splits
+    - cv_subtype_classifier: Cross-validated classifier with bootstrap CIs
+    - evaluate_generated_tiles: Evaluate classifier on generated tile features
     - extract_virchow2_features: Extract Virchow2 features from generated tiles and
       save as per-patient H5 files compatible with the subtype classifier pipeline
     - segment_and_classify_cells: Run DeepCMorph cell segmentation on H&E tiles
@@ -16,6 +18,8 @@ Components:
 Usage:
     python -m src.classifier.train_subtype_classifier --help
     python -m src.classifier.evaluate_subtype_classifier --help
+    python -m src.classifier.cv_subtype_classifier --help
+    python -m src.classifier.evaluate_generated_tiles --help
     python -m src.classifier.extract_virchow2_features --help
     python -m src.classifier.segment_and_classify_cells --help
 """
@@ -129,3 +133,52 @@ def run_subtype_classifier(cfg: Dict[str, Any], verbose: bool = True) -> None:
             print(f"[SubtypeClassifier] model_path: {model_path}")
             print(f"[SubtypeClassifier] output_dir: {eval_dir}")
         eval_main(eval_args)
+
+
+def run_cv_subtype_classifier(cfg: Dict[str, Any], verbose: bool = True) -> None:
+    """Cross-validated Basal-vs-LumA classifier with bootstrap CIs.
+
+    Expected config section (``subtype_classifier_cv``):
+      features_dir:           path to Virchow2 H5 directory
+      output_dir:             experiment output directory
+      label_csv_path:         optional path to label CSV
+      patient_col:            optional patient column name
+      subtype_col:            optional subtype column name
+      max_tiles_per_patient:  optional int
+      seed:                   optional int (default 42)
+      n_folds:                optional int (default 5)
+      n_bootstrap:            optional int (default 1000)
+      solver:                 optional str (default liblinear)
+      Cs:                     optional list of floats
+      max_iter:               optional int (default 2000)
+      class_weight:           optional str (default balanced)
+    """
+    from .cv_subtype_classifier import run_cv_pipeline
+
+    if verbose:
+        print("[CVClassifier] Starting cross-validated classifier pipeline")
+        print(f"[CVClassifier] features_dir: {cfg.get('features_dir')}")
+        print(f"[CVClassifier] output_dir: {cfg.get('output_dir')}")
+
+    run_cv_pipeline(cfg)
+
+
+def run_generated_subtype_eval(cfg: Dict[str, Any], verbose: bool = True) -> None:
+    """Evaluate trained classifier on generated tile Virchow2 features.
+
+    Expected config section (``generated_subtype_eval``):
+      model_path:              path to final model joblib
+      generated_features_dir:  path with Basal/ and LumA/ H5 subdirectories
+      output_dir:              evaluation output directory
+      cv_summary_path:         optional path to cv_summary.json for comparison
+      max_tiles_per_patient:   optional int
+      seed:                    optional int (default 42)
+    """
+    from .evaluate_generated_tiles import run_generated_eval_pipeline
+
+    if verbose:
+        print("[GenSubtypeEval] Evaluating classifier on generated tiles")
+        print(f"[GenSubtypeEval] model_path: {cfg.get('model_path')}")
+        print(f"[GenSubtypeEval] features_dir: {cfg.get('generated_features_dir')}")
+
+    run_generated_eval_pipeline(cfg)

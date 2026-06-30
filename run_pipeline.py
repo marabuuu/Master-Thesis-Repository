@@ -24,31 +24,13 @@ if mopadi_src.exists() and str(mopadi_src) not in sys.path:
 
 
 def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[str, Any]:
-    """
-    Recursively resolve relative paths in config relative to repo_root.
-    
-    Converts paths like "./data/..." or "experiments/..." to absolute paths
-    based on the repository root. Leaves absolute paths unchanged.
-    
-    Parameters
-    ----------
-    config_dict : Dict[str, Any]
-        Configuration dictionary (may contain nested dicts and lists)
-    repo_root : Path
-        Repository root directory to use as base for relative paths
-    
-    Returns
-    -------
-    Dict[str, Any]
-        Configuration with resolved paths
-    """
+    """Recursively resolve relative paths in *config_dict* against *repo_root*."""
     def _resolve_path(value: str) -> str:
         repo_candidate = (repo_root / value).resolve()
         normalized = value[2:] if value.startswith("./") else value
 
-        # In this workspace layout, `data/`, `dataframes/`, and `experiments/`
-        # are siblings of the repository root.
-        # of the repository root. Use parent fallback when needed.
+        # data/, dataframes/, experiments/ are siblings of the repo root
+
         if normalized.startswith(("data/", "dataframes/", "experiments/")):
             parent_candidate = (repo_root.parent / normalized).resolve()
             if parent_candidate.exists() or not repo_candidate.exists():
@@ -80,21 +62,7 @@ def resolve_config_paths(config_dict: Dict[str, Any], repo_root: Path) -> Dict[s
 
 
 def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str, Any]:
-    """
-    Load configuration from YAML file and resolve relative paths.
-    
-    Parameters
-    ----------
-    config_path : str
-        Path to config.yaml file
-    repo_root : Path, optional
-        Repository root for resolving relative paths. If None, inferred from config_path.
-    
-    Returns
-    -------
-    Dict[str, Any]
-        Configuration with resolved paths
-    """
+    """Load config from YAML and resolve relative paths."""
     with open(config_path, "r") as f:
         config = yaml.safe_load(f)
     
@@ -110,10 +78,30 @@ def load_config(config_path: str, repo_root: Optional[Path] = None) -> Dict[str,
     return config
 
 
+_CFG_TRAINING_STAGES = {
+    "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest",
+    "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256",
+    "brca_pam50_cfg_v2_1hot_norm_256", "brca_pam50_cfg_v2_1hot_smoketest",
+    "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx",
+    "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M",
+    "poc_128_1hot_norm_30M",
+    "poc_128_zero", "poc_128_zero_30M",
+    "poc_128_noise", "poc_128_noise_30M",
+    "poc_128_rna", "poc_128_rna_30M",
+    "poc_128_class_embed_30M",
+}
+
+
 def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose: bool = True) -> None:
     """Run a specific pipeline stage based on config."""
     
-    if stage == "evaluation":
+    if stage == "downscale_tiles":
+        from src.preprocessing.downscale_tiles import run_downscale_tiles
+        if "downscale_tiles" not in config:
+            raise ValueError("No 'downscale_tiles' section in config.yaml")
+        run_downscale_tiles(config["downscale_tiles"], verbose=verbose)
+
+    elif stage == "evaluation":
         from src.quality_assurance import run_evaluation
         if "evaluation" not in config:
             raise ValueError("No 'evaluation' section in config.yaml")
@@ -130,72 +118,29 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         import sys as _sys
         _sys.argv = ["get_tiles_within_rois", "--config", config_path]
         run_roi_filter()
-    
-    elif stage == "encoding":
-        print(f"[INFO] Encoding stage not yet configured in this CLI")
-        print(f"       Run: python -m src.encoding.encode_genomics --config {config_path}")
-    
-    elif stage == "extract_joint_latents":
-        from src.joint_training.train import extract_latents
-        if "extract_joint_latents" not in config:
-            raise ValueError("No 'extract_joint_latents' section in config.yaml")
-        if "joint_training" not in config:
-            raise ValueError("No 'joint_training' section in config.yaml to provide model definitions")
-        extract_cfg = config["extract_joint_latents"]
 
-        section = extract_cfg.get("section", "joint_training")
-        if section == "joint_training":
-            joint_cfg = config["joint_training"].copy()
-            expected_variant = "joint_training"
-        else:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
-
-            _repo_root = Path(config_path).resolve().parent.parent
-            _full_cfg = _resolve_config_paths(dict(config), _repo_root)
-            if section not in _full_cfg:
-                raise ValueError(f"No '{section}' section in config.yaml")
-            _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
-            _overrides = _full_cfg[section]
-            joint_cfg = _deep_update(_base, _overrides)
-            expected_variant = (
-                "gene_token_cross_attention_joint_training"
-                if section.startswith("gene_token_cross_attention_")
-                else "gene_token_transformer_joint_training"
-            )
-        
-        # Enforce output directory override
-        joint_cfg["latent_dir"] = extract_cfg.get("out_dir")
-        
-        if verbose:
-            print(f"[INFO] Extracting joint latents from {extract_cfg.get('ckpt')}...")
-            print(f"[INFO] Latent extraction section: {section}")
-            
-        extract_latents(
-            joint_cfg=joint_cfg,
-            ckpt_path=extract_cfg.get("ckpt"),
-            split=extract_cfg.get("split", "all"),
-            verbose=verbose,
-            expected_variant=expected_variant,
-        )
+    elif stage == "tar_to_tumor_zip":
+        from src.preprocessing.tar_to_tumor_zip import main as run_tar_to_tumor_zip
+        if "tar_to_tumor_zip" not in config:
+            raise ValueError("No 'tar_to_tumor_zip' section in config.yaml")
+        import sys as _sys
+        _sys.argv = ["tar_to_tumor_zip", "--config", config_path]
+        run_tar_to_tumor_zip()
     
     elif stage == "visualize_latents":
         from src.visualization.visualize_latents import run_visualizations
         if "visualize_latents" not in config:
             raise ValueError("No 'visualize_latents' section in config.yaml")
         run_visualizations(config["visualize_latents"], verbose=verbose)
-    
-    elif stage == "joint_training":
-        from src.joint_training.train import run_joint_training
-        if "joint_training" not in config:
-            raise ValueError("No 'joint_training' section in config.yaml")
-        run_joint_training(config["joint_training"], verbose=verbose)
 
-    elif stage == "training":
-        print(f"[INFO] Training stage not yet configured in this CLI")
-        print(f"       Run: python -m src.training.train_genomic_autoenc --config {config_path}")
+    elif stage == "poc_breast_vs_liver_visualize_latents":
+        from src.visualization.visualize_latents import run_visualizations
+        if "poc_breast_vs_liver_visualize_latents" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_visualize_latents' section in config.yaml")
+        run_visualizations(config["poc_breast_vs_liver_visualize_latents"], verbose=verbose)
     
     elif stage == "dataset_statistics":
-        from src.statistics.dataset_statistics import run_dataset_statistics
+        from src.visualization.dataset_statistics import run_dataset_statistics
         if "dataset_statistics" not in config:
             raise ValueError("No 'dataset_statistics' section in config.yaml")
         run_dataset_statistics(config["dataset_statistics"], verbose=verbose)
@@ -212,10 +157,6 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         finally:
             sys.argv = old_argv
 
-    elif stage == "sampling":
-        print(f"[INFO] Sampling stage not yet configured in this CLI")
-        print(f"       Run: python -m src.sampling.sample_from_model --config {config_path}")
-    
     elif stage == "reconstruction":
         from src.reconstruction import run_reconstruction
         if "reconstruction" not in config:
@@ -227,6 +168,42 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         if "segmentation" not in config:
             raise ValueError("No 'segmentation' section in config.yaml")
         run_segmentation(config["segmentation"], verbose=verbose)
+
+    elif stage == "tfd_separability":
+        from src.quality_assurance.tfd_separability import run_tfd_separability
+        if "tfd_separability" not in config:
+            raise ValueError("No 'tfd_separability' section in config.yaml")
+        run_tfd_separability(config["tfd_separability"], verbose=verbose)
+
+    elif stage == "tfd_separability_poc":
+        from src.quality_assurance.tfd_separability import run_tfd_separability
+        if "tfd_separability_poc" not in config:
+            raise ValueError("No 'tfd_separability_poc' section in config.yaml")
+        run_tfd_separability(config["tfd_separability_poc"], verbose=verbose)
+
+    elif stage == "tfd_separability_viz":
+        from src.visualization.tfd_separability import run_tfd_separability_viz
+        if "tfd_separability_viz" not in config:
+            raise ValueError("No 'tfd_separability_viz' section in config.yaml")
+        run_tfd_separability_viz(config["tfd_separability_viz"], verbose=verbose)
+
+    elif stage == "tfd_separability_viz_poc":
+        from src.visualization.tfd_separability import run_tfd_separability_viz_cohort
+        if "tfd_separability_viz_poc" not in config:
+            raise ValueError("No 'tfd_separability_viz_poc' section in config.yaml")
+        run_tfd_separability_viz_cohort(config["tfd_separability_viz_poc"], verbose=verbose)
+
+    elif stage == "tfd_separability_viz_subtype":
+        from src.visualization.tfd_separability import run_tfd_separability_viz_subtype
+        if "tfd_separability_viz_subtype" not in config:
+            raise ValueError("No 'tfd_separability_viz_subtype' section in config.yaml")
+        run_tfd_separability_viz_subtype(config["tfd_separability_viz_subtype"], verbose=verbose)
+
+    elif stage == "tfd_separability_generated":
+        from src.quality_assurance.tfd_separability import run_tfd_separability_from_dirs
+        if "tfd_separability_generated" not in config:
+            raise ValueError("No 'tfd_separability_generated' section in config.yaml")
+        run_tfd_separability_from_dirs(config["tfd_separability_generated"], verbose=verbose)
 
     elif stage == "virchow2_extraction":
         from src.classifier import run_virchow2_extraction
@@ -242,66 +219,100 @@ def run_stage(config: Dict[str, Any], stage: str, config_path: str = "", verbose
         cfg.setdefault("config_path", config_path)
         run_subtype_classifier(cfg, verbose=verbose)
 
+    elif stage == "subtype_classifier_cv":
+        from src.classifier import run_cv_subtype_classifier
+        if "subtype_classifier_cv" not in config:
+            raise ValueError("No 'subtype_classifier_cv' section in config.yaml")
+        cfg = dict(config["subtype_classifier_cv"])
+        cfg.setdefault("_config_path", config_path)
+        run_cv_subtype_classifier(cfg, verbose=verbose)
+
+    elif stage == "generated_subtype_eval":
+        from src.classifier import run_generated_subtype_eval
+        if "generated_subtype_eval" not in config:
+            raise ValueError("No 'generated_subtype_eval' section in config.yaml")
+        run_generated_subtype_eval(dict(config["generated_subtype_eval"]), verbose=verbose)
+
     elif stage == "build_genomic_features":
         from src.preprocessing.build_genomic_features import run_build_genomic_features
-        if "mopadi_genomic_training" not in config:
-            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
-        run_build_genomic_features(config["mopadi_genomic_training"], verbose=verbose)
+        if "build_genomic_features" not in config:
+            raise ValueError("No 'build_genomic_features' section in config.yaml")
+        run_build_genomic_features(config["build_genomic_features"], verbose=verbose)
 
-    elif stage == "mopadi_genomic_training":
-        from src.mopadi_genomic.run_genomic_training import run_genomic_training
-        if "mopadi_genomic_training" not in config:
-            raise ValueError("No 'mopadi_genomic_training' section in config.yaml")
-        run_genomic_training(config["mopadi_genomic_training"], verbose=verbose)
+    elif stage == "poc_breast_vs_liver_genomic_features":
+        from src.preprocessing.build_genomic_features import run_build_genomic_features
+        if "poc_breast_vs_liver_genomic_features" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_genomic_features' section in config.yaml")
+        run_build_genomic_features(config["poc_breast_vs_liver_genomic_features"], verbose=verbose)
 
-    elif stage in ("gtca_training", "gtca_nocfg", "gtca_scratch"):
-        # Gene-token cross-attention training — three variants sharing one train function.
-        #   gtca_training : mopadi init, cond_dropout=0.15 (CFG, for guidance experiments)
-        #   gtca_nocfg    : mopadi init, cond_dropout=0.0  (no uncond path; zero-cond → noise)
-        #   gtca_scratch  : random init, cond_dropout=0.0  (fully from scratch baseline)
-        from src.gene_token_cross_attention_joint_training.train import (
-            run_gene_token_cross_attention_training,
-        )
-        try:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update, _resolve_config_paths
-        except ImportError:
-            from src.gene_token_cross_attention_joint_training.train import _deep_update
-            _resolve_config_paths = lambda cfg, _: cfg  # noqa: E731
+    elif stage == "gene_manipulation":
+        from src.reconstruction.manipulate_tiles import run_manipulation
+        if "gene_manipulation" not in config:
+            raise ValueError("No 'gene_manipulation' section in config.yaml")
+        run_manipulation(config["gene_manipulation"])
 
-        from pathlib import Path as _Path
-        _repo_root = _Path(config_path).resolve().parent.parent
-        _full_cfg = _resolve_config_paths(dict(config), _repo_root)
+    elif stage == "genomic_adapter_training":
+        from src.drafts.genomic_adapter.run_training import run_gda_training
+        if "genomic_adapter_training" not in config:
+            raise ValueError("No 'genomic_adapter_training' section in config.yaml")
+        run_gda_training(config["genomic_adapter_training"], verbose=verbose)
 
-        _section_map = {
-            "gtca_training": "gene_token_cross_attention_joint_training",
-            "gtca_nocfg":    "gene_token_cross_attention_nocfg_training",
-            "gtca_scratch":  "gene_token_cross_attention_scratch_training",
-        }
-        _section = _section_map[stage]
-        if _section not in _full_cfg:
-            raise ValueError(f"No '{_section}' section in config.yaml")
-        _base = _full_cfg.get("gene_token_transformer_joint_training", _full_cfg.get("joint_training", {}))
-        _overrides = _full_cfg[_section]
-        _joint_cfg = _deep_update(_base, _overrides)
-        run_gene_token_cross_attention_training(_joint_cfg, verbose=verbose)
+    elif stage == "poc_breast_vs_liver_gda":
+        from src.drafts.genomic_adapter.run_training import run_gda_training
+        if "poc_breast_vs_liver_gda" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_gda' section in config.yaml")
+        run_gda_training(config["poc_breast_vs_liver_gda"], verbose=verbose)
+
+    elif stage == "poc_breast_vs_liver_cfg":
+        from src.drafts.genomic_adapter.run_training import run_gda_training
+        if "poc_breast_vs_liver_cfg" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_cfg' section in config.yaml")
+        run_gda_training(config["poc_breast_vs_liver_cfg"], verbose=verbose)
+
+    elif stage == "poc_breast_vs_liver_cfg_brca_init":
+        from src.drafts.genomic_adapter.run_training import run_gda_training
+        if "poc_breast_vs_liver_cfg_brca_init" not in config:
+            raise ValueError("No 'poc_breast_vs_liver_cfg_brca_init' section in config.yaml")
+        run_gda_training(config["poc_breast_vs_liver_cfg_brca_init"], verbose=verbose)
+
+    elif stage == "brca_pam50_cfg":
+        from src.drafts.genomic_adapter.run_training import run_gda_training
+        if "brca_pam50_cfg" not in config:
+            raise ValueError("No 'brca_pam50_cfg' section in config.yaml")
+        run_gda_training(config["brca_pam50_cfg"], verbose=verbose)
+
+    elif stage in _CFG_TRAINING_STAGES:
+        from src.model_training.run_cfg_training import run_cfg_training
+        if stage not in config:
+            raise ValueError(f"No '{stage}' section in config.yaml")
+        run_cfg_training(config[stage], verbose=verbose)
+
+    elif stage == "virchow2_umap":
+        from src.visualization.virchow2_umap import run_virchow2_umap
+        if "virchow2_umap" not in config:
+            raise ValueError("No 'virchow2_umap' section in config.yaml")
+        run_virchow2_umap(config["virchow2_umap"], verbose=verbose)
+
+    elif stage == "virchow2_umap_cohort":
+        from src.visualization.virchow2_umap import run_virchow2_umap
+        if "virchow2_umap_cohort" not in config:
+            raise ValueError("No 'virchow2_umap_cohort' section in config.yaml")
+        run_virchow2_umap(config["virchow2_umap_cohort"], verbose=verbose)
 
     elif stage == "all":
         print("[INFO] Running all stages in sequence...")
-        for s in ["preprocessing", "encoding", "training", "sampling", "evaluation"]:
+        for s in ["preprocessing", "evaluation"]:
             print(f"\n{'='*70}")
             print(f"STAGE: {s.upper()}")
             print(f"{'='*70}\n")
             try:
                 run_stage(config, s, config_path, verbose=verbose)
             except Exception as e:
-                if "not yet configured" not in str(e):
-                    print(f"[ERROR] Stage '{s}' failed: {e}")
-                    return
+                print(f"[ERROR] Stage '{s}' failed: {e}")
+                return
     
     else:
-        raise ValueError(
-            f"Unknown stage: {stage}. Choose from: preprocessing, encoding, extract_joint_latents, visualize_latents, joint_training, gtca_training, gtca_nocfg, gtca_scratch, training, dataset_statistics, training_stats, sampling, reconstruction, segmentation, subtype_classifier, build_genomic_features, mopadi_genomic_training, evaluation, all"
-        )
+        raise ValueError(f"Unknown stage: '{stage}'")
 
 
 def main():
@@ -332,7 +343,7 @@ Examples:
         "--stage",
         type=str,
         required=True,
-        choices=["preprocessing", "encoding", "extract_joint_latents", "visualize_latents", "joint_training", "gtca_training", "gtca_nocfg", "gtca_scratch", "training", "dataset_statistics", "training_stats", "sampling", "reconstruction", "segmentation", "subtype_classifier", "build_genomic_features", "mopadi_genomic_training", "evaluation", "all"],
+        choices=["downscale_tiles", "preprocessing", "tar_to_tumor_zip", "visualize_latents", "poc_breast_vs_liver_visualize_latents", "dataset_statistics", "training_stats", "reconstruction", "segmentation", "tfd_separability", "tfd_separability_poc", "tfd_separability_viz", "tfd_separability_viz_poc", "tfd_separability_viz_subtype", "tfd_separability_generated", "subtype_classifier", "subtype_classifier_cv", "generated_subtype_eval", "build_genomic_features", "poc_breast_vs_liver_genomic_features", "gene_manipulation", "genomic_adapter_training", "poc_breast_vs_liver_gda", "poc_breast_vs_liver_cfg", "poc_breast_vs_liver_cfg_brca_init", "brca_pam50_cfg", "brca_pam50_cfg_v2", "brca_pam50_cfg_v2_smoketest", "brca_pam50_cfg_v2_1hot", "brca_pam50_cfg_v2_1hot_256", "brca_pam50_cfg_v2_1hot_norm_256", "brca_pam50_cfg_v2_1hot_smoketest", "poc_brca_lihc_cfg_v2", "poc_brca_lihc_cfg_v2_dgx", "poc_128_1hot", "poc_128_1hot_nonorm", "poc_128_1hot_nonorm_30M", "poc_128_1hot_norm_30M", "poc_128_zero", "poc_128_zero_30M", "poc_128_noise", "poc_128_noise_30M", "poc_128_rna", "poc_128_rna_30M", "poc_128_class_embed_30M", "virchow2_umap", "virchow2_umap_cohort", "evaluation", "all"],
         help="Pipeline stage to run",
     )
     

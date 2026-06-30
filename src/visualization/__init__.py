@@ -63,6 +63,7 @@ from .latent_space import (
     compute_silhouette,
     compute_tsne,
     compute_umap,
+    plot_composite_latent_analysis,
     plot_cosine_distance_clustermap,
     plot_dendrogram,
     plot_kmeans_confusion,
@@ -83,6 +84,17 @@ from .training_plots import (
     plot_train_val_comparison,
     plot_training_summary,
 )
+from .tfd_separability import (
+    build_cell_type_palette,
+    plot_channel_contributions,
+    plot_radar_channel_contributions,
+    plot_cell_type_boxplots,
+    plot_tile_mask_examples,
+    plot_ternary_composition,
+    plot_nn_distance_violins,
+    plot_cross_type_proximity_heatmaps,
+    run_tfd_separability_viz,
+)
 
 __all__ = [
     # core
@@ -92,6 +104,7 @@ __all__ = [
     "save_figure",
     "show_or_save",
     "build_label_palette",
+    "build_cell_type_palette",
     # embedding I/O
     "load_embedding",
     "collect_embeddings",
@@ -113,6 +126,7 @@ __all__ = [
     "plot_silhouette_per_group",
     "plot_dendrogram",
     "plot_kmeans_confusion",
+    "plot_composite_latent_analysis",
     # distributions
     "plot_countplot",
     "plot_stacked_bar",
@@ -125,4 +139,13 @@ __all__ = [
     "plot_early_stopping",
     "plot_training_summary",
     "plot_run_comparison",
+    # tfd separability
+    "plot_channel_contributions",
+    "plot_radar_channel_contributions",
+    "plot_cell_type_boxplots",
+    "plot_tile_mask_examples",
+    "plot_ternary_composition",
+    "plot_nn_distance_violins",
+    "plot_cross_type_proximity_heatmaps",
+    "run_tfd_separability_viz",
 ]
