@@ -258,6 +258,60 @@ poc_128_1hot_nonorm_30M:
   base_dir: ./experiments/20260605_poc_128_orthogonal_nonorm_30M
   logdir: ./experiments/20260605_poc_128_orthogonal_nonorm_30M/gda
 
+poc_128_1hot_norm_30M:
+  training_mode: cfg_backbone
+  conditioning_type: one_hot
+  normalize_feats: true
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ./data/PoC-BRCA-LIHC-tumor-tiles-128
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    TCGA-BRCA: 300
+    TCGA-LIHC: null
+
+  backbone_ckpt_path: ""
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 128
+  net_ch: 64
+  net_ch_mult: [1, 2, 4, 8]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  cfg_dropout: 0.15
+
+  backbone_lr: 2.0e-4
+  batch_size: 32
+  accum_batches: 1
+  total_samples: 30000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 100000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 25000
+  sample_size: 8
+  seed: 42
+  num_workers: 8
+  gpus: [0, 1, 2, 3]
+
+  output_dir: ./experiments/20260622_poc_128_orthogonal_norm_30M
+  base_dir: ./experiments/20260622_poc_128_orthogonal_norm_30M
+  logdir: ./experiments/20260622_poc_128_orthogonal_norm_30M/gda
+
 poc_128_class_embed_30M:
   training_mode: cfg_backbone
   conditioning_type: class_embed
@@ -705,6 +759,69 @@ brca_pam50_cfg_v2_1hot_256:
   output_dir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256
   base_dir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256
   logdir: ./experiments/20260621_brca_pam50_cfg_v2_1hot_256/gda
+
+brca_pam50_cfg_v2_1hot_norm_256:
+  training_mode: cfg_backbone
+  conditioning_type: one_hot
+  normalize_feats: true
+
+  # ── Data ─────────────────────────────────────────────────────────────────
+  zip_dir: ../data/BRCA-tumor-tiles-256
+  genomic_feature_dir: null
+  patient_splits_path: ./experiments/20260528_genomic_features/patient_splits.json
+
+  max_tiles_by_subtype:
+    LumA: 45
+    LumB: 120
+    Basal: 135
+    Her2: 300
+    Normal: null
+
+  backbone_ckpt_path: ""
+  val_swap_basal_luma: true
+  do_resize: false
+
+  # ── Architecture ─────────────────────────────────────────────────────────
+  img_size: 256
+  net_ch: 128
+  net_ch_mult: [1, 1, 2, 2, 4, 4]
+  net_attn: [16]
+  net_num_res_blocks: 2
+  style_ch: 512
+  feat_dim: 512
+  T: 1000
+  T_eval: 20
+  net_beatgans_gradient_checkpoint: false
+
+  # ── CFG ──────────────────────────────────────────────────────────────────
+  cfg_dropout: 0.15
+
+  # ── Optimisation ─────────────────────────────────────────────────────────
+  backbone_lr: 1.0e-4
+  batch_size: 64
+  accumulate_grad_batches: 1
+  total_samples: 200000000
+  ema_decay: 0.9999
+  grad_clip: 1.0
+  fp16: false
+  bf16: true
+
+  # ── Logging / checkpointing ───────────────────────────────────────────────
+  val_every_steps: 2000
+  limit_val_batches: 100
+  save_every_samples: 50000
+  save_top_k: 3
+  monitor_metric: loss/val_ckpt
+  reconstruct_every_samples: 50000
+  sample_size: 8
+  seed: 42
+  num_workers: 16
+  gpus: [0, 1, 2, 3]
+
+  # ── Output ───────────────────────────────────────────────────────────────
+  output_dir: ./experiments/20260624_brca_pam50_cfg_v2_1hot_norm_256
+  base_dir: ./experiments/20260624_brca_pam50_cfg_v2_1hot_norm_256
+  logdir: ./experiments/20260624_brca_pam50_cfg_v2_1hot_norm_256/gda
 
 # ═════════════════
 # 5. EVALUATION

@@ -58,7 +58,11 @@ COHORT_INDEX: Dict[str, int] = {"TCGA-BRCA": 0, "TCGA-LIHC": 1}
 
 
 def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict[str, torch.Tensor]:
-    """Return alternating binary codes for BRCA (odd indices) and LIHC (even indices)."""
+    """Return alternating binary codes for BRCA and LIHC.
+
+    Must match _make_orthogonal_codes(["TCGA-BRCA", "TCGA-LIHC"], feat_dim):
+    BRCA (sorted index 0) → even positions, LIHC (sorted index 1) → odd positions.
+    """
     if feat_dim < 2:
         raise ValueError(f"feat_dim must be at least 2, got {feat_dim}")
     if feat_dim % 2 != 0:
@@ -68,8 +72,8 @@ def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict
 
     brca = torch.zeros(feat_dim, dtype=torch.float32)
     lihc = torch.zeros(feat_dim, dtype=torch.float32)
-    brca[1::2] = 1.0
-    lihc[0::2] = 1.0
+    brca[0::2] = 1.0
+    lihc[1::2] = 1.0
 
     if normalize:
         brca = F.normalize(brca, p=2, dim=-1)
@@ -77,7 +81,7 @@ def _make_orthogonal_binary_codes(feat_dim: int, normalize: bool = True) -> Dict
 
     dot = torch.dot(brca, lihc).item()
     log.info(
-        "Synthetic one_hot conditioning: BRCA=0101..., LIHC=1010..., "
+        "Synthetic one_hot conditioning: BRCA=1010..., LIHC=0101..., "
         "normalize=%s, dot=%.1f, norms=(%.3f, %.3f), feat_dim=%d",
         normalize, dot, float(brca.norm().item()), float(lihc.norm().item()), feat_dim,
     )

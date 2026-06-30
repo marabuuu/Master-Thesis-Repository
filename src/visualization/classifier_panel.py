@@ -52,7 +52,7 @@ from src.visualization.training_plots import (
 # ── fixed paths ──────────────────────────────────────────────────────────────
 CV_DIR = _EXP / "20260618_subtype_classifier_cv"
 CV_RESULTS = CV_DIR / "cv_results"
-GEN_EVAL = CV_DIR / "generated_eval"
+GEN_EVAL = CV_DIR / "generated_eval_10k"
 OUT = CV_DIR / "classifier_panel.png"
 
 # ── colours ──────────────────────────────────────────────────────────────────
@@ -97,11 +97,7 @@ def _load_gen_patients() -> pd.DataFrame:
 
 # ── panel A: ROC — per-fold lines + aggregate CI ─────────────────────────────
 
-def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict,
-                  n_bootstrap: int = 1000, seed: int = 42) -> None:
-    base_fpr = np.linspace(0, 1, 200)
-
-    # Per-fold curves
+def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict) -> None:
     for fold_i in sorted(oof_df["fold"].unique()):
         fdf = oof_df[oof_df["fold"] == fold_i]
         fy = fdf["y_true"].to_numpy(dtype=np.int64)
@@ -111,43 +107,22 @@ def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict,
         f_fpr, f_tpr, _ = roc_curve(fy, fp)
         f_auc = roc_auc_score(fy, fp)
         ax.plot(f_fpr, f_tpr, color=FOLD_COLORS[fold_i], lw=0.9, alpha=0.6,
+                drawstyle="steps-post",
                 label=f"Fold {fold_i} = {f_auc:.3f}")
 
-    # Bootstrap CI band
     y = oof_df["y_true"].to_numpy(dtype=np.int64)
     p = oof_df["p_pos"].to_numpy(dtype=np.float64)
     fpr, tpr, _ = roc_curve(y, p)
     auc_val = roc_auc_score(y, p)
     ci = cv_summary["bootstrap_ci"]["tile_roc_auc"]
 
-    rng = np.random.RandomState(seed)
-    pids = oof_df["patient_id"].unique()
-    tpr_samples = []
-    for _ in range(n_bootstrap):
-        boot_pids = rng.choice(pids, size=len(pids), replace=True)
-        bdf = pd.concat([oof_df[oof_df["patient_id"] == pid] for pid in boot_pids],
-                        ignore_index=True)
-        by = bdf["y_true"].to_numpy(dtype=np.int64)
-        bp = bdf["p_pos"].to_numpy(dtype=np.float64)
-        if len(np.unique(by)) < 2:
-            continue
-        b_fpr, b_tpr, _ = roc_curve(by, bp)
-        tpr_samples.append(np.interp(base_fpr, b_fpr, b_tpr))
-
-    tpr_stack = np.array(tpr_samples)
-    ax.fill_between(base_fpr,
-                    np.percentile(tpr_stack, 2.5, axis=0),
-                    np.percentile(tpr_stack, 97.5, axis=0),
-                    alpha=0.12, color=C_AGG, linewidth=0, zorder=0)
-
-    # Aggregate curve
-    ax.plot(fpr, tpr, color=C_AGG, lw=2.0, zorder=5,
-            label=f"Aggregate = {auc_val:.3f} [{ci['ci_lower']:.3f}, {ci['ci_upper']:.3f}]")
+    ax.plot(fpr, tpr, color=C_AGG, lw=2.0, zorder=5, drawstyle="steps-post",
+            label=f"Aggregate = {auc_val:.3f}\n[{ci['ci_lower']:.3f}, {ci['ci_upper']:.3f}]")
 
     ax.plot([0, 1], [0, 1], ls="--", color="0.65", lw=0.7)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.legend(loc="lower right", fontsize=7, framealpha=0.9)
+    ax.legend(loc="lower right", fontsize=16, framealpha=0.9)
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.02, 1.02)
     _strip_spines(ax)
@@ -155,11 +130,7 @@ def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict,
 
 # ── panel B: PR — per-fold lines + aggregate CI ─────────────────────────────
 
-def _panel_pr_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict,
-                 n_bootstrap: int = 1000, seed: int = 42) -> None:
-    base_rec = np.linspace(0, 1, 200)
-
-    # Per-fold curves
+def _panel_pr_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict) -> None:
     for fold_i in sorted(oof_df["fold"].unique()):
         fdf = oof_df[oof_df["fold"] == fold_i]
         fy = fdf["y_true"].to_numpy(dtype=np.int64)
@@ -169,41 +140,20 @@ def _panel_pr_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict,
         f_prec, f_rec, _ = precision_recall_curve(fy, fp)
         f_ap = average_precision_score(fy, fp)
         ax.plot(f_rec, f_prec, color=FOLD_COLORS[fold_i], lw=0.9, alpha=0.6,
+                drawstyle="steps-post",
                 label=f"Fold {fold_i} = {f_ap:.3f}")
 
-    # Bootstrap CI band
     y = oof_df["y_true"].to_numpy(dtype=np.int64)
     p = oof_df["p_pos"].to_numpy(dtype=np.float64)
     prec, rec, _ = precision_recall_curve(y, p)
     ap = average_precision_score(y, p)
 
-    rng = np.random.RandomState(seed)
-    pids = oof_df["patient_id"].unique()
-    prec_samples = []
-    for _ in range(n_bootstrap):
-        boot_pids = rng.choice(pids, size=len(pids), replace=True)
-        bdf = pd.concat([oof_df[oof_df["patient_id"] == pid] for pid in boot_pids],
-                        ignore_index=True)
-        by = bdf["y_true"].to_numpy(dtype=np.int64)
-        bp = bdf["p_pos"].to_numpy(dtype=np.float64)
-        if len(np.unique(by)) < 2:
-            continue
-        b_prec, b_rec, _ = precision_recall_curve(by, bp)
-        prec_samples.append(np.interp(base_rec, b_rec[::-1], b_prec[::-1]))
-
-    prec_stack = np.array(prec_samples)
-    ax.fill_between(base_rec,
-                    np.percentile(prec_stack, 2.5, axis=0),
-                    np.percentile(prec_stack, 97.5, axis=0),
-                    alpha=0.12, color=C_AGG, linewidth=0, zorder=0)
-
-    # Aggregate curve
-    ax.plot(rec, prec, color=C_AGG, lw=2.0, zorder=5,
-            label=f"Aggregate = {ap:.3f}")
+    ax.plot(rec, prec, color=C_AGG, lw=2.0, zorder=5, drawstyle="steps-post",
+            label=f"Aggregate AP = {ap:.3f}")
 
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
-    ax.legend(loc="lower left", fontsize=7, framealpha=0.9)
+    ax.legend(loc="lower left", fontsize=16, framealpha=0.9)
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.02, 1.05)
     _strip_spines(ax)
@@ -219,6 +169,7 @@ def _panel_gen_roc(ax: plt.Axes, gen_tiles: pd.DataFrame,
     r_fpr, r_tpr, _ = roc_curve(ry, rp)
     r_auc = roc_auc_score(ry, rp)
     ax.plot(r_fpr, r_tpr, color=C_AGG, lw=1.3, ls="--", alpha=0.5,
+            drawstyle="steps-post",
             label=f"Real (CV) = {r_auc:.3f}")
 
     # Generated ROC
@@ -226,13 +177,13 @@ def _panel_gen_roc(ax: plt.Axes, gen_tiles: pd.DataFrame,
     gp = gen_tiles["p_pos"].to_numpy(dtype=np.float64)
     g_fpr, g_tpr, _ = roc_curve(gy, gp)
     g_auc = roc_auc_score(gy, gp)
-    ax.plot(g_fpr, g_tpr, color=C_GEN, lw=1.8,
+    ax.plot(g_fpr, g_tpr, color=C_GEN, lw=1.8, drawstyle="steps-post",
             label=f"Generated = {g_auc:.3f}")
 
     ax.plot([0, 1], [0, 1], ls="--", color="0.65", lw=0.7)
     ax.set_xlabel("False Positive Rate")
     ax.set_ylabel("True Positive Rate")
-    ax.legend(loc="lower right", fontsize=8, framealpha=0.9)
+    ax.legend(loc="lower right", fontsize=17, framealpha=0.9)
     ax.set_xlim(-0.02, 1.02)
     ax.set_ylim(-0.02, 1.02)
     _strip_spines(ax)
@@ -270,9 +221,9 @@ def _panel_patient_dots(ax: plt.Axes, gen_patients: pd.DataFrame,
     basal_acc = (basal >= threshold).mean()
     luma_acc = (luma < threshold).mean()
     ax.text(0.97, 1.35, f"{basal_acc:.0%}", transform=ax.get_yaxis_transform(),
-            ha="right", va="top", fontsize=8, color=C_BASAL, fontweight="bold")
+            ha="right", va="top", fontsize=20, color=C_BASAL, fontweight="bold")
     ax.text(0.97, -0.35, f"{luma_acc:.0%}", transform=ax.get_yaxis_transform(),
-            ha="right", va="bottom", fontsize=8, color="0.35", fontweight="bold")
+            ha="right", va="bottom", fontsize=20, color="0.35", fontweight="bold")
 
     _strip_spines(ax)
 
@@ -281,9 +232,17 @@ def _panel_patient_dots(ax: plt.Axes, gen_patients: pd.DataFrame,
 
 def build_panel(
     output_path: Optional[str | Path] = None,
-    n_bootstrap: int = 1000,
 ) -> None:
-    plt.rcParams.update(_PAPER_RC)
+    rc_overrides = {
+        **_PAPER_RC,
+        "font.size": 19,
+        "axes.labelsize": 20,
+        "xtick.labelsize": 18,
+        "ytick.labelsize": 18,
+        "legend.fontsize": 17,
+        "axes.titlesize": 21,
+    }
+    plt.rcParams.update(rc_overrides)
 
     oof_df = _load_oof()
     cv_summary = _load_cv_summary()
@@ -292,23 +251,23 @@ def build_panel(
     gen_patients = _load_gen_patients()
     threshold = gen_eval["threshold"]
 
-    fig = plt.figure(figsize=(10, 9))
+    fig = plt.figure(figsize=(13, 11.5))
 
     gs = gridspec.GridSpec(2, 2, figure=fig,
-                           hspace=0.32, wspace=0.32,
-                           left=0.08, right=0.97,
-                           top=0.97, bottom=0.06)
+                           hspace=0.38, wspace=0.38,
+                           left=0.09, right=0.97,
+                           top=0.97, bottom=0.07)
 
     ax_a = fig.add_subplot(gs[0, 0])
     ax_b = fig.add_subplot(gs[0, 1])
     ax_c = fig.add_subplot(gs[1, 0])
     ax_d = fig.add_subplot(gs[1, 1])
 
-    print("[Panel] A: ROC with per-fold lines + bootstrap CI ...")
-    _panel_roc_cv(ax_a, oof_df, cv_summary, n_bootstrap=n_bootstrap)
+    print("[Panel] A: ROC with per-fold lines ...")
+    _panel_roc_cv(ax_a, oof_df, cv_summary)
 
-    print("[Panel] B: Precision-Recall with per-fold lines + bootstrap CI ...")
-    _panel_pr_cv(ax_b, oof_df, cv_summary, n_bootstrap=n_bootstrap)
+    print("[Panel] B: Precision-Recall with per-fold lines ...")
+    _panel_pr_cv(ax_b, oof_df, cv_summary)
 
     print("[Panel] C: Generated ROC vs real ...")
     _panel_gen_roc(ax_c, gen_tiles, oof_df)
@@ -328,9 +287,8 @@ def main() -> None:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--output", type=str, default=None)
-    p.add_argument("--n-bootstrap", type=int, default=1000)
     args = p.parse_args()
-    build_panel(output_path=args.output, n_bootstrap=args.n_bootstrap)
+    build_panel(output_path=args.output)
 
 
 if __name__ == "__main__":

@@ -2202,7 +2202,7 @@ def _annotate_two_group_bracket(
     ax.text(
         (x_a + x_b) / 2, bar_y + 0.01 * y_span,
         f"{star}  r={r_val:+.2f}{eta_str}",
-        ha="center", va="bottom", fontsize=9, color="#333333", clip_on=False,
+        ha="center", va="bottom", fontsize=14, color="#333333", clip_on=False,
         fontweight="bold",
     )
     return 0.24 * y_span
@@ -2283,7 +2283,7 @@ def plot_cell_type_boxplots_by_cohort(
     df = pd.DataFrame(records)
 
     n_ch = len(ch_indices)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=False, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=False, squeeze=False)
 
     for col_idx, (ch, ch_name) in enumerate(channels):
         ax = axes[0][col_idx]
@@ -2297,15 +2297,15 @@ def plot_cell_type_boxplots_by_cohort(
         sns.stripplot(
             data=subset, x="Cohort", y="Fraction",
             order=display_labels, color="#333333",
-            alpha=0.35, size=2.2, jitter=True, ax=ax,
+            alpha=0.35, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "")
+        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "", fontsize=14)
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
 
-    # Significance brackets — per-panel y-limits since sharey=False
     for col_idx, (ch, ch_name) in enumerate(channels):
         ax = axes[0][col_idx]
         y_min_ax, y_max_ax = ax.get_ylim()
@@ -2319,7 +2319,7 @@ def plot_cell_type_boxplots_by_cohort(
         if h > 0:
             ax.set_ylim(top=y_max_ax + h + 0.04 * y_span_ax)
 
-    fig.suptitle("Cell-Type Nuclei Composition: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.suptitle("Cell-Type Nuclei Composition: Breast vs Liver Cancer", fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / "cohort_cell_type_boxplots.png"
     save_figure(fig, out, dpi=dpi)
@@ -2400,15 +2400,15 @@ def plot_nn_distance_violins_by_cohort(
     stats_results = _run_cohort_stats(cohort_data_by_ch)
 
     n_ch = len(non_bg_channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=True, squeeze=False)
 
     for col_idx, (ch, ch_name) in enumerate(zip(non_bg_channels, ch_labels)):
         ax = axes[0][col_idx]
         subset = df[df["Cell Type"] == ch_name]
         if subset.empty:
-            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, color="grey")
+                    transform=ax.transAxes, color="grey", fontsize=14)
             continue
 
         sns.boxplot(
@@ -2419,18 +2419,18 @@ def plot_nn_distance_violins_by_cohort(
         sns.stripplot(
             data=subset, x="Cohort", y="NN Distance (px)",
             order=display_labels, color="#333333",
-            alpha=0.35, size=2.2, jitter=True, ax=ax,
+            alpha=0.35, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "")
-        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "", fontsize=14)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
         if log_scale:
             ax.set_yscale("log")
         if col_idx > 0:
             ax.tick_params(axis="y", labelleft=False)
 
-        # Text-badge significance annotation (works for both linear and log scale)
         sr = stats_results.get(ch_name, {})
         pq = sr.get("pairwise_q", {})
         pr = sr.get("pairwise_r", {})
@@ -2444,10 +2444,10 @@ def plot_nn_distance_violins_by_cohort(
             eta_str = f"\nη²={eta:.2f}" if eta == eta else ""
             ax.text(0.97, 0.97, f"{star}  r={r_val:+.2f}{eta_str}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=9, color="#333333", fontweight="bold",
+                    fontsize=14, color="#333333", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
-    fig.suptitle("Intra-Cell-Type NN Distance: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.suptitle("Intra-Cell-Type NN Distance: Breast vs Liver Cancer", fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / "cohort_nn_distance_violins.png"
     save_figure(fig, out, dpi=dpi)
@@ -2538,9 +2538,10 @@ def plot_ripley_L_by_cohort(
                     "AUC": float(v),
                 })
     df_auc = pd.DataFrame(records_auc)
+    df_auc["AUC_k"] = df_auc["AUC"] / 1000.0
 
     n_ch = len(non_bg_channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.6, 4.8), sharey=False, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=False, squeeze=False)
 
     for col_idx, ch in enumerate(non_bg_channels):
         ax = axes[0][col_idx]
@@ -2548,27 +2549,27 @@ def plot_ripley_L_by_cohort(
         subset = df_auc[df_auc["Cell Type"] == ch_name]
 
         if subset.empty:
-            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, color="grey")
+                    transform=ax.transAxes, color="grey", fontsize=14)
             continue
 
         sns.boxplot(
-            data=subset, x="Cohort", y="AUC",
+            data=subset, x="Cohort", y="AUC_k",
             order=display_labels, palette=pal,
             linewidth=0.8, fliersize=0, ax=ax,
         )
         sns.stripplot(
-            data=subset, x="Cohort", y="AUC",
+            data=subset, x="Cohort", y="AUC_k",
             order=display_labels, color="#333333",
-            alpha=0.35, size=2.2, jitter=True, ax=ax,
+            alpha=0.35, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("AUC of L(r) − r" if col_idx == 0 else "")
-        ax.tick_params(axis="x", labelrotation=25, labelsize=8)
+        ax.set_ylabel("AUC of L(r) − r  (×10³)" if col_idx == 0 else "", fontsize=14)
+        ax.tick_params(axis="x", labelrotation=25, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
 
-        # Significance bracket
         y_min_ax, y_max_ax = ax.get_ylim()
         y_span_ax = y_max_ax - y_min_ax
         h = _annotate_two_group_bracket(
@@ -2580,7 +2581,7 @@ def plot_ripley_L_by_cohort(
         if h > 0:
             ax.set_ylim(top=y_max_ax + h + 0.04 * y_span_ax)
 
-    fig.suptitle("Ripley Spatial Regularity by Cell Type: Breast vs Liver Cancer", fontsize=11, y=1.02)
+    fig.suptitle("Ripley Spatial Regularity by Cell Type: Breast vs Liver Cancer", fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / "cohort_ripley_L.png"
     save_figure(fig, out, dpi=dpi)
@@ -2756,7 +2757,7 @@ def plot_cell_type_boxplots_per_celltype(
     df = pd.DataFrame(records)
 
     n_ch = len(ch_indices)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 5.0), sharey=False, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=False, squeeze=False)
 
     for col_idx, (ch, ch_name) in enumerate(channels):
         ax = axes[0][col_idx]
@@ -2769,15 +2770,15 @@ def plot_cell_type_boxplots_per_celltype(
         sns.stripplot(
             data=subset, x="Group", y="Fraction",
             order=group_order, color="#333333",
-            alpha=0.30, size=1.8, jitter=True, ax=ax,
+            alpha=0.30, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "")
+        ax.set_ylabel("Fraction of nuclei area" if col_idx == 0 else "", fontsize=14)
         ax.yaxis.set_major_formatter(mticker.PercentFormatter(xmax=1, decimals=0))
-        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+        ax.tick_params(axis="x", labelrotation=35, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
 
-        # KW omnibus badge — pairwise brackets too cluttered for 5 groups
         sr   = stats_results.get(ch_name, {})
         kw_q = sr.get("kruskal_q", 1.0)
         eta  = sr.get("eta_sq", 0.0)
@@ -2785,10 +2786,10 @@ def plot_cell_type_boxplots_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=9, color="#333333", fontweight="bold",
+                    fontsize=14, color="#333333", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
-    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.suptitle(title, fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
@@ -2857,15 +2858,15 @@ def plot_nn_distance_violins_per_celltype(
     stats_results = _run_cohort_stats(cohort_data_by_ch)
 
     n_ch = len(non_bg_channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 5.0), sharey=True, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=True, squeeze=False)
 
     for col_idx, (ch, ch_name) in enumerate(zip(non_bg_channels, ch_labels)):
         ax = axes[0][col_idx]
         subset = df[df["Cell Type"] == ch_name]
         if subset.empty:
-            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, color="grey")
+                    transform=ax.transAxes, color="grey", fontsize=14)
             continue
         sns.boxplot(
             data=subset, x="Group", y="NN Distance (px)",
@@ -2875,18 +2876,18 @@ def plot_nn_distance_violins_per_celltype(
         sns.stripplot(
             data=subset, x="Group", y="NN Distance (px)",
             order=group_order, color="#333333",
-            alpha=0.30, size=1.8, jitter=True, ax=ax,
+            alpha=0.30, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "")
-        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+        ax.set_ylabel("Median intra-type NN dist (px)" if col_idx == 0 else "", fontsize=14)
+        ax.tick_params(axis="x", labelrotation=35, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
         if log_scale:
             ax.set_yscale("log")
         if col_idx > 0:
             ax.tick_params(axis="y", labelleft=False)
 
-        # KW omnibus badge (pairwise brackets too cluttered for 5 groups on log scale)
         sr   = stats_results.get(ch_name, {})
         kw_q = sr.get("kruskal_q", 1.0)
         eta  = sr.get("eta_sq", 0.0)
@@ -2894,10 +2895,10 @@ def plot_nn_distance_violins_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=9, color="#333333", fontweight="bold",
+                    fontsize=14, color="#333333", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
-    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.suptitle(title, fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
@@ -2976,9 +2977,10 @@ def plot_ripley_L_per_celltype(
             for v in aucs:
                 records_auc.append({"Group": group, "Cell Type": CHANNEL_NAMES[ch], "AUC": float(v)})
     df_auc = pd.DataFrame(records_auc)
+    df_auc["AUC_k"] = df_auc["AUC"] / 1000.0
 
     n_ch = len(non_bg_channels)
-    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 2.8, 4.8), sharey=False, squeeze=False)
+    fig, axes = plt.subplots(1, n_ch, figsize=(n_ch * 3.5, 6.0), sharey=False, squeeze=False)
 
     for col_idx, ch in enumerate(non_bg_channels):
         ax = axes[0][col_idx]
@@ -2986,25 +2988,26 @@ def plot_ripley_L_per_celltype(
         subset = df_auc[df_auc["Cell Type"] == ch_name]
 
         if subset.empty:
-            ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+            ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
             ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                    transform=ax.transAxes, color="grey")
+                    transform=ax.transAxes, color="grey", fontsize=14)
             continue
 
         sns.boxplot(
-            data=subset, x="Group", y="AUC",
+            data=subset, x="Group", y="AUC_k",
             order=group_order, palette=group_palette,
             linewidth=0.8, fliersize=0, ax=ax,
         )
         sns.stripplot(
-            data=subset, x="Group", y="AUC",
+            data=subset, x="Group", y="AUC_k",
             order=group_order, color="#333333",
-            alpha=0.30, size=1.8, jitter=True, ax=ax,
+            alpha=0.30, size=2.5, jitter=True, ax=ax,
         )
-        ax.set_title(ch_name, fontsize=10, fontweight="bold", pad=5)
+        ax.set_title(ch_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xlabel("")
-        ax.set_ylabel("AUC of L(r) − r" if col_idx == 0 else "")
-        ax.tick_params(axis="x", labelrotation=35, labelsize=7)
+        ax.set_ylabel("AUC of L(r) − r  (×10³)" if col_idx == 0 else "", fontsize=14)
+        ax.tick_params(axis="x", labelrotation=35, labelsize=13)
+        ax.tick_params(axis="y", labelsize=13)
 
         sr   = stats_results.get(ch_name, {})
         kw_q = sr.get("kruskal_q", 1.0)
@@ -3013,10 +3016,10 @@ def plot_ripley_L_per_celltype(
             star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
             ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                     transform=ax.transAxes, ha="right", va="top",
-                    fontsize=9, color="#333333", fontweight="bold",
+                    fontsize=14, color="#333333", fontweight="bold",
                     bbox=dict(boxstyle="round,pad=0.25", fc="white", alpha=0.85, ec="none"))
 
-    fig.suptitle(title, fontsize=11, y=1.02)
+    fig.suptitle(title, fontsize=18, y=1.02)
     fig.tight_layout()
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
@@ -3144,21 +3147,20 @@ def plot_pairwise_r_matrix_subtype(
                 ))
                 if is_sig:
                     star = ("***" if q_val < 0.001 else "**" if q_val < 0.01 else "*")
-                    # oslo: dark at low norm values, light at high → dark text only near white end
                     tc = "#111111" if norm(r_val) > 0.72 else "white"
                     ax.text(j, i - 0.14, star, ha="center", va="center",
-                            fontsize=10, color=tc, fontweight="bold")
+                            fontsize=14, color=tc, fontweight="bold")
                     ax.text(j, i + 0.22, f"{r_val:+.2f}", ha="center", va="center",
-                            fontsize=9, color=tc)
+                            fontsize=13, color=tc)
                 else:
                     ax.text(j, i, f"{r_val:+.2f}", ha="center", va="center",
-                            fontsize=8, color="#aaaaaa")
+                            fontsize=12, color="#aaaaaa")
 
-        ax.set_title(ct_name, fontsize=13, fontweight="bold", pad=6)
+        ax.set_title(ct_name, fontsize=16, fontweight="bold", pad=8)
         ax.set_xticks(range(n_groups))
-        ax.set_xticklabels(group_order, rotation=45, ha="right", fontsize=11)
+        ax.set_xticklabels(group_order, rotation=45, ha="right", fontsize=14)
         ax.set_yticks(range(n_groups))
-        ax.set_yticklabels(group_order, fontsize=11)
+        ax.set_yticklabels(group_order, fontsize=14)
         ax.tick_params(length=0)
         for spine in ax.spines.values():
             spine.set_visible(False)
@@ -3169,16 +3171,16 @@ def plot_pairwise_r_matrix_subtype(
     sm = plt.cm.ScalarMappable(cmap=cmap, norm=norm)
     sm.set_array([])
     cbar = fig.colorbar(sm, ax=axes.ravel().tolist(), shrink=0.5, pad=0.02, aspect=20)
-    cbar.set_label("Rank-biserial r  (row > col)", fontsize=11)
-    cbar.ax.tick_params(labelsize=10)
+    cbar.set_label("Rank-biserial r  (row > col)", fontsize=14)
+    cbar.ax.tick_params(labelsize=13)
 
-    fig.suptitle("Pairwise Effect Size (Rank-Biserial r) by Cell Type", fontsize=14)
+    fig.suptitle("Pairwise Effect Size (Rank-Biserial r) by Cell Type", fontsize=18)
     fig.text(
         0.5, -0.01,
         f"Coloured: BH q < {q_threshold} and |r| ≥ {r_threshold}.  "
         "Grey: not significant.  Blank: diagonal / lower triangle.  "
         "Positive r = row subtype has higher fraction than column subtype.",
-        ha="center", va="top", fontsize=6.5, color="#555555", style="italic",
+        ha="center", va="top", fontsize=10, color="#555555", style="italic",
     )
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)
@@ -3308,9 +3310,9 @@ def plot_combined_panel_per_celltype(
     ch_names = [CHANNEL_NAMES[ch] for ch in non_bg_channels]
 
     fig, axes = plt.subplots(
-        3, n_ch, figsize=(n_ch * 2.5, 9.0),
+        3, n_ch, figsize=(n_ch * 3.5, 13.0),
         sharey=False, squeeze=False,
-        gridspec_kw={"hspace": 0.55, "wspace": 0.10},
+        gridspec_kw={"hspace": 0.55, "wspace": 0.15},
     )
     row_labels = ["Fraction of nuclei area", "Median NN dist (px)", "AUC of L(r) − r"]
     row_dfs    = [df_comp,      df_nn,              df_auc]
@@ -3330,7 +3332,7 @@ def plot_combined_panel_per_celltype(
 
             if subset.empty:
                 ax.text(0.5, 0.5, "no data", ha="center", va="center",
-                        transform=ax.transAxes, color="grey", fontsize=7)
+                        transform=ax.transAxes, color="grey", fontsize=12)
             else:
                 sns.boxplot(
                     data=subset, x="Group", y=y_col,
@@ -3351,11 +3353,11 @@ def plot_combined_panel_per_celltype(
 
             # Column title only on top row
             if row_idx == 0:
-                ax.set_title(ch_name, fontsize=9, fontweight="bold", pad=4)
+                ax.set_title(ch_name, fontsize=15, fontweight="bold", pad=6)
             ax.set_xlabel("")
-            ax.set_ylabel(row_labels[row_idx] if col_idx == 0 else "", fontsize=8)
-            ax.tick_params(axis="x", labelrotation=35, labelsize=6.5)
-            ax.tick_params(axis="y", labelsize=7)
+            ax.set_ylabel(row_labels[row_idx] if col_idx == 0 else "", fontsize=13)
+            ax.tick_params(axis="x", labelrotation=35, labelsize=12)
+            ax.tick_params(axis="y", labelsize=12)
 
             # KW badge
             sr   = stats_r.get(ch_name, {})
@@ -3365,7 +3367,7 @@ def plot_combined_panel_per_celltype(
                 star = "***" if kw_q < 0.001 else ("**" if kw_q < 0.01 else "*")
                 ax.text(0.97, 0.97, f"{star}  η²={eta:.2f}",
                         transform=ax.transAxes, ha="right", va="top",
-                        fontsize=6, color="#333333",
+                        fontsize=11, color="#333333",
                         bbox=dict(boxstyle="round,pad=0.15", fc="white",
                                   alpha=0.75, ec="none"))
 
@@ -3378,14 +3380,14 @@ def plot_combined_panel_per_celltype(
             for ax in all_axes_row:
                 ax.set_ylim(y_lo, y_hi)
 
-    fig.suptitle(title, fontsize=12, y=1.01)
+    fig.suptitle(title, fontsize=18, y=1.01)
     fig.text(
         0.5, -0.01,
         "Row 1: fraction of non-background nuclei area (per patient median).  "
         "Row 2: median intra-type nearest-neighbour distance, log scale.  "
         "Row 3: AUC of Ripley L(r)−r (more negative = more regular spacing).  "
         "Badge: KW omnibus BH q < 0.05 and η² ≥ 0.01.",
-        ha="center", va="top", fontsize=6, color="#555555", style="italic",
+        ha="center", va="top", fontsize=10, color="#555555", style="italic",
     )
     out = output_dir / f"{out_stem}.png"
     save_figure(fig, out, dpi=dpi)

@@ -15,8 +15,8 @@ import sys
 import torch
 import yaml
 
-from src.joint_training.model import build_conf
-from src.joint_training.train import _count_genes
+from src.drafts.joint_training.model import build_conf
+from src.drafts.joint_training.train import _count_genes
 
 def main():
     parser = argparse.ArgumentParser(description="Patch joint checkpoint with missing hyper_parameters")

@@ -55,3 +55,7 @@ venv.bak/
 *.out
 *.err
 !slurm/committed/*.sh
+
+# Notebooks (only 19_PAM50_subtypes.ipynb is tracked)
+notebooks/*.ipynb
+!notebooks/19_PAM50_subtypes.ipynb

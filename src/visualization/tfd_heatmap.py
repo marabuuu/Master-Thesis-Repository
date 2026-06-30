@@ -79,15 +79,19 @@ def main() -> None:
     )
     n = len(class_names)
 
-    # Colour scale spans the full matrix range (diagonal values are small but
-    # real — they represent within-class TFD and correctly appear darker)
-    vmin = np.nanmin(mat)
-    vmax = np.nanmax(mat)
+    # Mask diagonal and lower triangle
+    mask = np.tri(n, dtype=bool)
+    mat_masked = np.where(mask, np.nan, mat)
+
+    vmin = np.nanmin(mat_masked)
+    vmax = np.nanmax(mat_masked)
 
     fig, ax = plt.subplots(figsize=FIGSIZE)
     cmap = crameri_cm.oslo
-    im = ax.imshow(mat, cmap=cmap, aspect="equal", interpolation="nearest",
-                   vmin=vmin, vmax=vmax)
+    cmap_copy = cmap.copy()
+    cmap_copy.set_bad(color="#e0e0e0")
+    im = ax.imshow(mat_masked, cmap=cmap_copy, aspect="equal",
+                   interpolation="nearest", vmin=vmin, vmax=vmax)
 
     # Remove spines (matches channel contributions style)
     for spine in ax.spines.values():
@@ -98,33 +102,32 @@ def main() -> None:
     cax = divider.append_axes("right", size="4%", pad=0.1)
     cb = fig.colorbar(im, cax=cax)
     cb.update_ticks()
-    cb.set_label("TFD", fontsize=10)
+    cb.set_label("TopoFD", fontsize=16)
+    cb.ax.tick_params(labelsize=14)
 
     # Axis labels
     ax.set_xticks(range(n))
     ax.set_yticks(range(n))
-    ax.set_xticklabels(class_names, rotation=35, ha="right", fontsize=10)
-    ax.set_yticklabels(class_names, fontsize=10)
-    ax.set_title(
-        "Topological Fréchet Distance\nPAM50 Class Separability",
-        fontsize=11, pad=8,
-    )
+    ax.set_xticklabels(class_names, rotation=35, ha="right", fontsize=16)
+    ax.set_yticklabels(class_names, fontsize=16)
     ax.grid(False)
 
-    # Cell annotations — plain number, no "NF" prefix on the diagonal
+    # Cell annotations — upper triangle only
     for i in range(n):
         for j in range(n):
-            val = mat[i, j]
+            if j <= i:
+                continue
+            val = mat_masked[i, j]
             if not np.isfinite(val):
-                ax.text(j, i, "—", ha="center", va="center", fontsize=8, color="white")
                 continue
             brightness = (val - vmin) / (vmax - vmin) if vmax > vmin else 0.5
             text_color = "white" if brightness < 0.72 else "black"
             ax.text(j, i, f"{val:.1f}",
-                    ha="center", va="center", fontsize=8, color=text_color)
+                    ha="center", va="center", fontsize=14,
+                    fontweight="bold", color=text_color)
 
     fig.tight_layout()
-    out = OUTPUT_DIR / "tfd_separability_heatmap_v2.png"
+    out = OUTPUT_DIR / "tfd_separability_heatmap_v3.png"
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close()
     print(f"Saved → {out}")

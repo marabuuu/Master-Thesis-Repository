@@ -69,14 +69,16 @@ def _plot_fid_matrix(matrix: np.ndarray, rows: list[str], cols: list[str], out_p
 
     fig, ax = plt.subplots(figsize=(max(5, len(cols) * 2.5), max(4, len(rows) * 2.0)))
     im = ax.imshow(matrix, cmap=crameri_cm.oslo)
-    plt.colorbar(im, ax=ax, label="FID")
+    cbar = plt.colorbar(im, ax=ax, label="FID")
+    cbar.ax.tick_params(labelsize=18)
+    cbar.set_label("FID", fontsize=22)
 
     ax.set_xticks(range(len(cols)))
     ax.set_yticks(range(len(rows)))
-    ax.set_xticklabels([c.replace("gen_", "gen\n") for c in cols], fontsize=11)
-    ax.set_yticklabels([r.replace("real_", "real\n") for r in rows], fontsize=11)
-    ax.set_xlabel("Generated", fontsize=12)
-    ax.set_ylabel("Real", fontsize=12)
+    ax.set_xticklabels([c.replace("gen_", "gen\n") for c in cols], fontsize=21)
+    ax.set_yticklabels([r.replace("real_", "real\n") for r in rows], fontsize=21)
+    ax.set_xlabel("Generated", fontsize=22)
+    ax.set_ylabel("Real", fontsize=22)
 
     valid = matrix[~np.isnan(matrix)]
     vmin, vmax = valid.min(), valid.max()
@@ -88,7 +90,7 @@ def _plot_fid_matrix(matrix: np.ndarray, rows: list[str], cols: list[str], out_p
                 # oslo: dark at low values, near-white at high → white text on dark, black on light
                 text_color = "white" if norm_val < 0.5 else "black"
                 ax.text(j, i, f"{v:.1f}", ha="center", va="center",
-                        fontsize=11, fontweight="normal", color=text_color)
+                        fontsize=21, fontweight="normal", color=text_color)
 
     plt.tight_layout()
     plt.savefig(out_path, dpi=300, bbox_inches="tight")

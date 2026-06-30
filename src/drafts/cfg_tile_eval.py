@@ -81,8 +81,8 @@ def load_v11_model(ckpt_path: str, v11_cfg: dict, repo_root: Path, device: torch
     """
     _add_mopadi_to_path(repo_root)
 
-    from src.cross_attention.genomic_config import GenomicCaConfig  # noqa: F401
-    from src.cross_attention.run_training import _build_ca_config
+    from src.drafts.cross_attention.genomic_config import GenomicCaConfig  # noqa: F401
+    from src.drafts.cross_attention.run_training import _build_ca_config
 
     conf = _build_ca_config(v11_cfg)
     conf.make_model_conf()

@@ -55,7 +55,7 @@ _GENOMIC_BASE = _EXP / "20260607_brca_pam50_cfg_v2_256"
 _ORTHOGONAL_RUN = _EXP / "20260614_brca_pam50_cfg_v2_1hot_256" / "gda"
 OUT = _GENOMIC_BASE / "brca_pam50_results_panel.png"
 
-# ── colours — match make_paper_panels.py ─────────────────────────────────────
+# ── colours — match pam50_conditioning_metrics_panel.py ──────────────────────
 C_SIG, C_GAP, C_SEP = _batlow_colors([0.20, 0.55, 0.78])
 
 try:
@@ -69,10 +69,10 @@ FID_VMIN, FID_VMAX = 27.0, 81.0
 
 _RC: Dict = {
     **_PAPER_RC,
-    "font.size": 20,
-    "axes.labelsize": 19,
-    "xtick.labelsize": 17,
-    "ytick.labelsize": 17,
+    "font.size": 30,
+    "axes.labelsize": 30,
+    "xtick.labelsize": 27,
+    "ytick.labelsize": 27,
 }
 
 _TILE_IDX = 20
@@ -88,10 +88,10 @@ def _sci_fmt(ax: plt.Axes) -> None:
     ax.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
 
 
-def _row_label(ax: plt.Axes, name: str, fontsize: int = 20) -> None:
+def _row_label(ax: plt.Axes, name: str, fontsize: int = 30) -> None:
     """Row label rotated 90° to the left of the axis."""
     ax.text(
-        -0.28, 0.5, name,
+        -0.42, 0.5, name,
         transform=ax.transAxes,
         rotation=90, va="center", ha="right",
         fontsize=fontsize, fontweight="bold", color="0.15",
@@ -180,43 +180,25 @@ def main() -> None:
     gen_gap_s, gen_gap_v = _aggregate_by_step(_gap_rs, _gap_rv)
     gen_sep_s, gen_sep_v = gen_data.get("cond/basal_luma_sep", ([], []))
 
-    print("Loading orthogonal (1-hot) run TFEvents …")
-    orth_data = load_gda_tfevents(_ORTHOGONAL_RUN)
-
-    orth_sig_s, orth_sig_v = orth_data.get("cond/signal", ([], []))
-    _ogap_rs, _ogap_rv     = orth_data.get("cond/gap", ([], []))
-    orth_gap_s, orth_gap_v = _aggregate_by_step(_ogap_rs, _ogap_rv)
-    orth_sep_s, orth_sep_v = orth_data.get("cond/brca_lihc_sep", ([], []))
-
-    def _col_ylim_pair(steps_a, vals_a, steps_b, vals_b, *, is_gap):
-        all_vals = []
-        all_maxes = []
-        for steps, vals in ((steps_a, vals_a), (steps_b, vals_b)):
-            if not vals:
-                continue
-            fin = [v for v in vals if np.isfinite(v)]
-            if not fin:
-                continue
-            all_vals.extend(fin)
-            if not is_gap:
-                s_M = [s / 1e6 for s in steps]
-                _, v_ema = _ema_series(s_M, fin, alpha=0.05)
-                all_maxes.append(max(v_ema) if v_ema else max(fin))
-            else:
-                all_maxes.append(max(fin))
-        if not all_vals:
+    def _col_ylim(steps, vals, *, is_gap):
+        fin = [v for v in vals if np.isfinite(v)]
+        if not fin:
             return 0.0, 1e-4
-        col_max = max(all_maxes)
-        col_min = min(all_vals)
-        top = col_max * 1.25
+        if not is_gap:
+            s_M = [s / 1e6 for s in steps]
+            _, v_ema = _ema_series(s_M, fin, alpha=0.05)
+            col_max = max(v_ema) if v_ema else max(fin)
+        else:
+            col_max = max(fin)
+        col_min = min(fin)
+        top = col_max * 1.45
         bot = col_min * 1.20 if col_min < 0 else -top * 0.08
         return bot, top
 
     ylims = [
-        _col_ylim_pair(gen_sig_s, gen_sig_v, orth_sig_s, orth_sig_v, is_gap=False),
-        _col_ylim_pair([float(s) for s in gen_gap_s], gen_gap_v,
-                       [float(s) for s in orth_gap_s], orth_gap_v, is_gap=True),
-        _col_ylim_pair(gen_sep_s, gen_sep_v, orth_sep_s, orth_sep_v, is_gap=False),
+        _col_ylim(gen_sig_s, gen_sig_v, is_gap=False),
+        _col_ylim([float(s) for s in gen_gap_s], gen_gap_v, is_gap=True),
+        _col_ylim(gen_sep_s, gen_sep_v, is_gap=False),
     ]
     y_bots = [b for b, _ in ylims]
     y_tops = [t for _, t in ylims]
@@ -229,9 +211,6 @@ def main() -> None:
         cfg_fids[cfg] = _load_fid(p)
 
     # ── load sample tiles ─────────────────────────────────────────────────────
-    # _select_zips sorts patients alphabetically; same count in every CFG dir
-    # → identical patient at each column position across all CFG rows.
-    # Same tile_idx within a patient zip → same batch seed → same starting noise.
     print("Loading sample tiles …")
     cfg_tiles: Dict[int, Dict[str, List[np.ndarray]]] = {}
     for cfg in (1, 3, 5):
@@ -243,98 +222,73 @@ def main() -> None:
                 _load_tile(p, tile_idx=_TILE_IDX) for p in _select_zips(d, indices=idx_override)
             ]
 
-    # ── figure layout ─────────────────────────────────────────────────────────
-    fig = plt.figure(figsize=(22, 28))
+    # ── figure layout (4 rows: conditioning + 3 CFG) ─────────────────────────
+    fig = plt.figure(figsize=(22, 24))
 
     outer = gridspec.GridSpec(
-        5, 2,
+        4, 2,
         figure=fig,
-        height_ratios=[1.0, 1.0, 2.0, 2.0, 2.0],
+        height_ratios=[1.0, 2.0, 2.0, 2.0],
         width_ratios=[1, 0.025],
         hspace=0.38,
         wspace=0.03,
-        left=0.09, right=0.97, top=0.97, bottom=0.03,
+        left=0.12, right=0.95, top=0.90, bottom=0.03,
     )
 
-    col_ylabels = ["Conditioning signal", "Conditioning gap", "Cond. separation"]
+    col_ylabels = ["Cond. signal", "Cond. gap", "Cond. sep."]
 
-    # ── Row 0: Orthogonal (1-hot) conditioning ─────────────────────────────────
+    # ── Row 0: Genomic conditioning ───────────────────────────────────────────
     inner0 = gridspec.GridSpecFromSubplotSpec(
-        1, 3, subplot_spec=outer[0, :], wspace=0.42
+        1, 3, subplot_spec=outer[0, :], wspace=0.50
     )
-    orth_row_data = [
-        (orth_sig_s,                     orth_sig_v, C_SIG, False),
-        ([float(s) for s in orth_gap_s], orth_gap_v, C_GAP, True),
-        (orth_sep_s,                     orth_sep_v, C_SEP, False),
-    ]
-    orth_axes = []
-    for ci, (steps, vals, color, is_gap) in enumerate(orth_row_data):
-        ax = fig.add_subplot(inner0[ci])
-        orth_axes.append(ax)
-        _plot_metric(ax, steps, vals, color,
-                     is_gap=is_gap, y_top=y_tops[ci], y_bot=y_bots[ci])
-        ax.set_ylabel(col_ylabels[ci])
-        ax.tick_params(labelbottom=False)
-
-    _row_label(orth_axes[0], "Orthogonal")
-
-    # ── Row 1: Genomic conditioning ───────────────────────────────────────────
-    inner1 = gridspec.GridSpecFromSubplotSpec(
-        1, 3, subplot_spec=outer[1, :], wspace=0.42
-    )
-    row1_data = [
+    row0_data = [
         (gen_sig_s,                     gen_sig_v, C_SIG, False),
         ([float(s) for s in gen_gap_s], gen_gap_v, C_GAP, True),
         (gen_sep_s,                     gen_sep_v, C_SEP, False),
     ]
     gen_axes = []
-    for ci, (steps, vals, color, is_gap) in enumerate(row1_data):
-        ax = fig.add_subplot(inner1[ci])
+    for ci, (steps, vals, color, is_gap) in enumerate(row0_data):
+        ax = fig.add_subplot(inner0[ci])
         gen_axes.append(ax)
         _plot_metric(ax, steps, vals, color,
                      is_gap=is_gap, y_top=y_tops[ci], y_bot=y_bots[ci])
         ax.set_ylabel(col_ylabels[ci])
         ax.set_xlabel("Samples (×10⁶)")
 
-    _row_label(gen_axes[0], "Genomic")
-
-    # ── Rows 2–4: FID heatmap + sample tiles per CFG scale ───────────────────
+    # ── Rows 1–3: FID heatmap + sample tiles per CFG scale ───────────────────
     for cfg_i, cfg in enumerate((1, 3, 5)):
         matrix, row_labels, col_labels = cfg_fids[cfg]
         tiles = cfg_tiles[cfg]
 
-        # 2 sub-rows (LumA / Basal) × 4 cols (FID | tile | tile | tile)
         inner = gridspec.GridSpecFromSubplotSpec(
             2, 4,
-            subplot_spec=outer[2 + cfg_i, 0],
+            subplot_spec=outer[1 + cfg_i, 0],
             wspace=0.05, hspace=0.06,
             width_ratios=[2.0, 1, 1, 1],
         )
 
-        # FID heatmap spanning both sub-rows
         ax_fid = fig.add_subplot(inner[:, 0])
         ax_fid.imshow(matrix, cmap=_oslo_cmap,
                       vmin=FID_VMIN, vmax=FID_VMAX, aspect="equal")
 
         ax_fid.set_xticks(range(len(col_labels)))
         ax_fid.set_yticks(range(len(row_labels)))
-        ax_fid.set_xticklabels(col_labels, fontsize=17)
-        ax_fid.set_yticklabels(row_labels, fontsize=17)
-        ax_fid.set_ylabel("Real", fontsize=17, labelpad=3)
-        ax_fid.set_xlabel("Generated", fontsize=17, labelpad=3)
+        ax_fid.set_xticklabels(col_labels, fontsize=30)
+        ax_fid.set_yticklabels(row_labels, fontsize=30)
+        ax_fid.set_ylabel("Real", fontsize=30, labelpad=3)
+        ax_fid.set_xlabel("Generated", fontsize=30, labelpad=3)
 
         for ii in range(matrix.shape[0]):
             for jj in range(matrix.shape[1]):
                 v = matrix[ii, jj]
                 nv = (v - FID_VMIN) / (FID_VMAX - FID_VMIN)
                 ax_fid.text(jj, ii, f"{v:.1f}",
-                            ha="center", va="center", fontsize=16,
+                            ha="center", va="center", fontsize=32,
                             fontweight="bold",
                             color="white" if nv < 0.5 else "black")
 
-        _row_label(ax_fid, f"cfg = {cfg}", fontsize=20)
+        _row_label(ax_fid, f"CFG = {cfg}", fontsize=30)
 
-        # Sample tiles — subtype label embedded in the first tile of each row
         for sub_i, subtype in enumerate(("LumA", "Basal")):
             for j, tile_img in enumerate(tiles[subtype]):
                 ax_t = fig.add_subplot(inner[sub_i, 1 + j])
@@ -345,20 +299,20 @@ def main() -> None:
                         0.04, 0.96, subtype,
                         transform=ax_t.transAxes,
                         ha="left", va="top",
-                        fontsize=16, fontweight="bold", color="white",
+                        fontsize=26, fontweight="bold", color="white",
                         bbox=dict(facecolor="black", alpha=0.45,
                                   pad=2, boxstyle="round,pad=0.2"),
                     )
 
-    # ── Shared FID colourbar (col 1, rows 2–4) ────────────────────────────────
-    ax_cbar = fig.add_subplot(outer[2:, 1])
+    # ── Shared FID colourbar (col 1, rows 1–3) ────────────────────────────────
+    ax_cbar = fig.add_subplot(outer[1:, 1])
     sm = plt.cm.ScalarMappable(
         cmap=_oslo_cmap, norm=plt.Normalize(vmin=FID_VMIN, vmax=FID_VMAX)
     )
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=ax_cbar)
-    cbar.set_label("FID", fontsize=16, labelpad=4)
-    cbar.ax.tick_params(labelsize=14)
+    cbar.set_label("FID", fontsize=30, labelpad=6)
+    cbar.ax.tick_params(labelsize=28)
 
     # ── Save ──────────────────────────────────────────────────────────────────
     OUT.parent.mkdir(parents=True, exist_ok=True)

@@ -11,7 +11,7 @@ Metrics implemented:
   • Spatial autocorrelation: Moran's I, Geary's C (per cell-type indicator maps)
 
 Usage:
-  from src.spatial_metrics import compute_ripley_l, compute_voronoi_areas, compute_knn_metrics
+  from src.statistics.spatial_metrics import compute_ripley_l, compute_voronoi_areas, compute_knn_metrics
   
   # Point pattern: (N, 2) array of (x, y) centroids
   points = ...  # from segmentation mask

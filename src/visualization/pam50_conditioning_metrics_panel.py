@@ -40,10 +40,10 @@ OUT = _BASE / "20260612_training_metrics_poc"
 OUT.mkdir(parents=True, exist_ok=True)
 
 RUNS = {
-    "Zero":       _BASE / "20260607_poc_128_zero_30M/gda",
-    "Noise":      _BASE / "20260607_poc_128_noise_30M/gda",
-    "Orthogonal": _BASE / "20260605_poc_128_orthogonal_nonorm_30M/gda",
-    "Genomic":    _BASE / "20260607_poc_128_rna_norm_30M/gda",
+    "Zero":                  _BASE / "20260607_poc_128_zero_30M/gda",
+    "Random":                _BASE / "20260607_poc_128_noise_30M/gda",
+    "Orthogonal":            _BASE / "20260605_poc_128_orthogonal_nonorm_30M/gda",
+    "Genomic":               _BASE / "20260607_poc_128_rna_norm_30M/gda",
 }
 
 RUN_NAMES = list(RUNS.keys())
@@ -62,11 +62,11 @@ C_TRAIN, C_VAL = _batlow_colors([0.15, 0.55])
 # Bump all font sizes from the base _PAPER_RC
 _COND_RC = {
     **_PAPER_RC,
-    "font.size": 15,
-    "axes.labelsize": 15,
-    "xtick.labelsize": 13,
-    "ytick.labelsize": 13,
-    "legend.fontsize": 13,
+    "font.size": 25,
+    "axes.labelsize": 25,
+    "xtick.labelsize": 23,
+    "ytick.labelsize": 23,
+    "legend.fontsize": 23,
 }
 
 
@@ -77,10 +77,10 @@ def _sci_fmt(ax) -> None:
 
 def _row_label(ax, name: str) -> None:
     ax.text(
-        -0.30, 0.5, name,
+        -0.38, 0.5, name,
         transform=ax.transAxes,
         rotation=90, va="center", ha="right",
-        fontsize=15, fontweight="bold", color="black",
+        fontsize=25, fontweight="bold", color="black",
     )
 
 
@@ -132,7 +132,7 @@ def _add_inset(ax, steps, vals, color) -> None:
 
 
 # Rows that get insets in every conditioning column
-_INSET_ROWS = {"Zero", "Noise"}
+_INSET_ROWS = {"Zero", "Random"}
 
 
 # ---------------------------------------------------------------------------
@@ -196,10 +196,10 @@ def make_conditioning_panel() -> None:
     # --- create figure ----------------------------------------------------
     fig, axes = plt.subplots(
         4, 3,
-        figsize=(13, 10),
-        gridspec_kw={"hspace": 0.40, "wspace": 0.50},
+        figsize=(18, 16),
+        gridspec_kw={"hspace": 0.40, "wspace": 0.55},
     )
-    fig.subplots_adjust(left=0.12, right=0.97, top=0.97, bottom=0.07)
+    fig.subplots_adjust(left=0.14, right=0.97, top=0.97, bottom=0.06)
 
     for row, name in enumerate(RUN_NAMES):
         data = all_data[name]
@@ -228,11 +228,11 @@ def make_conditioning_panel() -> None:
             _sci_fmt(ax)
             _strip_spines(ax)
 
-            ax.set_ylabel(ylabel, fontsize=15)
+            ax.set_ylabel(ylabel, fontsize=25)
             if row < 3:
                 ax.tick_params(labelbottom=False)
             else:
-                ax.set_xlabel("Samples (×10⁶)", fontsize=15)
+                ax.set_xlabel("Samples (×10⁶)", fontsize=25)
 
             # --- Inset zoom for Zero and Noise rows -----------------------
             if name in _INSET_ROWS and vals:
@@ -281,10 +281,10 @@ def make_loss_panel() -> None:
     # --- create figure ----------------------------------------------------
     fig, axes = plt.subplots(
         4, 2,
-        figsize=(10, 10),
-        gridspec_kw={"hspace": 0.35, "wspace": 0.45},
+        figsize=(14, 16),
+        gridspec_kw={"hspace": 0.35, "wspace": 0.50},
     )
-    fig.subplots_adjust(left=0.13, right=0.97, top=0.97, bottom=0.07)
+    fig.subplots_adjust(left=0.14, right=0.97, top=0.97, bottom=0.06)
 
     for row, name in enumerate(RUN_NAMES):
         data = all_data[name]
@@ -318,22 +318,22 @@ def make_loss_panel() -> None:
                 ax.set_yscale("log")
                 if log_bot is not None and log_top is not None:
                     ax.set_ylim(bottom=log_bot, top=log_top)
-                ax.set_ylabel("MSE loss (log scale)", fontsize=15)
+                ax.set_ylabel("MSE loss (log scale)", fontsize=25)
             else:
                 if lin_top is not None:
                     ax.set_ylim(bottom=0, top=lin_top)
-                ax.set_ylabel("MSE loss", fontsize=15)
+                ax.set_ylabel("MSE loss", fontsize=25)
 
             _strip_spines(ax)
 
             # Legend on first row only
             if row == 0:
-                ax.legend(loc="upper right", fontsize=13)
+                ax.legend(loc="upper right", fontsize=23)
 
             if row < 3:
                 ax.tick_params(labelbottom=False)
             else:
-                ax.set_xlabel("Samples (×10⁶)", fontsize=15)
+                ax.set_xlabel("Samples (×10⁶)", fontsize=25)
 
         _row_label(axes[row, 0], name)
 

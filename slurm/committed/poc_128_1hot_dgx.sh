@@ -33,8 +33,7 @@
 
 set -euo pipefail
 
-GENHIST_DIR=/mnt/bulk-saturn/maralampert/genhist
-REPO_DIR="$GENHIST_DIR/Master-Thesis-Repository"
+REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
 
 if [ -f "$REPO_DIR/.venv/bin/activate" ]; then
     source "$REPO_DIR/.venv/bin/activate"

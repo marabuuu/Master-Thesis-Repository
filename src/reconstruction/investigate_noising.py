@@ -82,25 +82,13 @@ def load_checkpoint_simple(
             variant = "joint_training"
 
     if variant == "joint_training":
-        try:
-            from src.joint_training.model import JointLitModel as ModelCls  # type: ignore[import-not-found]
-        except ImportError:
-            from ..joint_training.model import JointLitModel as ModelCls  # type: ignore[import-not-found]
+        from src.drafts.joint_training.model import JointLitModel as ModelCls
     elif variant == "cross_attention_joint_training":
-        try:
-            from src.cross_attention_joint_training.model import CrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
-        except ImportError:
-            from ..cross_attention_joint_training.model import CrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+        from src.drafts.cross_attention_joint_training.model import CrossAttentionJointLitModel as ModelCls
     elif variant == "gene_token_transformer_joint_training":
-        try:
-            from src.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel as ModelCls  # type: ignore[import-not-found]
-        except ImportError:
-            from ..gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel as ModelCls  # type: ignore[import-not-found]
+        from src.drafts.gene_token_transformer_joint_training.model import GeneTokenTransformerJointLitModel as ModelCls
     elif variant == "gene_token_cross_attention_joint_training":
-        try:
-            from src.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
-        except ImportError:
-            from ..gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel as ModelCls  # type: ignore[import-not-found]
+        from src.drafts.gene_token_cross_attention_joint_training.model import GeneTokenCrossAttentionJointLitModel as ModelCls
     else:
         raise ValueError(f"Unsupported joint variant in checkpoint: {variant}")
     

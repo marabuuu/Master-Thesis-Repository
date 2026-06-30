@@ -17,6 +17,7 @@ logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
 sys.path.insert(0, str(Path(__file__).parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "src" / "drafts"))
 
 
 def test_spatial_cross_attention_adapter():
@@ -24,7 +25,7 @@ def test_spatial_cross_attention_adapter():
     log.info("=== Test 1: Spatial Cross-Attention Adapter (FiLM Gating) ===")
     
     try:
-        from src.mopadi_genomic_crossattn.model import _SpatialCrossAttentionAdapter
+        from src.drafts.mopadi_genomic_crossattn.model_old_crossattn import _SpatialCrossAttentionAdapter
         
         batch_size = 2
         in_channels = 64
@@ -91,7 +92,7 @@ def test_multi_stage_wrapper_patching():
         
         base_unet = MockUNet()
         
-        from src.mopadi_genomic_crossattn.model import MultiStageCrossAttentionUNetWrapper
+        from src.drafts.mopadi_genomic_crossattn.model_old_crossattn import MultiStageCrossAttentionUNetWrapper
         
         wrapper = MultiStageCrossAttentionUNetWrapper(
             base_unet=base_unet,
@@ -163,7 +164,7 @@ def test_film_initialization():
     log.info("\n=== Test 4: FiLM Scale Initialization ===")
     
     try:
-        from src.mopadi_genomic_crossattn.model import _SpatialCrossAttentionAdapter
+        from src.drafts.mopadi_genomic_crossattn.model_old_crossattn import _SpatialCrossAttentionAdapter
         
         adapter = _SpatialCrossAttentionAdapter(
             in_channels=32,

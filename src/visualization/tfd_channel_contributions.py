@@ -50,7 +50,7 @@ N_CHANNELS = len(CHANNEL_NAMES)
 PAM50_ORDER = ["Basal", "Her2", "LumA", "LumB", "Normal"]
 
 # Match heatmap height exactly so LaTeX \includegraphics[width=X]{...} aligns both.
-FIGSIZE = (6.5, 8.5)
+FIGSIZE = (8.5, 9.5)
 DPI = 200
 
 
@@ -88,7 +88,7 @@ def main() -> None:
     vmax = np.nanmax(vals)
 
     fig, ax = plt.subplots(figsize=FIGSIZE)
-    cmap = crameri_cm.oslo
+    cmap = crameri_cm.oslo_r
     im = ax.imshow(vals, cmap=cmap, aspect="auto", interpolation="nearest",
                    vmin=vmin, vmax=vmax)
 
@@ -99,17 +99,14 @@ def main() -> None:
     cax = divider.append_axes("right", size="4%", pad=0.1)
     cb = fig.colorbar(im, cax=cax)
     cb.update_ticks()
-    cb.set_label("Channel TFD contribution", fontsize=10)
+    cb.set_label("TopoFD channel contribution", fontsize=14)
+    cb.ax.tick_params(labelsize=12)
 
     ax.set_xticks(range(N_CHANNELS))
-    ax.set_xticklabels(col_labels, rotation=35, ha="right", fontsize=9)
+    ax.set_xticklabels(col_labels, rotation=35, ha="right", fontsize=14)
     ax.set_yticks(range(n_pairs))
-    ax.set_yticklabels(pair_labels, fontsize=9)
+    ax.set_yticklabels(pair_labels, fontsize=14)
     ax.grid(False)
-    ax.set_title(
-        "Topological Fréchet Distance\nPer-Channel Contributions",
-        fontsize=11, pad=8,
-    )
 
     for i in range(n_pairs):
         for j in range(N_CHANNELS):
@@ -117,12 +114,13 @@ def main() -> None:
             if not np.isfinite(v):
                 continue
             brightness = (v - vmin) / (vmax - vmin) if vmax > vmin else 0.5
-            text_color = "white" if brightness < 0.72 else "black"
+            text_color = "white" if brightness > 0.45 else "black"
             ax.text(j, i, f"{v:.1f}",
-                    ha="center", va="center", fontsize=7, color=text_color)
+                    ha="center", va="center", fontsize=12,
+                    fontweight="bold", color=text_color)
 
     fig.tight_layout()
-    out = OUTPUT_DIR / "tfd_channel_contributions_absolute_v2.png"
+    out = OUTPUT_DIR / "tfd_channel_contributions_absolute_v3.png"
     fig.savefig(out, dpi=DPI, bbox_inches="tight")
     plt.close()
     print(f"Saved → {out}")

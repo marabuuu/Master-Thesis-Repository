@@ -1,6 +1,9 @@
 """Generate bulk conditioned tiles per subtype, collect real tiles, and compute the FID matrix.
 
 Outputs per-patient ZIPs under <output>/generated/<Subtype>/ and <output>/real/<Subtype>/.
+
+Supports both ``conditioning_type=real`` (per-patient H5 genomic features) and
+``conditioning_type=one_hot`` (fixed orthogonal codes matching training).
 """
 
 from __future__ import annotations
@@ -9,7 +12,7 @@ import argparse
 import json
 import logging
 from pathlib import Path
-from typing import List
+from typing import Dict, List, Optional
 
 import torch
 
@@ -21,6 +24,7 @@ from src.evaluation.poc_fid import (
     collect_real_cohort_tiles,
 )
 from src.evaluation.fid_matrix_pytorch import run as run_fid_matrix
+from src.model_training.dataset import _make_orthogonal_codes
 
 log = logging.getLogger(__name__)
 
@@ -63,10 +67,24 @@ def _load_test_patients_by_subtype(
     return by_subtype
 
 
+def _all_subtypes_from_splits(splits_path: Path) -> List[str]:
+    """Return sorted list of all unique subtypes across all splits."""
+    with open(splits_path) as f:
+        payload = json.load(f)
+    subtypes = set()
+    for fold, entries in payload.items():
+        if fold.startswith("_"):
+            continue
+        for meta in entries.values():
+            if isinstance(meta, dict) and "subtype" in meta:
+                subtypes.add(meta["subtype"])
+    return sorted(subtypes)
+
+
 def run(
     run_dir: Path,
     splits_path: Path,
-    genomic_dir: Path,
+    genomic_dir: Optional[Path],
     tiles_dir: Path,
     output_dir: Path,
     checkpoint: str | None,
@@ -100,8 +118,21 @@ def run(
         model = load_model(conf, ckpt_path, device)
 
         normalize_feats = getattr(conf, "normalize_feats", True)
-        log.info("img_size=%d  feat_dim=%d  normalize_feats=%s",
-                 conf.img_size, conf.feat_dim, normalize_feats)
+        conditioning_type = getattr(conf, "conditioning_type", "real")
+        log.info("img_size=%d  feat_dim=%d  normalize_feats=%s  conditioning_type=%s",
+                 conf.img_size, conf.feat_dim, normalize_feats, conditioning_type)
+
+        # Build per-subtype conditioning vectors for one_hot models
+        onehot_codes: Optional[Dict[str, torch.Tensor]] = None
+        effective_genomic_dir: Optional[Path] = genomic_dir
+        if conditioning_type == "one_hot":
+            all_train_subtypes = _all_subtypes_from_splits(splits_path)
+            onehot_codes = _make_orthogonal_codes(
+                all_train_subtypes, conf.feat_dim, normalize=normalize_feats,
+            )
+            for name, vec in onehot_codes.items():
+                log.info("  one_hot code '%s': norm=%.3f", name, vec.norm().item())
+            effective_genomic_dir = None
 
         null_vec = torch.zeros(conf.feat_dim, device=device)
 
@@ -111,10 +142,18 @@ def run(
                 log.warning("No test patients for %s, skipping", subtype)
                 continue
             gen_dir = output_dir / "generated" / subtype
-            log.info("Generating %d tiles for %s -> %s", n_per_subtype, subtype, gen_dir)
+
+            if onehot_codes is not None:
+                cond_vec = onehot_codes[subtype].to(device)
+                log.info("Generating %d tiles for %s -> %s  (one_hot code, norm=%.3f)",
+                         n_per_subtype, subtype, gen_dir, cond_vec.norm().item())
+            else:
+                cond_vec = null_vec
+                log.info("Generating %d tiles for %s -> %s", n_per_subtype, subtype, gen_dir)
+
             generate_cohort_tiles(
                 model=model,
-                cond_vec=null_vec,       # overridden per-patient by genomic_h5_dir
+                cond_vec=cond_vec,
                 patient_ids=pids,
                 n_tiles_total=n_per_subtype,
                 out_dir=gen_dir,
@@ -124,7 +163,7 @@ def run(
                 n_steps=n_steps,
                 seed=seed,
                 skip_existing=True,
-                genomic_h5_dir=genomic_dir,
+                genomic_h5_dir=effective_genomic_dir,
                 normalize_feats=normalize_feats,
             )
     else:
@@ -173,8 +212,9 @@ def main() -> None:
                         help="Checkpoint filename or path (default: auto-select best val loss)")
     parser.add_argument("--splits",         type=Path, required=True,
                         help="patient_splits.json")
-    parser.add_argument("--genomic-dir",    type=Path, required=True,
-                        help="Directory with per-patient .h5 genomic feature files")
+    parser.add_argument("--genomic-dir",    type=Path, default=None,
+                        help="Directory with per-patient .h5 genomic feature files "
+                             "(required for conditioning_type=real, ignored for one_hot)")
     parser.add_argument("--tiles-dir",      type=Path, required=True,
                         help="Directory with per-patient source zip files of real tiles")
     parser.add_argument("--output",         type=Path, required=True,
@@ -205,7 +245,7 @@ def main() -> None:
     run(
         run_dir=args.run_dir.resolve(),
         splits_path=args.splits.resolve(),
-        genomic_dir=args.genomic_dir.resolve(),
+        genomic_dir=args.genomic_dir.resolve() if args.genomic_dir else None,
         tiles_dir=args.tiles_dir.resolve(),
         output_dir=args.output.resolve(),
         checkpoint=args.checkpoint,

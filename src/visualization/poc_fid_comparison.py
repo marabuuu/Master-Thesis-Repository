@@ -24,7 +24,7 @@ EXPERIMENTS: list[tuple[str, Path]] = [
         _EXPS_ROOT / "20260607_poc_128_zero_30M/fid_evaluation_last_fixed/fd_results.json",
     ),
     (
-        "Noise",
+        "Random",
         _EXPS_ROOT / "20260607_poc_128_noise_30M/fid_evaluation_last_fixed/fd_results.json",
     ),
     (
@@ -37,7 +37,7 @@ EXPERIMENTS: list[tuple[str, Path]] = [
     ),
 ]
 
-OUT = _EXPS_ROOT / "fid_panel_comparison.png"
+OUT = _EXPS_ROOT / "20260612_training_metrics_poc" / "fid_panel_comparison.png"
 
 
 def _load(json_path: Path) -> tuple[np.ndarray, list[str], list[str]]:
@@ -73,13 +73,13 @@ def main() -> None:
     n = len(all_data)
 
     # Layout: n heatmap axes in column 0, single colourbar in column 1
-    fig = plt.figure(figsize=(3.8, n * 2.0 + 0.3))
+    fig = plt.figure(figsize=(6, n * 3.2 + 0.5))
     gs = gridspec.GridSpec(
         n, 2,
         width_ratios=[1, 0.06],
         hspace=0.45,
-        wspace=0.12,
-        left=0.12, right=0.88, top=0.97, bottom=0.06,
+        wspace=0.15,
+        left=0.22, right=0.85, top=0.97, bottom=0.05,
     )
 
     axes = []
@@ -93,12 +93,18 @@ def main() -> None:
         cl = _strip(cols)
         ax.set_xticks(range(len(cl)))
         ax.set_yticks(range(len(rl)))
-        ax.set_xticklabels(cl, fontsize=11)
-        ax.set_yticklabels(rl, fontsize=11)
+        ax.set_xticklabels(cl, fontsize=21)
+        ax.set_yticklabels(rl, fontsize=21)
 
-        ax.set_ylabel("Real", fontsize=11, labelpad=3)
+        ax.set_ylabel("Real", fontsize=21, labelpad=3)
+        ax.text(
+            -0.45, 0.5, label,
+            transform=ax.transAxes,
+            rotation=90, va="center", ha="right",
+            fontsize=22, fontweight="bold", color="black",
+        )
         if i == n - 1:
-            ax.set_xlabel("Generated", fontsize=11, labelpad=3)
+            ax.set_xlabel("Generated", fontsize=21, labelpad=3)
 
         # Value annotations with contrast-aware text colour
         for ii in range(matrix.shape[0]):
@@ -110,7 +116,7 @@ def main() -> None:
                     ax.text(
                         jj, ii, f"{v:.1f}",
                         ha="center", va="center",
-                        fontsize=11, color=text_color,
+                        fontsize=22, fontweight="bold", color=text_color,
                     )
 
     # Shared colourbar spanning all rows
@@ -120,8 +126,8 @@ def main() -> None:
     )
     sm.set_array([])
     cbar = fig.colorbar(sm, cax=cbar_ax)
-    cbar.set_label("FID", fontsize=11)
-    cbar.ax.tick_params(labelsize=9)
+    cbar.set_label("FID", fontsize=21)
+    cbar.ax.tick_params(labelsize=19)
 
     plt.savefig(OUT, dpi=300, bbox_inches="tight", facecolor="white")
     plt.close()

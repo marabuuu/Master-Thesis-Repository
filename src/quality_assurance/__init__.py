@@ -30,7 +30,7 @@ except Exception:
     pass
 
 try:
-    from visualization.reconstruction_eval import (
+    from src.visualization.reconstruction_eval import (
         plot_metrics_summary,
         plot_comparison_grid,
         plot_per_patient_metrics,

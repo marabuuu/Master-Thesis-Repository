@@ -162,17 +162,28 @@ def save_panel(
     fig.suptitle(title, fontsize=10, y=0.97)
 
     if metrics:
-        parts = []
+        lines = []
         if "ms_ssim_mean" in metrics:
-            parts.append(f"MS-SSIM: {metrics['ms_ssim_mean']:.4f}")
+            lines.append(f"MS-SSIM: {metrics['ms_ssim_mean']:.3f}")
         for model_name in sorted(k.replace("_cosine_sim_mean", "")
                                   for k in metrics if k.endswith("_cosine_sim_mean")):
             val = metrics[f"{model_name}_cosine_sim_mean"]
-            parts.append(f"cos-sim ({model_name}): {val:.4f}")
-        if parts:
-            fig.text(0.5, 0.015, "    ".join(parts),
-                     ha="center", va="bottom", fontsize=8, color="#555555",
-                     transform=fig.transFigure)
+            label = model_name.replace("_", " ").title()
+            lines.append(f"{label} cos-sim: {val:.3f}")
+        if lines:
+            text = "\n".join(lines)
+            fig.text(
+                0.97, 0.08, text,
+                transform=fig.transFigure,
+                ha="right", va="bottom",
+                fontsize=12, fontweight="bold", color="#222222",
+                bbox=dict(
+                    boxstyle="round,pad=0.5",
+                    facecolor="white", alpha=0.8,
+                    edgecolor="0.55", linewidth=0.8,
+                ),
+                zorder=10,
+            )
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(output_path, dpi=dpi, bbox_inches="tight")
