@@ -50,6 +50,7 @@ venv.bak/
 *png
 *.h5
 *.svg
+!schematics/*.png
 
 # SLURM logs and scripts (use slurm/committed/ for scripts to track in git)
 *.out
