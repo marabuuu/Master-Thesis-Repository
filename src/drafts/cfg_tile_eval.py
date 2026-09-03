@@ -588,7 +588,7 @@ def main() -> None:
     splits_path = v11_cfg["patient_splits_path"]
     genomic_h5  = v11_cfg["genomic_feature_dir"]
     zip_dir     = v11_cfg["zip_dir"]
-    clf_path    = "/mnt/bulk-saturn/maralampert/genhist/experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib"
+    clf_path    = "../experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib"
 
     run_evaluation(
         v11_ckpt=v11_ckpt,

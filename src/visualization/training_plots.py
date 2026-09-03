@@ -1880,7 +1880,7 @@ if __name__ == "__main__":
         plot_poc_ablation,
     )
 
-    _BASE = "/mnt/bulk-saturn/maralampert/genhist/experiments"
+    _BASE = "../experiments"
     _CFG_MAIN = f"{_BASE}/20260601_poc_brca_lihc_cfg_v2_dgx/gda"
     _CFG_WARM = f"{_BASE}/20260529_poc_brca_lihc_cfg_v1/gda"
     _CFG_OUT  = f"{_BASE}/20260601_poc_brca_lihc_cfg_v2_dgx/cfg_diagnostics.png"

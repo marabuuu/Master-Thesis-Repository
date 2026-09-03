@@ -36,9 +36,9 @@ from shapely.validation import make_valid
 # ---------------------------------------------------------------------------
 # Project-specific paths
 # ---------------------------------------------------------------------------
-OUTPUT_ZIP_DIR = Path("/mnt/bulk-saturn/maralampert/genhist/data/BRCA-tumor-tiles-final")
-INPUT_ZIP_DIR  = Path("/mnt/bulk-saturn/maralampert/genhist/data/TCGA")
-ANNOTATION_DIR = Path("/mnt/bulk-saturn/maralampert/genhist/data/annotations-BRCA")
+OUTPUT_ZIP_DIR = Path("../data/BRCA-tumor-tiles-final")
+INPUT_ZIP_DIR  = Path("../data/TCGA")
+ANNOTATION_DIR = Path("../data/annotations-BRCA")
 SAVE_DIR       = Path(__file__).parent  # src/evaluation/
 
 # Coordinate-system constants (must match the filtering script invocation)

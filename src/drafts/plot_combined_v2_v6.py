@@ -25,18 +25,9 @@ sys.path.insert(0, str(_REPO))
 
 from src.visualization.training_plots import load_gda_tfevents, setup_style  # noqa: E402
 
-LOGDIR_V2 = (
-    "/mnt/bulk-saturn/maralampert/genhist/experiments"
-    "/20260526_poc_brca_lihc_gda_v2/gda"
-)
-LOGDIR_V6 = (
-    "/mnt/bulk-saturn/maralampert/genhist/experiments"
-    "/20260527_poc_brca_lihc_gda_v6/gda"
-)
-DEFAULT_OUT = (
-    "/mnt/bulk-saturn/maralampert/genhist/experiments"
-    "/20260527_poc_brca_lihc_gda_v6/combined_v2_v6_diagnostics.png"
-)
+LOGDIR_V2 = "../experiments/20260526_poc_brca_lihc_gda_v2/gda"
+LOGDIR_V6 = "../experiments/20260527_poc_brca_lihc_gda_v6/gda"
+DEFAULT_OUT = "../experiments/20260527_poc_brca_lihc_gda_v6/combined_v2_v6_diagnostics.png"
 RESUME_SAMPLE = 576_000  # sample count where v6 starts
 
 

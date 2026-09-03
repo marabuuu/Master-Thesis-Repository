@@ -17,7 +17,7 @@ import matplotlib.gridspec as gridspec
 import numpy as np
 from PIL import Image
 
-_BASE = Path("/mnt/bulk-saturn/maralampert/genhist/experiments")
+_BASE = Path("../experiments")
 
 PANELS = [
     ("Zero",       _BASE / "20260607_poc_128_zero_30M/panel.png"),

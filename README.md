@@ -13,6 +13,7 @@ This repository contains code for my Master Thesis entitled "Reconstructing hist
 - [Schematics](#schematics)
 - [Main Experiments](#main-experiments)
 - [Building on the following Work](#building-on-the-following-work)
+- [Hardware](#hardware)
 
 ## Project Description
 
@@ -93,6 +94,12 @@ also inline in relevant source modules.
 	- Preprocessing utilities were adapted from mopadi data-prep scripts in:
 		- `src/preprocessing/get_tiles_within_rois.py`
 		- `src/preprocessing/utils.py`
+
+- **DiffAE** (konpatp/diffae), MIT license:
+	- Repository: https://github.com/konpatp/diffae
+	- Transitive dependency via mopadi: the UNet architecture and FiLM-style AdaGN
+		conditioning mechanism that mopadi (and therefore this repository's
+		`src/model_training/`) build on originate from DiffAE.
 
 - **TopoCellGen** (Melon-Xu/TopoCellGen):
 	- Repository: https://github.com/Melon-Xu/TopoCellGen

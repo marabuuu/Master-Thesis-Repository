@@ -35,7 +35,7 @@ from src.visualization.training_plots import (
 # Paths
 # ---------------------------------------------------------------------------
 
-_BASE = Path("/mnt/bulk-saturn/maralampert/genhist/experiments")
+_BASE = Path("../experiments")
 OUT = _BASE / "20260612_training_metrics_poc"
 OUT.mkdir(parents=True, exist_ok=True)
 
