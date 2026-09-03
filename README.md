@@ -14,6 +14,7 @@ This repository contains code for my Master Thesis entitled "Reconstructing hist
 - [Main Experiments](#main-experiments)
 - [Building on the following Work](#building-on-the-following-work)
 - [Hardware](#hardware)
+- [Contributing](#contributing)
 
 ## Project Description
 
@@ -126,6 +127,8 @@ slurm cluster. For the breast PAM50 subtype experiment, 4 NVIDIA H100 GPUs with 
 services provided at TU Dresden/ZIH](https://compendium.hpc.tu-dresden.de).
 
 
+
+## Contributing
 
 For questions or contributions, please open an issue or pull request!
 
