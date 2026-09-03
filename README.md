@@ -18,7 +18,7 @@ This repository contains code for my Master Thesis entitled "Reconstructing hist
 
 This thesis investigates whether bulk RNA-seq gene expression profiles can guide a diffusion model to generate realistic, subtype-specific H&E histology tiles. The target dataset is TCGA-BRCA with PAM50 molecular subtypes (Basal, LumA, LumB, Her2, Normal).
 
-The core model is a **Classifier-Free Guidance (CFG)** diffusion model built on top of [mopadi](https://github.com/KatherLab/mopadi)'s `BeatGANsAutoencModel` UNet. Genomic conditioning is injected via the model's FiLM-style AdaGN mechanism.
+The diffusion model framework is inspired by [mopadi](https://github.com/KatherLab/mopadi)'s UNet architecture which was built on a [DiffAE](https://github.com/konpatp/diffae). Genomic conditioning is injected via the model's FiLM-style AdaGN mechanism. Also, Classifier-Free Guidance (CFG) is utilized.
 
 ![Training pipeline](schematics/training.png)
 
@@ -68,7 +68,7 @@ source .venv/bin/activate
 
 ## Dataset
 
-TCGA's digital histopathology WSIs, together with the corresponding bulk RNA-seq and clinical data, are available at [Genomic Data Commons](https://portal.gdc.cancer.gov/) and [cBioPortal](https://cbioportal.org).
+[TCGA](https://www.cancer.gov/tcga)'s digital histopathology WSIs, together with the corresponding bulk RNA-seq and clinical data, are available at [Genomic Data Commons](https://portal.gdc.cancer.gov/) and [cBioPortal](https://cbioportal.org).
 
 ## Main Experiments
 
@@ -99,6 +99,25 @@ also inline in relevant source modules.
 	- Topological Fréchet Distance implementation in
 		`src/quality_assurance/topological_frechet_distance.py` is inspired by
 		TopoCellGen's `eval_TopoFD` approach.
+
+- **DeepCMorph** (aiff22/DeepCMorph), CC BY-NC-SA 4.0:
+	- Repository: https://github.com/aiff22/DeepCMorph
+	- `src/classifier/segment_and_classify_cells.py` and the TFD cell-segmentation
+		pipeline (`src/quality_assurance/segment_and_compute_topofd.py`) depend on
+		DeepCMorph at runtime for nuclei segmentation and classification. No
+		DeepCMorph code or pretrained weights are bundled in this repository. It
+		must be cloned separately and its checkpoints obtained independently.
+	- This repository's own code remains MIT-licensed, but these specific modules
+		are only usable non-commercially in practice, since they require a
+		separately obtained DeepCMorph installation and are subject to its
+		NonCommercial-ShareAlike terms.
+
+## Hardware 
+
+For the investigation of the conditioning experiment, 4 NVIDIA A100-SXM4 GPUs with 80 GB of memory each were used. These resources were provided by Kather Lab internal
+slurm cluster. For the breast PAM50 subtype experiment, 4 NVIDIA H100 GPUs with 80 GB of memory each were used on [High-Performance Computing (HPC) system and
+services provided at TU Dresden/ZIH](https://compendium.hpc.tu-dresden.de).
+
 
 
 For questions or contributions, please open an issue or pull request!

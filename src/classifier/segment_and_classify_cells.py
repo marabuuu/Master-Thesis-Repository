@@ -6,6 +6,12 @@ Run DeepCMorph on H&E tile images to produce per-tile nuclei segmentation
 masks and per-cell-type classification maps.  The output is saved as NumPy
 ``.npy`` files compatible with the TopoFD evaluation pipeline.
 
+Attribution:
+    Depends at runtime on DeepCMorph (not vendored — clone separately):
+    https://github.com/aiff22/DeepCMorph
+    DeepCMorph is licensed CC BY-NC-SA 4.0 (non-commercial); this module is
+    only usable within those terms.
+
 **Input** – one of:
   * a directory of ZIP archives (one per patient, each containing 512×512 tiles)
   * a flat directory of tile images (.png / .jpg)
