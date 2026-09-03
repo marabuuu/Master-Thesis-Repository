@@ -198,7 +198,7 @@ def _bootstrap_confidence_intervals(
     rng = np.random.RandomState(seed)
 
     metric_names = [
-        "tile_roc_auc", "tile_balanced_accuracy", "tile_f1_macro",
+        "tile_roc_auc", "tile_pr_auc", "tile_balanced_accuracy", "tile_f1_macro",
         "tile_precision_basal", "tile_recall_basal",
         "patient_roc_auc", "patient_balanced_accuracy",
     ]
@@ -222,6 +222,7 @@ def _bootstrap_confidence_intervals(
         pm = _patient_metrics(boot_df, threshold)
 
         samples["tile_roc_auc"].append(tm["roc_auc"])
+        samples["tile_pr_auc"].append(tm["pr_auc"])
         samples["tile_balanced_accuracy"].append(tm["balanced_accuracy"])
         samples["tile_f1_macro"].append(tm["f1_macro"])
         samples["tile_precision_basal"].append(tm["precision_basal"])

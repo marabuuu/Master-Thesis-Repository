@@ -4,8 +4,8 @@ Subtype Classifier Panel
 ========================
 
 Publication-quality 2×2 panel:
-  (A) ROC — per-fold curves + aggregate with bootstrap 95% CI
-  (B) Precision-Recall — per-fold curves + aggregate with bootstrap 95% CI
+  (A) ROC — aggregate with bootstrap 95% CI
+  (B) Precision-Recall — aggregate with bootstrap 95% CI
   (C) Generated tiles — ROC vs real CV reference
   (D) Generated tiles — per-patient mean P(Basal) dot plot
 
@@ -66,7 +66,6 @@ try:
 except ImportError:
     _cmap = plt.cm.viridis
 
-FOLD_COLORS = [to_hex(_cmap(p)) for p in np.linspace(0.12, 0.88, 5)]
 C_AGG = "0.15"
 C_GEN = to_hex(_cmap(0.45))
 
@@ -95,21 +94,9 @@ def _load_gen_patients() -> pd.DataFrame:
     return pd.read_parquet(GEN_EVAL / "per_patient_predictions.parquet")
 
 
-# ── panel A: ROC — per-fold lines + aggregate CI ─────────────────────────────
+# ── panel A: ROC — aggregate with bootstrap CI ───────────────────────────────
 
 def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict) -> None:
-    for fold_i in sorted(oof_df["fold"].unique()):
-        fdf = oof_df[oof_df["fold"] == fold_i]
-        fy = fdf["y_true"].to_numpy(dtype=np.int64)
-        fp = fdf["p_pos"].to_numpy(dtype=np.float64)
-        if len(np.unique(fy)) < 2:
-            continue
-        f_fpr, f_tpr, _ = roc_curve(fy, fp)
-        f_auc = roc_auc_score(fy, fp)
-        ax.plot(f_fpr, f_tpr, color=FOLD_COLORS[fold_i], lw=0.9, alpha=0.6,
-                drawstyle="steps-post",
-                label=f"Fold {fold_i} = {f_auc:.3f}")
-
     y = oof_df["y_true"].to_numpy(dtype=np.int64)
     p = oof_df["p_pos"].to_numpy(dtype=np.float64)
     fpr, tpr, _ = roc_curve(y, p)
@@ -128,28 +115,17 @@ def _panel_roc_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict) -> None:
     _strip_spines(ax)
 
 
-# ── panel B: PR — per-fold lines + aggregate CI ─────────────────────────────
+# ── panel B: PR — aggregate with bootstrap CI ────────────────────────────────
 
 def _panel_pr_cv(ax: plt.Axes, oof_df: pd.DataFrame, cv_summary: dict) -> None:
-    for fold_i in sorted(oof_df["fold"].unique()):
-        fdf = oof_df[oof_df["fold"] == fold_i]
-        fy = fdf["y_true"].to_numpy(dtype=np.int64)
-        fp = fdf["p_pos"].to_numpy(dtype=np.float64)
-        if len(np.unique(fy)) < 2:
-            continue
-        f_prec, f_rec, _ = precision_recall_curve(fy, fp)
-        f_ap = average_precision_score(fy, fp)
-        ax.plot(f_rec, f_prec, color=FOLD_COLORS[fold_i], lw=0.9, alpha=0.6,
-                drawstyle="steps-post",
-                label=f"Fold {fold_i} = {f_ap:.3f}")
-
     y = oof_df["y_true"].to_numpy(dtype=np.int64)
     p = oof_df["p_pos"].to_numpy(dtype=np.float64)
     prec, rec, _ = precision_recall_curve(y, p)
     ap = average_precision_score(y, p)
+    ci = cv_summary["bootstrap_ci"]["tile_pr_auc"]
 
     ax.plot(rec, prec, color=C_AGG, lw=2.0, zorder=5, drawstyle="steps-post",
-            label=f"Aggregate AP = {ap:.3f}")
+            label=f"Aggregate AP = {ap:.3f}\n[{ci['ci_lower']:.3f}, {ci['ci_upper']:.3f}]")
 
     ax.set_xlabel("Recall")
     ax.set_ylabel("Precision")
@@ -263,10 +239,10 @@ def build_panel(
     ax_c = fig.add_subplot(gs[1, 0])
     ax_d = fig.add_subplot(gs[1, 1])
 
-    print("[Panel] A: ROC with per-fold lines ...")
+    print("[Panel] A: ROC aggregate with CI ...")
     _panel_roc_cv(ax_a, oof_df, cv_summary)
 
-    print("[Panel] B: Precision-Recall with per-fold lines ...")
+    print("[Panel] B: Precision-Recall aggregate with CI ...")
     _panel_pr_cv(ax_b, oof_df, cv_summary)
 
     print("[Panel] C: Generated ROC vs real ...")

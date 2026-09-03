@@ -561,6 +561,59 @@ gene_manipulation:
   feature_models:
     - virchow2
 
+# Gene-SET manipulation: shifts curated mechanistic gene programs (proliferation,
+# stromal/CAF, immune) as one coordinated module instead of a single gene.
+# delta_std is the TARGET TOTAL Euclidean-norm displacement of the conditioning
+# vector, split evenly across all member genes (delta_per_gene = delta_std /
+# sqrt(n_genes)) — see src/reconstruction/manipulate_gene_sets.py::perturb_feats_by_set.
+# This keeps perturbation magnitude comparable across sets of different size, and
+# comparable to the single-gene ±3σ POSTN pilot above, instead of compounding with
+# set size (which risks off-manifold artifacts, e.g. the red-blob tile in the
+# POSTN panel at -3σ on a single gene).
+#
+# Gene sets were curated from this panel's own Basal-vs-LumA OLS DE ranking
+# (same method as build_genomic_features.py's gene selection), hand-adjusted to
+# keep canonical/recognizable markers (e.g. MKI67, HLA-A/HLA-DRA) even where
+# their individual DE rank was modest.
+
+gene_set_manipulation:
+  run_dir: ./experiments/20260607_brca_pam50_cfg_v2_256/gda
+  genomic_h5_dir: ./experiments/20260528_genomic_features/genomic_h5
+  gene_list_path: ./experiments/20260528_genomic_features/gene_list.txt
+  output_dir: ./experiments/20260607_brca_pam50_cfg_v2_256/gene_set_manipulation
+
+  # Same patient as the POSTN pilot, for direct visual continuity.
+  patient_id: TCGA-E9-A1NF
+  n_tiles: 10
+  guidance_scale: 5.0
+  steps: 20
+  seed: 42
+
+  # Pin columns 4 and 10 (1-indexed) to the exact same noise seeds as
+  # manipulation_panel.png (seed * 10000 + i, seed=42) so those two tile crops
+  # are visually identical across the POSTN pilot and all gene-set panels.
+  col_seed_overrides:
+    4: 420003
+    10: 420009
+
+  gene_sets:
+    - name: proliferation
+      delta_std: -3.0
+      genes: [CDCA7, CCNE1, CDC20, CENPW, CENPA, KIF2C, CDCA8, AURKB, TTK, MELK,
+              MYBL2, CEP55, FAM83D, MKI67, BIRC5]
+    - name: stromal_ecm
+      delta_std: -3.0
+      genes: [POSTN, COL3A1, SPARC, LUM, MMP11, AEBP1, SERPINH1, RARRES1, HAPLN3,
+              NPNT, SFRP1, MMP7, NTN4, PLOD1, SPARCL1, ASPN, TIMP3]
+    - name: immune
+      delta_std: -3.0
+      genes: [IL6ST, CXCL10, CXCL14, CXCL16, HLA-A, HLA-DRA, TAP1, IL32, GBP1,
+              IFITM2, CD46, CHI3L1, RIPK2, AIF1L, SOD2]
+
+  compute_metrics: true
+  feature_models:
+    - virchow2
+
 # ═══════════════════════════════════════════════════════════
 # 5. TRAINING — BRCA PAM50 subtype conditioning (512×512)
 # ═══════════════════════════════════════════════════════════

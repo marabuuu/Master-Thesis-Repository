@@ -106,23 +106,30 @@ def _add_inset(ax, steps, vals, color) -> None:
         y_in_bot = v_min - margin if v_min < 0 else -span * 0.08
         y_in_top = v_max + margin
 
-    ax_in = ax.inset_axes([0.50, 0.42, 0.46, 0.50])
+    ax_in = ax.inset_axes([0.46, 0.38, 0.50, 0.54])
     s_M = [s / 1e6 for s in steps]
     s_in, v_in = _subsample_series(s_M, list(vals), 800)
     ax_in.plot(s_in, v_in, lw=0.7, color=color, alpha=0.9, rasterized=True)
 
     ax_in.set_ylim(y_in_bot, y_in_top)
-    # Three clean reference ticks: bottom / zero / top
-    ax_in.set_yticks([y_in_bot, 0.0, y_in_top])
+    # Reference ticks: bottom / zero / top — but drop the zero tick if it
+    # sits too close to either end, since the larger font then makes the
+    # labels collide.
+    span = y_in_top - y_in_bot
+    if span > 0 and min(abs(0.0 - y_in_bot), abs(y_in_top - 0.0)) < 0.22 * span:
+        yticks = [y_in_bot, y_in_top]
+    else:
+        yticks = [y_in_bot, 0.0, y_in_top]
+    ax_in.set_yticks(yticks)
     ax_in.yaxis.set_major_formatter(mticker.ScalarFormatter(useMathText=True))
     ax_in.ticklabel_format(style="sci", axis="y", scilimits=(0, 0))
     # Make the offset-text (×10^N) visible and readable inside the inset
     ot = ax_in.yaxis.get_offset_text()
     ot.set_visible(True)
-    ot.set_fontsize(6.5)
+    ot.set_fontsize(15)
 
     ax_in.set_xticks([])
-    ax_in.tick_params(labelsize=6.5, pad=1)
+    ax_in.tick_params(labelsize=15, pad=2)
     for spine in ax_in.spines.values():
         spine.set_linewidth(0.6)
         spine.set_color("0.4")
