@@ -13,6 +13,7 @@ This repository contains code for my Master Thesis entitled "Reconstructing hist
 - [Schematics](#schematics)
 - [Main Experiments](#main-experiments)
 - [Building on the following Work](#building-on-the-following-work)
+- [Hardware](#hardware)
 
 ## Project Description
 
