@@ -647,7 +647,7 @@ def main() -> None:
         log.info("Auto-selected checkpoint (most recent non-last): %s", ckpt_path)
         log.info("Auto-selected checkpoint: %s", ckpt_path)
 
-    clf_path = "/mnt/bulk-saturn/maralampert/genhist/experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib"
+    clf_path = "../experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib"
 
     run_evaluation(
         gda_ckpt=ckpt_path,

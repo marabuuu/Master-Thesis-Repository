@@ -20,8 +20,8 @@ preprocessing:
 
 tar_to_tumor_zip:
   # for proof of concept investigation needed
-  tar_dir: /mnt/bulk-ganymede/laura/diffusion/data/TCGA-LIHC
-  roi_dir: /mnt/copernicus3/PATHOLOGY/others/public/TCGA/TCGA-LIHC-DX-IMGS/annotations-LIHC
+  tar_dir: /path/to/TCGA-LIHC/tar_archives  # external raw WSI tar archives, not part of this repo
+  roi_dir: /path/to/TCGA-LIHC/annotations  # external ROI annotations, not part of this repo
   save_dir: ../data/Liver-tumor-tiles-final
   target_mpp: 0.5
   native_slide_mpp: 0.25
@@ -88,7 +88,7 @@ poc_breast_vs_liver_genomic_features:
 
 subtype_classifier:
   mode: evaluate
-  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  features_dir: /path/to/features/TCGA-BRCA/virchow2  # precomputed Virchow2 tile features (external cache)
   patient_splits_path: ./experiments/20260320_joint_training_encoder_only_slurm/patient_splits.json
   max_tiles_per_patient: 100
   seed: 42
@@ -108,7 +108,7 @@ subtype_classifier:
     model_path: ./experiments/20260326_cross_subtype_classifier/train/subtype_linear_model.joblib
 
 subtype_classifier_cv:
-  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  features_dir: /path/to/features/TCGA-BRCA/virchow2  # precomputed Virchow2 tile features (external cache)
   label_csv_path: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_col: Patient_ID
   subtype_col: Majority_Subtype_mRNA
@@ -940,14 +940,14 @@ tfd_separability_poc:
 
 tfd_separability_viz:
   # ── Input ─────────────────────────────────────────────────────────────────
-  results_json: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/results/tfd_separability_results.json
+  results_json: ./experiments/20260509_tfd_separability/results/tfd_separability_results.json
   tiles_dir: ../data/BRCA-tumor-tiles-final
-  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+  masks_dir: ./experiments/20260509_tfd_separability/masks
   metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_col: Patient_ID
   subtype_col: Majority_Subtype_mRNA
   classes: null
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/plots
+  output_dir: ./experiments/20260509_tfd_separability/plots
 
   # ── Plots to generate ─────────────────────────────────────────────────────
   # Each plot that involves per-tile data also saves a sidecar JSON with
@@ -986,16 +986,16 @@ tfd_separability_viz:
 tfd_separability_viz_poc:
   cohorts:
     TCGA-BRCA:
-      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
+      masks_dir: ./experiments/20260509_tfd_separability/masks
     TCGA-LIHC:
-      masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/lihc_masks
+      masks_dir: ./experiments/20260529_tfd_separability_poc/lihc_masks
   cohort_labels:
     TCGA-BRCA: "Breast"
     TCGA-LIHC: "Liver"
   cohort_palette:
     TCGA-BRCA: "#FDAE61"   # amber — matches latent-space UMAP
     TCGA-LIHC: "#762A83"   # violet
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260529_tfd_separability_poc/cohort_plots
+  output_dir: ./experiments/20260529_tfd_separability_poc/cohort_plots
   plots:
     - cell_type_boxplots      # → cohort_cell_type_boxplots.png + stats JSON
     - nn_distance_violins     # → cohort_nn_distance_violins.png + stats JSON
@@ -1010,8 +1010,8 @@ tfd_separability_viz_poc:
   seed: 42
 
 tfd_separability_viz_subtype:
-  masks_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/masks
-  metadata_csv: /mnt/bulk-saturn/maralampert/genhist/dataframes/brca_gene_expression_with_subtypes.csv
+  masks_dir: ./experiments/20260509_tfd_separability/masks
+  metadata_csv: ../dataframes/brca_gene_expression_with_subtypes.csv
   patient_col: Patient_ID
   subtype_col: Majority_Subtype_mRNA
   subtype_order:
@@ -1023,7 +1023,7 @@ tfd_separability_viz_subtype:
   subtype_palette:
     Normal: "#F4A7B9"   # soft pink override (romaO default too light)
   cmap_categorical: romaO
-  output_dir: /mnt/bulk-saturn/maralampert/genhist/experiments/20260509_tfd_separability/subtype_plots
+  output_dir: ./experiments/20260509_tfd_separability/subtype_plots
   plots:
     - cell_type_boxplots      # → subtype_cell_type_boxplots.png + stats JSON
     - nn_distance_violins     # → subtype_nn_distance_violins.png + stats JSON
@@ -1120,7 +1120,7 @@ poc_breast_vs_liver_visualize_latents:
     TCGA-LIHC: Liver
 
 virchow2_umap:
-  features_dir: /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3
+  features_dir: /path/to/features/TCGA-BRCA/virchow2  # precomputed Virchow2 tile features (external cache)
   csv_path: ../dataframes/brca_subtypes.csv
   patient_col: bcr_patient_barcode
   subtype_col: Majority_Subtype_mRNA
@@ -1146,9 +1146,9 @@ virchow2_umap:
 virchow2_umap_cohort:
   label_source: splits                 # read TCGA-BRCA / TCGA-LIHC labels from patient_splits.json
   features_dirs:
-    - /mnt/copernicus0/mopadi/features/TCGA-BRCA/virchow2-7e9d3eb3   # BRCA (same as virchow2_umap)
-    - /mnt/bulk-neptune/laura/mopadiv2/features/new/virchow2/TCGA-LIHC/virchow2-02627079                                   # ← fill in your LIHC path here
-  patient_splits_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
+    - /path/to/features/TCGA-BRCA/virchow2  # BRCA precomputed Virchow2 tile features (external cache, same as virchow2_umap)
+    - /path/to/features/TCGA-LIHC/virchow2  # LIHC precomputed Virchow2 tile features (external cache)
+  patient_splits_path: ./experiments/20260524_poc_breast_vs_liver_genomic_features/patient_splits.json
   mode: tile                           # "patient" (1 pt per patient) or "tile" (1 pt per tile)
   output_dir: ./experiments/virchow2_umap_cohort
   max_tiles_per_patient: 50           # consistent with virchow2_umap (PAM50)

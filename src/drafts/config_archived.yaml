@@ -176,7 +176,7 @@ poc_breast_vs_liver_cfg_brca_init:
   bf16: true
 
   # Warm-start from the BRCA-only backbone checkpoint.
-  backbone_ckpt_path: /mnt/bulk-saturn/maralampert/genhist/experiments/20260115_different_models_difficult_to_disentangle/TCGA-BRCA/splitting_mopadi_checkpoint/diffusion_only.ckpt
+  backbone_ckpt_path: ../experiments/20260115_different_models_difficult_to_disentangle/TCGA-BRCA/splitting_mopadi_checkpoint/diffusion_only.ckpt
 
   # ── Logging / checkpointing ───────────────────────────────────────────────
   val_every_steps: 2000

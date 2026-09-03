@@ -31,7 +31,7 @@ from mpl_toolkits.axes_grid1 import make_axes_locatable
 # Paths
 # ---------------------------------------------------------------------------
 RESULTS_JSON = Path(
-    "/mnt/bulk-saturn/maralampert/genhist/experiments"
+    "../experiments"
     "/20260509_tfd_separability/results/tfd_separability_results.json"
 )
 OUTPUT_DIR = RESULTS_JSON.parent
